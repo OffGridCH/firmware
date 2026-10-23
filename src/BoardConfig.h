@@ -28,4 +28,6 @@ constexpr uint8_t RadioReset = 12;
 constexpr uint8_t RadioBusy = 13;
 constexpr uint8_t RadioDio1 = 14;
 constexpr float RadioTcxoVoltage = 1.8f;
+constexpr uint32_t RadioSpiTimeoutMs = 20;
+constexpr uint32_t RadioChannelTimeoutMs = 10000;
 }

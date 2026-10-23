@@ -20,6 +20,7 @@ public:
 	static constexpr int16_t Busy = -10000;
 	static constexpr int16_t NotReady = -10001;
 	static constexpr int16_t Cancelled = -10002;
+	static constexpr int16_t ChannelBusy = -10003;
 
 	struct Event {
 		EventType type = EventType::Failed;
@@ -37,6 +38,9 @@ public:
 		uint32_t crcErrors = 0;
 		uint32_t failures = 0;
 		uint32_t droppedEvents = 0;
+		uint32_t cadScans = 0;
+		uint32_t cadBusy = 0;
+		uint32_t timeouts = 0;
 		uint64_t txAirtimeMs = 0;
 		float lastRssi = 0;
 		float lastSnr = 0;
@@ -51,7 +55,12 @@ public:
 	bool applyConfig(const Config& configuration);
 	bool standby();
 	bool startReceive();
-	bool startTransmit(const uint8_t* bytes, size_t length, uint64_t nowMs);
+	bool startTransmit(const uint8_t* bytes, size_t length, uint64_t nowMs,
+					   bool cadEnabled = true, uint8_t backoffSlots = 8);
+	bool startCad(uint64_t nowMs);
+	bool queueConfig(const Config& configuration);
+	bool configPending() const;
+	bool recover();
 	void tick(uint64_t nowMs);
 	bool popEvent(Event& event);
 	const Stats& stats() const;
@@ -71,6 +80,9 @@ private:
 	bool resumeReceive();
 	void emit(const Event& event);
 	void failTransfer(int16_t error, uint64_t nowMs);
+	bool beginTransmit(uint64_t nowMs);
+	bool beginCad(uint64_t nowMs);
+	bool busy() const;
 
 	SPIClass spi_;
 	Module module_;
@@ -90,4 +102,10 @@ private:
 	size_t eventHead_ = 0;
 	size_t eventCount_ = 0;
 	Stats stats_;
+	bool cadForTransmit_ = false;
+	uint8_t backoffSlots_ = 8;
+	uint64_t channelDeadline_ = 0;
+	uint64_t nextActionAt_ = 0;
+	Config pendingConfiguration_;
+	bool configPending_ = false;
 };
