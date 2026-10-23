@@ -7,9 +7,17 @@ PHY CRC and automatic low-data-rate optimization. The sync word is expanded by
 RadioLib with control bits 0x44, so 0x4F becomes 0x44F4.
 
 The default serial mock profiles do not initialize radio hardware. Build
-`pio run -e radio_diag` for real hardware diagnostics. Stage 1 initializes from
-saved settings and stays in standby; `sys.status.radio` reports initialized,
-state and the last RadioLib error. RX/TX and CAD follow in separate commits.
+`pio run -e radio_diag` for real hardware diagnostics. Initialization uses saved
+settings and stays in standby; `sys.status.radio` reports initialized, state and
+the last RadioLib error. Diagnostic serial controls follow with integration.
+
+`startReceive`, `startTransmit`, `tick`, and `popEvent` implement asynchronous
+operations. DIO1 only sets an instance-owned flag under an ISR-safe critical
+section; the application loop reads SPI and handles packets. TX/RX buffers hold
+up to 255 bytes. Four event slots reserve one slot from RX traffic for operation
+completion; excess received events are counted as drops. The caller must drain
+events promptly. TX success is reported only after TxDone, and RX is restored
+when requested. CAD/backoff and recovery follow in the next stage.
 
 Initialization/configuration calls can wait inside RadioLib. No strict
 non-blocking timing guarantee or real-device acceptance is claimed by a build.
