@@ -3,20 +3,26 @@
 ## Current Implementation: Serial Mock With Real Configuration Storage
 
 This folder implements the real JSON Lines transport and command-envelope
-boundary. The simulated device backend lives in `../main.cpp`, behind
+boundary. The simulated device backend lives in `MockDevice.h`, owned by `App`, behind
 `OFFGRID_MOCK_DEVICE=1`. It is not secure firmware. Use synthetic data only.
 
 | Component | Responsibility |
 |---|---|
 | `SerialLink` | LF/CRLF framing, 2048-byte wire limit, bounded RX/TX work, complete output lines, queued JSON serialization |
 | `Commands` | JSON envelope validation, exact integer IDs, argument-validation helpers, dispatch, response/error formatting |
-| `MockDevice` in `main.cpp` | Command-specific behavior, public identity, mock lifecycle, deferred events and physical reset confirmation |
+| `MockDevice` | Command-specific behavior, public identity, mock lifecycle, deferred events, physical reset confirmation and typed UI adapters |
+| `App` | Instance ownership, initialization, cooperative loop and LED/OLED snapshot/event routing |
 
 Request views are valid only during dispatch. Copy any data retained for later
 work into owned fixed buffers. Domain implementations can replace the mock
 callback without changing the transport. `ConfigStore` now provides real NVS
 persistence; security and mesh remain mocked. The separate radio_diag profiles
 connect real RadioDriver hardware without changing the default Android mock.
+
+LED/OLED have wired interfaces but unavailable no-op hardware implementations.
+`sys.status.result.ui` adds `led_ready`, `oled_ready` and numeric `page` (Home=0,
+Radio=1, Pairing=2). A short PRG press cycles pages without changing reset rules.
+See the [App/UI handoff](../../docs/app-core-handoff.md) for driver integration.
 
 ## Radio Diagnostic Images
 
@@ -103,7 +109,7 @@ raw prints or retain borrowed JSON views between ticks.
 | `radio.get/set` | Defaults, presets, strict ranges, warnings and calculated airtime; no radio is initialized |
 | `radio.stats` | Synthetic packet/ACK/retry counters and signal values; optional reset reads then clears counters |
 | `mesh.get/set` | Validated settings, nested ACK-default merging; hop defaults, ACK defaults, retries and locked relay state affect the mock |
-| `led.get/set/test` | Built-in/custom pattern validation, nested merging, brightness/quiet/enabled settings and simulated preview; no LEDs are driven |
+| `led.get/set/test` | Pattern validation, nested merging and real settings persistence; App forwards copied settings/preview to LedDriver, whose current stub drives no LEDs |
 | `dbg.rf_trace` | Enables deferred rf.tx/rf.rx fixtures while unlocked; bytes are marked mock, not actual encrypted RF captures |
 
 All command namespaces listed by the target specification now have mock handlers.

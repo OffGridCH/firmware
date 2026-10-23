@@ -44,9 +44,9 @@ Keep antennas connected and use lawful frequencies/power when RF is enabled.
 
 The driver owns SPI, RadioLib, buffers, IRQ state, operation deadlines and PHY
 statistics. It accepts typed Config values and exposes typed Event values; it
-has no JSON, NVS, serial, mesh or crypto dependency. `MockDevice` in `main.cpp`
-temporarily adapts serial/NVS settings to the driver. Later `App` will own it,
-and `MeshEngine` will use the same typed boundary for encrypted frames.
+has no JSON, NVS, serial, mesh or crypto dependency. App owns the driver and
+injects it into the temporary `host/MockDevice.h` backend, which adapts serial/NVS
+settings. Later `MeshEngine` will use the same typed boundary for encrypted frames.
 
 Default profiles keep the Android mock and leave hardware RF off. Diagnostic
 profiles enable real RF, advertise `radio_diagnostics: true` in boot/hello, and

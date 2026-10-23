@@ -6,8 +6,9 @@
 > **Companion specifications:** [Host interface](offgrid-link.md) and [over-the-air protocol](offgrid-protocol.md)
 
 > **Development exception:** During [serial mock development](../src/host/README.md),
-> `main.cpp` temporarily owns the mock device handler and serial wiring. It does
-> not yet delegate to `App`. Mock behavior stays outside the reusable host modules.
+> `App` owns serial wiring, UI drivers and the temporary `host/MockDevice.h` backend.
+> `main.cpp` only delegates to App. Mock behavior stays outside the reusable
+> transport/parser modules. See the [UI handoff](app-core-handoff.md).
 
 ## 1. Design Rules
 
@@ -79,6 +80,8 @@ firmware/
 ```
 
 There are 30 module files plus `main.cpp`, `BoardConfig.h`, and `Types.h`.
+The temporary `host/MockDevice.h` adapter is additional development-only code,
+not a new permanent domain module in this target structure.
 No separate `core/`, `ui/`, `radio/`, `handlers/`, or generic `utils/` directory
 is needed. A driver here is the complete peripheral-facing module, including its
 small state machine and presentation logic, not necessarily a register-only HAL.
@@ -101,6 +104,13 @@ Use direct calls and a small set of fixed callbacks instead of a generic
 `EventBus`. Callbacks run in the application context and do not perform hidden
 long-running work. Shared notifications carry values, not pointers to temporary
 buffers. A small private wrap-safe timing helper replaces `SystemClock`.
+
+The current minimal App owns the mock backend instead of functional Security or
+MeshEngine modules. It feeds secret-free `UiSnapshot` values, typed events and
+copied LED settings/previews to independently initialized LED/OLED drivers.
+Those drivers are unavailable no-op stubs until their hardware implementations
+land. Driver failure never stops the other modules. UI ticks continue when
+native USB is disconnected. `sys.status.result.ui` exposes readiness and page.
 
 ### RadioDriver
 
@@ -136,8 +146,9 @@ separate strip-driver or animator files are required for two fixed strips.
 
 Owns SSD1306 power/reset/init, framebuffer, dirty-region transfers, text/icons,
 and page rendering. Includes home/security status, RF telemetry, pairing expiry
-and fingerprint overlay, factory-reset prompt/progress, and short-press page
-cycling. Receives a display snapshot and UI notifications, never private keys.
+and fingerprint overlay, factory-reset prompt/progress, and the page selected by
+App on a short press. Receives a display snapshot and UI notifications, never
+private keys.
 
 Refresh presentation only when needed; send bounded chunks independently of the
 render rate. Measure actual I2C transfer time before choosing the chunk size.
@@ -149,6 +160,10 @@ Owns PRG sampling, debounce, press duration, short-press detection, and hold
 progress. Reports actions to `App`; it cannot erase flash itself. A reset hold is
 accepted only under the agreed armed-window rules and must not be satisfied by
 a hold that predates arming. Page cycling and reset confirmation stay distinct.
+
+For now Button is a placeholder: the existing mock backend samples/debounces
+GPIO0 and confirms resets, and App consumes short-press page advances. Neither
+UI driver should add another button sampler or erase configuration.
 
 ### SerialLink
 
