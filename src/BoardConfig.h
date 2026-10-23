@@ -1,5 +1,10 @@
 #pragma once
 
+#define OLED_SDA   17
+#define OLED_SCL   18
+#define OLED_RST   21
+#define VEXT_CTRL  36
+
 #include <stddef.h>
 #include <stdint.h>
 
@@ -31,3 +36,4 @@ constexpr float RadioTcxoVoltage = 1.8f;
 constexpr uint32_t RadioSpiTimeoutMs = 20;
 constexpr uint32_t RadioChannelTimeoutMs = 10000;
 }
+
