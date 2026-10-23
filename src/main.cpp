@@ -14,6 +14,7 @@
 #include "BoardConfig.h"
 #include "host/Commands.h"
 #include "host/SerialLink.h"
+#include "security/CryptoEngine.h"
 #include "storage/ConfigStore.h"
 #include "drivers/RadioDriver.h"
 
@@ -875,10 +876,237 @@ private:
         }
     }
 
+    static bool allZeroBytes(const uint8_t* bytes, size_t length) {
+        uint8_t combined = 0;
+        for (size_t index = 0; index < length; ++index) combined |= bytes[index];
+        return combined == 0;
+    }
+
+    static void runCryptoSelfTest(JsonObject result) {
+        JsonObject checks = result.createNestedObject("checks");
+        bool passed = true;
+        const auto record = [&](const char* name, bool success) {
+            checks[name] = success;
+            passed = passed && success;
+        };
+
+        static const uint8_t expectedSha256[32] = {
+            0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea,
+            0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22, 0x23,
+            0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c,
+            0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad
+        };
+        static const uint8_t expectedHmac[32] = {
+            0xf7, 0xbc, 0x83, 0xf4, 0x30, 0x53, 0x84, 0x24,
+            0xb1, 0x32, 0x98, 0xe6, 0xaa, 0x6f, 0xb1, 0x43,
+            0xef, 0x4d, 0x59, 0xa1, 0x49, 0x46, 0x17, 0x59,
+            0x97, 0x47, 0x9d, 0xbc, 0x2d, 0x1a, 0x3c, 0xd8
+        };
+        static const uint8_t alicePublic[32] = {
+            0x2e, 0x8b, 0x28, 0x83, 0xc2, 0x7b, 0x39, 0x13,
+            0x59, 0xd7, 0xd0, 0xc1, 0x5d, 0x00, 0x81, 0x5a,
+            0x66, 0x93, 0x29, 0x0a, 0x38, 0xdd, 0x8e, 0xba,
+            0x34, 0x1c, 0xc0, 0x7d, 0xda, 0xa8, 0xed, 0x4d
+        };
+        static const uint8_t bobPublic[32] = {
+            0xc0, 0xb1, 0x26, 0xb5, 0xaa, 0x13, 0x4b, 0x84,
+            0xe6, 0x46, 0x25, 0x25, 0x6b, 0x8d, 0xe8, 0x97,
+            0x37, 0x87, 0x61, 0x2b, 0x1f, 0x38, 0x39, 0xd2,
+            0xc6, 0x05, 0x26, 0xd2, 0x11, 0x4e, 0x88, 0x6d
+        };
+        static const uint8_t expectedAliceToBob[16] = {
+            0xb6, 0xc3, 0x83, 0x6e, 0x8b, 0xfc, 0x1d, 0x78,
+            0x4b, 0x06, 0x88, 0xa5, 0x96, 0x3e, 0x14, 0x97
+        };
+        static const uint8_t expectedBobToAlice[16] = {
+            0x86, 0x9a, 0x27, 0x2d, 0xb6, 0x65, 0x53, 0xbf,
+            0x73, 0x7a, 0x40, 0xf9, 0xfb, 0x89, 0x29, 0xca
+        };
+        static const uint8_t expectedSharedSecret[32] = {
+            0x22, 0x8c, 0x9a, 0x51, 0xc3, 0xf3, 0x16, 0xec,
+            0xd4, 0xc4, 0xe2, 0xa4, 0xc5, 0x20, 0x6f, 0xf1,
+            0x3d, 0x44, 0xbf, 0xc6, 0xe9, 0x42, 0x76, 0x28,
+            0x7d, 0xf5, 0x93, 0x7b, 0x7b, 0xf9, 0x67, 0x46
+        };
+        static const uint8_t hkdfInput[22] = {
+            0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b,
+            0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b,
+            0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b
+        };
+        static const uint8_t hkdfSalt[13] = {
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
+            0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c
+        };
+        static const uint8_t hkdfInfo[10] = {
+            0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9
+        };
+        static const uint8_t expectedHkdf[42] = {
+            0x3c, 0xb2, 0x5f, 0x25, 0xfa, 0xac, 0xd5, 0x7a,
+            0x90, 0x43, 0x4f, 0x64, 0xd0, 0x36, 0x2f, 0x2a,
+            0x2d, 0x2d, 0x0a, 0x90, 0xcf, 0x1a, 0x5a, 0x4c,
+            0x5d, 0xb0, 0x2d, 0x56, 0xec, 0xc4, 0xc5, 0xbf,
+            0x34, 0x00, 0x72, 0x08, 0xd5, 0xb8, 0x87, 0x18,
+            0x58, 0x65
+        };
+        static const uint8_t expectedCcmCiphertext[7] = {
+            0x5d, 0x1d, 0x3f, 0xd9, 0x2a, 0x3e, 0x04
+        };
+        static const uint8_t expectedCcmTag[8] = {
+            0xda, 0x79, 0x40, 0x24, 0xdb, 0x76, 0xad, 0xbc
+        };
+        static const uint8_t expectedGcmCiphertext[16] = {
+            0xce, 0xa7, 0x40, 0x3d, 0x4d, 0x60, 0x6b, 0x6e,
+            0x07, 0x4e, 0xc5, 0xd3, 0xba, 0xf3, 0x9d, 0x18
+        };
+        static const uint8_t expectedGcmTag[16] = {
+            0xd0, 0xd1, 0xc8, 0xa7, 0x99, 0x99, 0x6b, 0xf0,
+            0x26, 0x5b, 0x98, 0xb5, 0xd4, 0x8a, 0xb9, 0x19
+        };
+
+        uint8_t digest[32] = {};
+        const uint8_t abc[] = {'a', 'b', 'c'};
+        const bool shaOk = CryptoEngine::sha256(abc, sizeof(abc), digest) &&
+            memcmp(digest, expectedSha256, sizeof(digest)) == 0;
+        record("sha256", shaOk);
+
+        uint8_t hmac[32] = {};
+        static const uint8_t hmacKey[] = {'k', 'e', 'y'};
+        static const uint8_t hmacInput[] = "The quick brown fox jumps over the lazy dog";
+        const bool hmacOk = CryptoEngine::hmacSha256(hmacKey, sizeof(hmacKey),
+            hmacInput, sizeof(hmacInput) - 1, hmac) &&
+            memcmp(hmac, expectedHmac, sizeof(hmac)) == 0;
+        record("hmac_sha256", hmacOk);
+
+        uint8_t alicePrivate[32] = {};
+        uint8_t bobPrivate[32] = {};
+        uint8_t sharedAlice[32] = {};
+        uint8_t sharedBob[32] = {};
+        const bool privateKeysOk = CryptoEngine::sha256(
+            reinterpret_cast<const uint8_t*>("alice"), 5, alicePrivate) &&
+            CryptoEngine::sha256(reinterpret_cast<const uint8_t*>("bob"), 3, bobPrivate);
+        const bool sharedOk = privateKeysOk &&
+            CryptoEngine::x25519(alicePrivate, bobPublic, sharedAlice) &&
+            CryptoEngine::x25519(bobPrivate, alicePublic, sharedBob) &&
+            memcmp(sharedAlice, sharedBob, sizeof(sharedAlice)) == 0;
+        record("x25519_shared_secret_vector", sharedOk &&
+            memcmp(sharedAlice, expectedSharedSecret, sizeof(sharedAlice)) == 0);
+        uint8_t hkdfOutput[sizeof(expectedHkdf)] = {};
+        const bool hkdfStandardOk = CryptoEngine::hkdfSha256(hkdfInput,
+            sizeof(hkdfInput), hkdfSalt, sizeof(hkdfSalt), hkdfInfo,
+            sizeof(hkdfInfo), hkdfOutput, sizeof(hkdfOutput)) &&
+            memcmp(hkdfOutput, expectedHkdf, sizeof(hkdfOutput)) == 0;
+        record("hkdf_sha256_rfc5869", hkdfStandardOk);
+        uint8_t pairingSalt[32] = {};
+        uint8_t aliceToBobInfo[67] = {'o', 'g', '1'};
+        uint8_t bobToAliceInfo[67] = {'o', 'g', '1'};
+        for (size_t index = 0; index < 16; ++index) {
+            pairingSalt[index] = 0x10 + index;
+            pairingSalt[index + 16] = 0x20 + index;
+        }
+        memcpy(aliceToBobInfo + 3, alicePublic, sizeof(alicePublic));
+        memcpy(aliceToBobInfo + 35, bobPublic, sizeof(bobPublic));
+        memcpy(bobToAliceInfo + 3, bobPublic, sizeof(bobPublic));
+        memcpy(bobToAliceInfo + 35, alicePublic, sizeof(alicePublic));
+        uint8_t aliceToBob[16] = {};
+        uint8_t bobToAlice[16] = {};
+        const bool hkdfOk = sharedOk &&
+            CryptoEngine::hkdfSha256(sharedAlice, sizeof(sharedAlice), pairingSalt,
+                sizeof(pairingSalt), aliceToBobInfo, sizeof(aliceToBobInfo),
+                aliceToBob, sizeof(aliceToBob)) &&
+            CryptoEngine::hkdfSha256(sharedBob, sizeof(sharedBob), pairingSalt,
+                sizeof(pairingSalt), bobToAliceInfo, sizeof(bobToAliceInfo),
+                bobToAlice, sizeof(bobToAlice)) &&
+            memcmp(aliceToBob, expectedAliceToBob, sizeof(aliceToBob)) == 0 &&
+            memcmp(bobToAlice, expectedBobToAlice, sizeof(bobToAlice)) == 0;
+        record("x25519_hkdf_pairing_vectors", hkdfOk);
+
+        uint8_t ccmKey[16] = {};
+        static const uint8_t nonce[13] = {
+            0xe3, 0xf0, 0xe8, 0x41, 0x00, 0x00, 0x01,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+        };
+        static const uint8_t associatedData[8] = {
+            0x60, 0xe8, 0x41, 0xe3, 0xf0, 0x00, 0x00, 0x01
+        };
+        static const uint8_t ccmPlaintext[7] = {
+            0x08, 'H', 'e', 'l', 'l', 'o', '!'
+        };
+        static const uint8_t ccmKeyFixture[16] = {
+            0xb6, 0xc3, 0x83, 0x6e, 0x8b, 0xfc, 0x1d, 0x78,
+            0x4b, 0x06, 0x88, 0xa5, 0x96, 0x3e, 0x14, 0x97
+        };
+        memcpy(ccmKey, ccmKeyFixture, sizeof(ccmKey));
+        uint8_t ccmCiphertext[7] = {};
+        uint8_t ccmTag[8] = {};
+        const bool ccmEncryptOk = CryptoEngine::aes128CcmEncrypt(ccmKey, nonce,
+            associatedData, sizeof(associatedData), ccmPlaintext,
+            sizeof(ccmPlaintext), ccmCiphertext, ccmTag) &&
+            memcmp(ccmCiphertext, expectedCcmCiphertext, sizeof(ccmCiphertext)) == 0 &&
+            memcmp(ccmTag, expectedCcmTag, sizeof(ccmTag)) == 0;
+        record("aes128_ccm_protocol_vector", ccmEncryptOk);
+
+        uint8_t recoveredCcm[7];
+        memset(recoveredCcm, 0xa5, sizeof(recoveredCcm));
+        const bool ccmDecryptOk = CryptoEngine::aes128CcmDecrypt(ccmKey, nonce,
+            associatedData, sizeof(associatedData), expectedCcmCiphertext,
+            sizeof(expectedCcmCiphertext), expectedCcmTag, recoveredCcm) &&
+            memcmp(recoveredCcm, ccmPlaintext, sizeof(recoveredCcm)) == 0;
+        record("aes128_ccm_decrypt", ccmDecryptOk);
+
+        uint8_t invalidTag[8];
+        memcpy(invalidTag, expectedCcmTag, sizeof(invalidTag));
+        invalidTag[0] ^= 1;
+        memset(recoveredCcm, 0xa5, sizeof(recoveredCcm));
+        const bool ccmRejectOk = !CryptoEngine::aes128CcmDecrypt(ccmKey, nonce,
+            associatedData, sizeof(associatedData), expectedCcmCiphertext,
+            sizeof(expectedCcmCiphertext), invalidTag, recoveredCcm) &&
+            allZeroBytes(recoveredCcm, sizeof(recoveredCcm));
+        record("aes128_ccm_rejects_bad_tag", ccmRejectOk);
+
+        static const uint8_t gcmKey[32] = {};
+        static const uint8_t gcmNonce[12] = {};
+        static const uint8_t gcmPlaintext[16] = {};
+        uint8_t gcmCiphertext[16] = {};
+        uint8_t gcmTag[16] = {};
+        const bool gcmEncryptOk = CryptoEngine::aes256GcmEncrypt(gcmKey, gcmNonce,
+            nullptr, 0, gcmPlaintext, sizeof(gcmPlaintext), gcmCiphertext, gcmTag) &&
+            memcmp(gcmCiphertext, expectedGcmCiphertext, sizeof(gcmCiphertext)) == 0 &&
+            memcmp(gcmTag, expectedGcmTag, sizeof(gcmTag)) == 0;
+        record("aes256_gcm_vector", gcmEncryptOk);
+
+        uint8_t recoveredGcm[16] = {};
+        const bool gcmDecryptOk = CryptoEngine::aes256GcmDecrypt(gcmKey, gcmNonce,
+            nullptr, 0, expectedGcmCiphertext, sizeof(expectedGcmCiphertext),
+            expectedGcmTag, recoveredGcm) &&
+            memcmp(recoveredGcm, gcmPlaintext, sizeof(recoveredGcm)) == 0;
+        record("aes256_gcm_decrypt", gcmDecryptOk);
+
+        uint8_t generatedPrivate[32] = {};
+        uint8_t generatedPublic[32] = {};
+        uint8_t generatedShared[32] = {};
+        const bool generatedKeyOk = CryptoEngine::generateX25519KeyPair(
+            generatedPrivate, generatedPublic) &&
+            CryptoEngine::x25519(generatedPrivate, generatedPublic, generatedShared) &&
+            !allZeroBytes(generatedShared, sizeof(generatedShared));
+        record("x25519_key_generation", generatedKeyOk);
+
+        uint8_t random[32] = {};
+        const bool randomOk = CryptoEngine::randomBytes(random, sizeof(random));
+        record("random_bytes", randomOk);
+        CryptoEngine::zeroize(random, sizeof(random));
+        record("zeroize", allZeroBytes(random, sizeof(random)));
+        result["passed"] = passed;
+        result["diagnostic"] = true;
+    }
+
     void handleMessages(const char* command, JsonObjectConst args, JsonObject response,
                         uint64_t nowMs) {
-        if (!requireUnlocked(response)) return;
         JsonObject result = response["result"].as<JsonObject>();
+        if (strcmp(command, "mock.crypto.selftest") == 0) {
+            runCryptoSelfTest(result);
+            return;
+        }
+        if (!requireUnlocked(response)) return;
         if (strcmp(command, "mock.set_scenario") == 0) {
             if (!Commands::stringArg(args, response, "outcome", 1, 11)) return;
             const char* value = args["outcome"];
@@ -1191,7 +1419,9 @@ private:
             handleRadioDiagnostics(command, args, response, nowMs);
             return;
         }
-        if (strncmp(command, "msg.", 4) == 0 || strncmp(command, "mock.", 5) == 0) {
+        if (strncmp(command, "msg.", 4) == 0 ||
+            (strncmp(command, "mock.", 5) == 0 &&
+             strcmp(command, "mock.crypto.selftest") != 0)) {
             Commands::fail(response, "E_BUSY", "mock chat is disabled in the real radio diagnostic image");
             return;
         }
