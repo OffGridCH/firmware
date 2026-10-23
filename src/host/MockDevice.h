@@ -14,6 +14,7 @@
 #include <math.h>
 
 #include "../BoardConfig.h"
+#include "../Types.h"
 #include "Commands.h"
 #include "SerialLink.h"
 #include "../security/CryptoEngine.h"
@@ -27,6 +28,99 @@ public:
 #else
     explicit MockDevice(SerialLink& link) : serialLink(link) {}
 #endif
+
+    using UiHandler = void (*)(void* context, UiEvent event, uint64_t nowMs);
+
+    void setUiHandler(UiHandler handler, void* context) {
+        uiHandler_ = handler;
+        uiContext_ = context;
+    }
+
+    UiSnapshot uiSnapshot(uint64_t nowMs) const {
+        UiSnapshot snapshot;
+        snapshot.uptimeMs = nowMs;
+        snapshot.state = !provisioned_ ? DeviceState::Unprovisioned :
+            unlocked_ ? DeviceState::Unlocked : DeviceState::Locked;
+        snapshot.radioDiagnostics = OFFGRID_RADIO_DIAGNOSTICS != 0;
+        memcpy(snapshot.deviceId, deviceId_, sizeof(deviceId_));
+        if (unlocked_) {
+            memcpy(snapshot.nodeId, nodeId_, sizeof(nodeId_));
+            memcpy(snapshot.name, name_, sizeof(name_));
+            memcpy(snapshot.fingerprint, lastFingerprint_, sizeof(lastFingerprint_));
+            snapshot.contacts = contactCount();
+            snapshot.pendingMessages = pendingCount();
+        }
+        snapshot.radioRunning = radioRunning();
+        snapshot.relayOnly = snapshot.radioRunning && !unlocked_;
+        const JsonObjectConst radio = config_["radio"].as<JsonObjectConst>();
+        snapshot.frequencyMhz = radio["freq_mhz"];
+        snapshot.bandwidthKhz = radio["bw_khz"];
+        snapshot.spreadingFactor = radio["sf"];
+        snapshot.txPackets = txPackets_;
+        snapshot.rxPackets = rxPackets_;
+        snapshot.hasSignal = rxPackets_ != 0;
+        snapshot.rssi = snapshot.hasSignal ? -92 : 0;
+        snapshot.snr = snapshot.hasSignal ? 7.5f : 0;
+#if OFFGRID_RADIO_DIAGNOSTICS
+        const RadioDriver::Stats& stats = radioDriver.stats();
+        snapshot.relayOnly = false;
+        snapshot.radioError = radioDriver.lastError();
+        snapshot.frequencyMhz = radioDriver.config().frequencyMhz;
+        snapshot.bandwidthKhz = radioDriver.config().bandwidthKhz;
+        snapshot.spreadingFactor = radioDriver.config().spreadingFactor;
+        snapshot.txPackets = stats.transmitted;
+        snapshot.rxPackets = stats.received;
+        snapshot.hasSignal = stats.hasSignal;
+        snapshot.rssi = stats.lastRssi;
+        snapshot.snr = stats.lastSnr;
+#endif
+        const uint64_t pairingElapsed = nowMs - pairingAt_;
+        snapshot.pairingActive = unlocked_ && pairing_ && pairingElapsed < 300000;
+        if (snapshot.pairingActive) {
+            snapshot.pairingRemainingS = (300000 - pairingElapsed + 999) / 1000;
+        }
+        const uint64_t resetElapsed = nowMs - resetArmedAt_;
+        snapshot.resetArmed = resetArmed_ && resetElapsed < 10000;
+        if (snapshot.resetArmed) {
+            snapshot.resetRemainingS = (10000 - resetElapsed + 999) / 1000;
+            if (stableButton_ && holdAt_ != 0) {
+                const uint64_t held = nowMs - holdAt_;
+                snapshot.resetHoldPermille = held >= 3000 ? 1000 : held / 3;
+            }
+        }
+        return snapshot;
+    }
+
+    bool takeLedConfig(LedConfig& output) {
+        if (!ledConfigDirty_) return false;
+        const JsonObjectConst config = config_["led"].as<JsonObjectConst>();
+        output.enabled = config["enabled"];
+        output.quiet = config["quiet"];
+        output.brightness = config["brightness"];
+        const char* states[] = {"unprovisioned", "locked", "unlocked"};
+        const char* events[] = {"tx", "rx", "msg_received", "delivered", "failed", "error", "pairing"};
+        for (size_t index = 0; index < LedConfig::StateCount; ++index) {
+            output.statePatterns[index] = ledPattern(config["state_patterns"][states[index]]);
+        }
+        for (size_t index = 0; index < LedConfig::EventCount; ++index) {
+            output.eventPatterns[index] = ledPattern(config["event_patterns"][events[index]]);
+        }
+        ledConfigDirty_ = false;
+        return true;
+    }
+
+    bool takeLedPreview(LedPattern& output) {
+        if (!ledPreviewPending_) return false;
+        output = ledPreview_;
+        ledPreviewPending_ = false;
+        return true;
+    }
+
+    bool takePageAdvance() {
+        const bool pending = pageAdvance_;
+        pageAdvance_ = false;
+        return pending;
+    }
 
     void init() {
         resetConfig();
@@ -87,8 +181,15 @@ public:
         }
         if (rawButton_ != stableButton_ && nowMs - buttonChangedAt_ >= 30) {
             stableButton_ = rawButton_;
+            if (stableButton_) {
+                buttonPressedAt_ = nowMs;
+                resetPress_ = resetArmed_;
+            }
             if (stableButton_ && resetArmed_ && resetSawRelease_) holdAt_ = nowMs;
             if (!stableButton_) {
+                if (buttonPressedAt_ != 0 && nowMs - buttonPressedAt_ < 1000 &&
+                    !resetPress_ && !resetArmed_) pageAdvance_ = true;
+                buttonPressedAt_ = 0;
                 resetSawRelease_ = true;
                 holdAt_ = 0;
             }
@@ -104,6 +205,9 @@ public:
             unlocked_ = false;
             session_ = false;
             configStore_.copyTo(config_, lockTimeoutS_);
+            ledConfigDirty_ = true;
+            ledPreviewPending_ = false;
+            lastFingerprint_[0] = '\0';
             syncMesh();
 #if OFFGRID_RADIO_DIAGNOSTICS
             radioDriver.standby();
@@ -127,6 +231,7 @@ public:
             radioDriver.standby();
 #endif
         }
+        if (!unlocked_) lastFingerprint_[0] = '\0';
         if (stateReason_ != nullptr && serialLink.availableTxSlots() > 0) {
             StaticJsonDocument<384> event;
             event["evt"] = "sec.state";
@@ -136,7 +241,10 @@ public:
             if (serialLink.sendJson(event)) stateReason_ = nullptr;
         }
         if (storageNotice_ != nullptr && serialLink.availableTxSlots() > 0) {
-            if (serialLink.sendError("E_INTERNAL", storageNotice_, nowMs)) storageNotice_ = nullptr;
+            if (serialLink.sendError("E_INTERNAL", storageNotice_, nowMs)) {
+                notifyUi(UiEvent::Error, nowMs);
+                storageNotice_ = nullptr;
+            }
         }
         if (logPending_ && serialLink.availableTxSlots() > 0) {
             StaticJsonDocument<384> event;
@@ -183,6 +291,41 @@ private:
 #if OFFGRID_RADIO_DIAGNOSTICS
     RadioDriver& radioDriver;
 #endif
+    UiHandler uiHandler_ = nullptr;
+    void* uiContext_ = nullptr;
+    bool ledConfigDirty_ = true;
+    bool ledPreviewPending_ = false;
+    LedPattern ledPreview_;
+    char lastFingerprint_[15] = {};
+    bool pageAdvance_ = false;
+    bool resetPress_ = false;
+    uint64_t buttonPressedAt_ = 0;
+
+    void notifyUi(UiEvent event, uint64_t nowMs) {
+        if (uiHandler_ != nullptr) uiHandler_(uiContext_, event, nowMs);
+    }
+
+    static LedPattern ledPattern(JsonVariantConst value) {
+        LedPattern pattern;
+        if (value.is<const char*>()) {
+            const char* names[] = {"off", "on", "flash", "blink_slow", "blink_fast", "double", "heartbeat", "pulse"};
+            for (size_t index = 0; index < 8; ++index) {
+                if (strcmp(value.as<const char*>(), names[index]) == 0) {
+                    pattern.kind = static_cast<LedPatternKind>(index);
+                    break;
+                }
+            }
+        } else {
+            pattern.kind = LedPatternKind::Custom;
+            const JsonArrayConst steps = value["steps"].as<JsonArrayConst>();
+            for (JsonVariantConst step : steps) {
+                if (pattern.stepCount == 16) break;
+                pattern.stepsMs[pattern.stepCount++] = step.as<uint16_t>();
+            }
+            pattern.repeat = value["repeat"] | 1;
+        }
+        return pattern;
+    }
 #if OFFGRID_RADIO_DIAGNOSTICS
     void radioFailure(JsonObject response) {
         Commands::fail(response, radioDriver.lastError() == RadioDriver::Busy ? "E_BUSY" : "E_RADIO",
@@ -299,7 +442,14 @@ private:
 
     void tickRadio(uint64_t nowMs) {
         radioDriver.tick(nowMs);
-        if (!radioEventPending_) radioEventPending_ = radioDriver.popEvent(radioEvent_);
+        if (!radioEventPending_) {
+            radioEventPending_ = radioDriver.popEvent(radioEvent_);
+            if (radioEventPending_) {
+                if (radioEvent_.type == RadioDriver::EventType::Received) notifyUi(UiEvent::Rx, nowMs);
+                if (radioEvent_.type == RadioDriver::EventType::Transmitted) notifyUi(UiEvent::Tx, nowMs);
+                if (radioEvent_.type == RadioDriver::EventType::Failed) notifyUi(UiEvent::Error, nowMs);
+            }
+        }
         if (!radioEventPending_ || serialLink.availableTxSlots() == 0) return;
         StaticJsonDocument<2048> event;
         const RadioDriver::EventType type = radioEvent_.type;
@@ -358,6 +508,9 @@ private:
                         storageNotice_ = "configuration load failed; using defaults with persistent writes disabled";
                 }
                 configStore_.copyTo(config_, lockTimeoutS_);
+        ledConfigDirty_ = true;
+        ledPreviewPending_ = false;
+        lastFingerprint_[0] = '\0';
         syncMesh();
     }
 
@@ -433,6 +586,9 @@ private:
                 !Commands::integerArg(args, response, "repeat", 1, 255, false)) return;
             result["preview"] = true;
             result["repeat"] = args["repeat"] | 1;
+            ledPreview_ = ledPattern(args["pattern"]);
+            ledPreview_.repeat = args["repeat"] | 1;
+            ledPreviewPending_ = true;
             return;
         }
         const char* category = strncmp(command, "radio.", 6) == 0 ? "radio" :
@@ -571,6 +727,7 @@ private:
                 return;
             }
             config_.set(configScratch_);
+            if (strcmp(category, "led") == 0) ledConfigDirty_ = true;
 #if OFFGRID_RADIO_DIAGNOSTICS
             if (strcmp(category, "radio") == 0) {
                 radioDriver.queueConfig(radioConfig(candidate));
@@ -797,6 +954,8 @@ private:
             data["rssi"] = -92;
             data["snr"] = 7.5;
             if (serialLink.sendJson(event)) {
+                notifyUi(UiEvent::Rx, nowMs);
+                notifyUi(UiEvent::MessageReceived, nowMs);
                 Contact& contact = contacts_[incoming_.contact];
                 contact.rxCounter = incoming_.counter;
                 ++rxPackets_;
@@ -845,12 +1004,16 @@ private:
                 data["rtt_ms"] = nowMs - message.created;
             }
             if (!serialLink.sendJson(event)) return;
+            if (message.failure != nullptr) notifyUi(UiEvent::Failed, nowMs);
             if (strcmp(status, "sent") == 0 || strcmp(status, "retrying") == 0) {
+                notifyUi(UiEvent::Tx, nowMs);
                 ++txPackets_;
                 txAirtime_ += airtime(packetBytes(message));
                 if (message.retry > 0) ++retryPackets_;
                 queueTrace(message, true);
             } else if (strcmp(status, "delivered") == 0) {
+                notifyUi(UiEvent::Rx, nowMs);
+                notifyUi(UiEvent::Delivered, nowMs);
                 ++acksReceived_;
                 ++rxPackets_;
                 queueTrace(message, false, true);
@@ -1240,6 +1403,7 @@ private:
             encode(raw, length, qr, sizeof(qr));
             pairing_ = true;
             pairingAt_ = nowMs;
+            lastFingerprint_[0] = '\0';
             result["qr"].set(qr);
             result["qr_bytes"] = length;
             result["expires_s"] = 300;
@@ -1318,6 +1482,7 @@ private:
             }
             failMessages(slot, "contact_deleted");
             contacts_[slot] = candidate;
+            memcpy(lastFingerprint_, candidate.fingerprint, sizeof(lastFingerprint_));
             writeContact(result.createNestedObject("contact"), slot);
             JsonArray warnings = result.createNestedArray("warnings");
             if (collision) warnings.add("node_id_collision");
