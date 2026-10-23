@@ -328,7 +328,8 @@ def main():
         parser.error("--args must be a JSON object")
     if args.command and (args.radio_peer or args.storage_phase):
         parser.error("--command cannot be combined with a checker mode")
-    read_only = {"sys.hello", "sys.status", "sys.ping", "radio.get", "mesh.get", "led.get", "diag.radio.status"}
+    read_only = {"sys.hello", "sys.status", "sys.ping", "radio.get", "mesh.get", "led.get",
+                 "diag.radio.status", "mock.crypto.selftest"}
     if args.command and args.command not in read_only and not args.allow_mock_changes:
         parser.error("non-read-only commands require --allow-mock-changes")
     if args.command == "diag.radio.tx" and not args.allow_radio_transmit:
@@ -379,6 +380,8 @@ def send_command(device, command, arguments, allow_mock_changes):
             if command == "sec.rotate_token":
                 device.call("sys.hello")
     result = device.call(command, arguments)
+    if command == "mock.crypto.selftest" and result.get("passed") is not True:
+        raise RuntimeError("device CryptoEngine known-answer tests failed")
     if command == "radio.set" and result.get("apply_pending"):
         device.event("diag.radio.configured", timeout=10)
         device.call("diag.radio.status")

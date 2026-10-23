@@ -98,6 +98,7 @@ raw prints or retain borrowed JSON views between ticks.
 | `contact.list/get/rename/delete` | 32 stable public-data slots; pagination bounded by count and wire size; deletion requires true confirmation |
 | `msg.send/cancel/pending` | Typed validation, eight RAM slots, monotonically allocated refs/counters, asynchronous status changes |
 | `mock.set_scenario` | Unlocked mock-only delivery outcome: delivered, timeout, or radio_error; applies to subsequently queued messages |
+| `mock.crypto.selftest` | Read-only mock diagnostic that runs CryptoEngine known-answer checks on the board; not present in production firmware |
 | `mock.receive` | Unlocked mock-only incoming message fixture, using from/type/payload and optional increasing ctr, hops and retry |
 | `radio.get/set` | Defaults, presets, strict ranges, warnings and calculated airtime; no radio is initialized |
 | `radio.stats` | Synthetic packet/ACK/retry counters and signal values; optional reset reads then clears counters |

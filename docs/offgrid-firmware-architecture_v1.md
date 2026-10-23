@@ -191,11 +191,15 @@ also respect actual serialized output size, not just a contact-count limit.
 
 ### CryptoEngine
 
-Provides RNG, SHA-256, HMAC, HKDF, X25519, AES-256-GCM, AES-128-CCM, SipHash,
-and secure zeroization through vetted libraries. Rejects invalid DH results and
-propagates crypto failures. It contains primitives, not device state, pairing
-policy, JSON, flash access, or radio scheduling. Never implement new crypto
-algorithms merely to reduce dependencies or file count.
+Provides RNG, SHA-256, HMAC, HKDF-SHA256, X25519, AES-256-GCM, AES-128-CCM,
+and secure zeroization through ESP-IDF/Mbed TLS. It rejects all-zero DH results
+and propagates crypto failures. The bundled ESP32-S3 SDK does not link its direct
+HKDF entry point and its PSA HKDF provider reports `NOT_SUPPORTED`; the current
+HKDF implementation follows RFC 5869 extract/expand using Mbed TLS HMAC and is
+checked against RFC and protocol vectors on-device. SipHash is deferred until a
+vetted implementation is selected for MeshEngine; do not handwrite a primitive.
+CryptoEngine contains no device state, pairing policy, JSON, flash access, or
+radio scheduling.
 
 ### Security
 
