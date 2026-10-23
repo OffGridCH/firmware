@@ -3,8 +3,10 @@
 
 import argparse
 import base64
+import copy
 from collections import deque
 import json
+from pathlib import Path
 import time
 
 
@@ -14,6 +16,36 @@ class Device:
         self.reference = 0
         self.events = deque(maxlen=128)
         self.buffer = bytearray()
+        self.startup_ids = set()
+
+    def connect(self, timeout=10):
+        deadline = time.monotonic() + timeout
+        next_probe = time.monotonic() + 0.5
+        while time.monotonic() < deadline:
+            if time.monotonic() >= next_probe:
+                self.reference += 1
+                self.startup_ids.add(self.reference)
+                request = {"id": self.reference, "cmd": "sys.hello",
+                           "args": {"app": "serial-check", "app_proto": "1.0"}}
+                wire = json.dumps(request, separators=(",", ":")).encode() + b"\n"
+                print(">", wire.decode().strip())
+                self.connection.write(b"\n" + wire)
+                next_probe = time.monotonic() + 0.5
+            try:
+                response = self.read(min(deadline, next_probe))
+            except TimeoutError:
+                continue
+            if "evt" in response:
+                self.events.append(response)
+                if response["evt"] == "sys.boot":
+                    next_probe = time.monotonic()
+                continue
+            if response.get("error", {}).get("code") == "E_PARSE" and "id" not in response:
+                continue
+            if response.get("id") not in self.startup_ids or not response.get("ok"):
+                raise RuntimeError(f"hello failed during startup: {response}")
+            return response["result"]
+        raise TimeoutError("no hello within startup timeout; check port, baud and flashed image")
 
     def read(self, deadline):
         while time.monotonic() < deadline:
@@ -51,6 +83,8 @@ class Device:
                 self.events.append(response)
                 continue
             if response.get("id") != self.reference:
+                if response.get("id") in self.startup_ids:
+                    continue
                 raise RuntimeError(f"unexpected response ID: {response}")
             if error is not None:
                 assert not response["ok"] and response["error"]["code"] == error, response
@@ -72,7 +106,7 @@ class Device:
 
 
 def exercise(device):
-    hello = device.call("sys.hello", {"app": "serial-check", "app_proto": "1.0"})
+    hello = device.connect()
     assert hello.get("mock") is True and hello.get("mock_stage") == 5, hello
     assert len(base64.b64decode(hello["session"]["device_eph_pub"], validate=True)) == 32
     assert len(base64.b64decode(hello["session"]["nonce"], validate=True)) == 16
@@ -135,14 +169,150 @@ def exercise(device):
     print("PASS: real-port mock API checks completed; device remains locked")
 
 
+def require_equal(actual, expected, label):
+    if actual != expected:
+        raise RuntimeError(f"{label}: expected {expected!r}, got {actual!r}")
+
+
+def unlock_mock(device, hello=None):
+    if hello is None:
+        hello = device.call("sys.hello")
+    wrapper = {
+        "app_eph_pub": "wLEmtaoTS4TmRiUla43olzeHYSsfODnSxgUm0hFOiG0=",
+        "wrapped_token": base64.b64encode(bytes(60)).decode(),
+    }
+    if hello["state"] == "unprovisioned":
+        device.call("sec.provision", wrapper)
+    elif hello["state"] == "locked":
+        device.call("sec.unlock", wrapper)
+
+
+def read_configuration(device):
+    configuration = {}
+    for category in ("radio", "mesh", "led"):
+        values = device.call(f"{category}.get")
+        for field in ("est_airtime_ms_23b", "max_text_bytes", "warnings", "builtin_patterns"):
+            values.pop(field, None)
+        configuration[category] = values
+    configuration["policy"] = device.call("sec.get_policy")
+    return configuration
+
+
+def save_configuration(device, configuration):
+    for category in ("radio", "mesh", "led"):
+        device.call(f"{category}.set", dict(configuration[category], persist=True))
+    device.call("sec.set_policy", dict(configuration["policy"], persist=True))
+
+
+def exercise_storage(device, phase, state_path):
+    hello = device.connect()
+    if hello.get("mock") is not True or hello.get("config_storage") != "nvs":
+        raise RuntimeError("refusing to change a non-mock or non-NVS firmware image")
+    storage = device.call("sys.status")["storage"]
+    if not storage["writable"] and phase != "reset":
+        raise RuntimeError(f"storage is read-only: {storage}; use confirmed factory reset to recover")
+
+    if phase == "write":
+        if state_path.exists():
+            raise RuntimeError(f"snapshot already exists: {state_path}; verify/restore it first")
+        unlock_mock(device, hello)
+        device.events.clear()
+        device.call("sys.reboot")
+        device.event("sys.boot", lambda data: data["reset_reason"] == "software")
+        unlock_mock(device)
+        original = read_configuration(device)
+        expected = copy.deepcopy(original)
+        expected["radio"]["sf"] = 8 if original["radio"]["sf"] != 8 else 9
+        expected["mesh"]["hop_default"] = 5 if original["mesh"]["hop_default"] != 5 else 4
+        expected["mesh"]["ack_default"]["geo"] = not original["mesh"]["ack_default"]["geo"]
+        expected["led"]["brightness"] = 41 if original["led"]["brightness"] != 41 else 42
+        expected["led"]["state_patterns"]["locked"] = {"steps": [50, 1950], "repeat": 2}
+        expected["policy"]["lock_timeout_s"] = 120
+        snapshot = {"version": 1, "device_id": hello["device_id"], "original": original,
+                    "expected": expected, "prepared": False}
+        with state_path.open("x", encoding="utf-8") as output:
+            json.dump(snapshot, output, indent=2)
+        save_configuration(device, expected)
+        require_equal(read_configuration(device), expected, "saved configuration")
+        device.call("radio.set", {"sf": 10, "tx_power_dbm": "bad"}, error="E_INVALID_ARG")
+        device.call("mesh.set", {"hop_default": 2, "ack_default": {"geo": "bad"}}, error="E_INVALID_ARG")
+        device.call("led.set", {"brightness": 99, "state_patterns": {"locked": {"steps": [0]}}}, error="E_INVALID_ARG")
+        device.call("sec.set_policy", {"lock_timeout_s": "bad"}, error="E_INVALID_ARG")
+        require_equal(read_configuration(device), expected, "invalid updates must be atomic")
+        temporary_sf = 7 if expected["radio"]["sf"] != 7 else 8
+        device.call("radio.set", {"sf": temporary_sf, "persist": False})
+        device.call("mesh.set", {"hop_default": 1, "persist": False})
+        device.call("led.set", {"brightness": 99, "persist": False})
+        device.call("sec.set_policy", {"lock_timeout_s": 30, "persist": False})
+        device.call("radio.set", {"tx_power_dbm": 13, "persist": True})
+        expected["radio"]["sf"] = temporary_sf
+        expected["radio"]["tx_power_dbm"] = 13
+        device.call("radio.set", {"sf": 12, "persist": False})
+        live = read_configuration(device)
+        require_equal(live["radio"]["sf"], 12, "temporary radio setting")
+        require_equal(live["mesh"]["hop_default"], 1, "temporary mesh setting")
+        require_equal(live["led"]["brightness"], 99, "temporary LED setting")
+        require_equal(live["policy"]["lock_timeout_s"], 30, "temporary policy")
+        snapshot["prepared"] = True
+        state_path.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
+        print(f"WRITE complete. Snapshot: {state_path.resolve()}")
+        print("Physically reset or power-cycle the board, then run --storage-phase verify.")
+        return
+
+    if phase == "reset":
+        device.events.clear()
+        device.call("sys.factory_reset", {"confirm": "ERASE"})
+        print("NOW release PRG if held, then hold it for 3 seconds within the 10-second window.", flush=True)
+        device.event("sec.state", lambda data: data["reason"] == "factory_reset", timeout=12)
+        device.event("sys.boot", lambda data: data["config_status"] == "defaults")
+        unlock_mock(device)
+        actual = read_configuration(device)
+        require_equal(actual["radio"]["freq_mhz"], 869.525, "reset frequency")
+        require_equal(actual["radio"]["sf"], 9, "reset spreading factor")
+        require_equal(actual["mesh"]["hop_default"], 3, "reset hop default")
+        require_equal(actual["led"]["brightness"], 128, "reset brightness")
+        require_equal(actual["policy"]["lock_timeout_s"], 15, "reset policy")
+        require_equal(device.call("sys.status")["storage"]["config_status"], "defaults", "erased namespace")
+        device.call("sec.lock")
+        print("PASS: physically confirmed configuration reset restored defaults.")
+        return
+
+    snapshot = json.loads(state_path.read_text(encoding="utf-8"))
+    require_equal(snapshot["version"], 1, "snapshot version")
+    require_equal(hello["device_id"], snapshot["device_id"], "snapshot board ID")
+    if phase == "verify":
+        require_equal(snapshot["prepared"], True, "completed write phase")
+        require_equal(hello["state"], "unprovisioned", "physical reset required, not simulated reboot")
+        require_equal(storage["config_status"], "loaded", "configuration loaded from NVS")
+        unlock_mock(device, hello)
+        require_equal(read_configuration(device), snapshot["expected"], "configuration after physical reset")
+        device.call("sec.lock")
+        print("PASS: NVS survives physical reset; temporary and rejected changes did not leak into storage.")
+    else:
+        unlock_mock(device, hello)
+        save_configuration(device, snapshot["original"])
+        require_equal(read_configuration(device), snapshot["original"], "restored configuration")
+        device.call("sec.lock")
+        state_path.unlink()
+        print("PASS: original persisted configuration restored; snapshot removed.")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", required=True)
     parser.add_argument("--baud", type=int, default=115200)
     parser.add_argument("--allow-mock-changes", action="store_true",
                         help="permit synthetic provisioning, settings changes, pairing and deletion")
+    parser.add_argument("--storage-phase", choices=("write", "verify", "restore", "reset"),
+                        help="run the NVS device check instead of the general mock API check")
+    parser.add_argument("--state", type=Path, default=Path("config-check-state.json"),
+                        help="local original/expected settings snapshot for storage checks")
+    parser.add_argument("--allow-config-changes", action="store_true",
+                        help="permit real flash writes and mock provisioning for storage checks")
     args = parser.parse_args()
-    if not args.allow_mock_changes:
+    if args.storage_phase and not args.allow_config_changes:
+        parser.error("--allow-config-changes is required; storage checks modify real NVS settings")
+    if not args.storage_phase and not args.allow_mock_changes:
         parser.error("--allow-mock-changes is required; this modifies a flashed mock")
     import serial
 
@@ -153,7 +323,10 @@ def main():
     connection.open()
     with connection:
         connection.reset_input_buffer()
-        exercise(Device(connection))
+        if args.storage_phase:
+            exercise_storage(Device(connection), args.storage_phase, args.state)
+        else:
+            exercise(Device(connection))
 
 
 if __name__ == "__main__":

@@ -8,23 +8,36 @@ Firmware for the Heltec WiFi LoRa 32 V3. This branch currently builds a
 Serial mock Stage 5 implements bounded JSON Lines communication, system commands,
 hello/session envelopes, mock provisioning/unlock/lock, heartbeat, policy, simulated
 reboot, and physically confirmed mock reset. Status and boot events include
-`mock: true` and `mock_stage: 5`. Firmware version is `0.1.0-serial-mock.5`.
+`mock: true` and `mock_stage: 5`. Firmware version is `0.1.0-config-store.1`.
 
 The mock validates wrapper shapes but **bypasses authentication**. Public identity,
 QR pairing, 32-slot contact CRUD, typed messages, pending/cancel, and simulated
 incoming/delivery/failure events are implemented. Radio/mesh/LED configuration,
-synthetic statistics/logs/traces, and simulated persistence are also available.
-Radio, LEDs, strips, and OLED are not initialized. No application data is written
-to flash. See the [host README](src/host/README.md) for supported commands and
-the RAM-only persistence/simulated reboot limitations.
+synthetic statistics/logs/traces, and real NVS configuration persistence are available.
+Radio, LEDs, strips, and OLED are not initialized. Only configuration and timeout
+policy are stored in flash; identity, tokens, contacts and messages remain mocks.
+See the [host README](src/host/README.md) for API behavior and the
+[storage README](src/storage/README.md) for the record format and device checker.
 
-Stages 2 through 5 are separate commits. The host README also documents the
-real-port exerciser in `tools/serial-check.py`. Both firmware profiles compile;
-hardware/Android acceptance is still pending because no USB board was detected.
+Storage is implemented in separate module, integration and checker/documentation
+commits. The UART configuration image compiles; physical persistence checks
+must be run on your board with the single Python checker below.
 
-See [serial stages and device checks](docs/serial-mock-milestones.md) for commit
-boundaries and acceptance scenarios. The [host specification](docs/offgrid-link.md)
+The [host specification](docs/offgrid-link.md)
 describes the complete target API, not the subset already implemented.
+
+## Storage Device Check
+
+```sh
+python3 tools/serial-check.py --port /dev/ttyUSB0 --storage-phase write --allow-config-changes
+# Physically reset or power-cycle the board before the next command.
+python3 tools/serial-check.py --port /dev/ttyUSB0 --storage-phase verify --allow-config-changes
+python3 tools/serial-check.py --port /dev/ttyUSB0 --storage-phase restore --allow-config-changes
+```
+
+Requires `pyserial`. Keep the generated snapshot until restore succeeds.
+The optional `--storage-phase reset` checks physically confirmed configuration
+erasure; see the storage README before running it.
 
 ## Build and Upload
 

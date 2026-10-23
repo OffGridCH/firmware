@@ -1,1 +1,219 @@
 #include "ConfigStore.h"
+
+#include <math.h>
+#include <nvs.h>
+#include <nvs_flash.h>
+#include <string.h>
+
+void ConfigStore::defaults() {
+	deserializeJson(saved_, R"json({
+	  "schema":1,
+	  "radio":{"freq_mhz":869.525,"bw_khz":125,"sf":9,"cr":5,"tx_power_dbm":14,"preamble":8,"sync_word":79},
+	  "mesh":{"hop_default":3,"relay_enabled":true,"relay_when_locked":false,"cad_enabled":true,"backoff_slots":8,"retries":3,"retry_base_ms":0,"rate_limit_per_src":20,"ack_default":{"text":true,"reaction":false,"geo":false}},
+	  "led":{"enabled":true,"quiet":false,"brightness":128,"state_patterns":{"unprovisioned":"pulse","locked":"blink_slow","unlocked":"off"},"event_patterns":{"tx":"flash","rx":"flash","msg_received":"double","delivered":"off","failed":{"steps":[100,100],"repeat":3},"error":"blink_fast","pairing":"heartbeat"}},
+	  "security":{"lock_timeout_s":15}
+	})json");
+}
+
+bool ConfigStore::validPattern(JsonVariantConst pattern) {
+	if (pattern.is<const char*>()) {
+		const JsonString value = pattern.as<JsonString>();
+		if (strlen(value.c_str()) != value.size()) return false;
+		const char* names[] = {"off", "on", "flash", "blink_slow", "blink_fast", "double", "heartbeat", "pulse"};
+		for (const char* name : names) if (strcmp(value.c_str(), name) == 0) return true;
+		return false;
+	}
+	if (!pattern.is<JsonObjectConst>()) return false;
+	const JsonArrayConst steps = pattern["steps"].as<JsonArrayConst>();
+	if (steps.isNull() || steps.size() == 0 || steps.size() > 16) return false;
+	for (JsonVariantConst step : steps) {
+		if (!step.is<int>() || step.as<int>() < 10 || step.as<int>() > 10000) return false;
+	}
+	if (pattern.as<JsonObjectConst>().containsKey("repeat")) {
+		if (!pattern["repeat"].is<int>() || pattern["repeat"].as<int>() < 1 ||
+			pattern["repeat"].as<int>() > 255) return false;
+	}
+	return true;
+}
+
+bool ConfigStore::validRecord(JsonObjectConst record) {
+	if (!record["schema"].is<uint32_t>() || record["schema"].as<uint32_t>() != SchemaVersion ||
+		!record["radio"].is<JsonObjectConst>() || !record["mesh"].is<JsonObjectConst>() ||
+		!record["led"].is<JsonObjectConst>() || !record["security"].is<JsonObjectConst>()) return false;
+
+	const JsonObjectConst radio = record["radio"];
+	if (!radio["freq_mhz"].is<double>() || !isfinite(radio["freq_mhz"].as<double>()) ||
+		radio["freq_mhz"].as<double>() < 150 || radio["freq_mhz"].as<double>() > 960 ||
+		!radio["bw_khz"].is<double>()) return false;
+	const double bandwidth = radio["bw_khz"];
+	if (bandwidth != 62.5 && bandwidth != 125 && bandwidth != 250 && bandwidth != 500) return false;
+
+	struct Range { const char* category; const char* key; int minimum; int maximum; };
+	const Range ranges[] = {
+		{"radio", "sf", 5, 12}, {"radio", "cr", 5, 8}, {"radio", "tx_power_dbm", -9, 22},
+		{"radio", "preamble", 6, 64}, {"radio", "sync_word", 0, 255},
+		{"mesh", "hop_default", 0, 7}, {"mesh", "backoff_slots", 0, 32},
+		{"mesh", "retries", 0, 3}, {"mesh", "retry_base_ms", 0, 60000},
+		{"mesh", "rate_limit_per_src", 0, 255}, {"led", "brightness", 0, 255},
+		{"security", "lock_timeout_s", 0, 3600}
+	};
+	for (const Range& range : ranges) {
+		const JsonVariantConst value = record[range.category][range.key];
+		if (!value.is<int>() || value.as<int>() < range.minimum || value.as<int>() > range.maximum) return false;
+	}
+	const char* meshFlags[] = {"relay_enabled", "relay_when_locked", "cad_enabled"};
+	for (const char* key : meshFlags) if (!record["mesh"][key].is<bool>()) return false;
+	if (!record["mesh"]["ack_default"].is<JsonObjectConst>()) return false;
+	const char* types[] = {"text", "reaction", "geo"};
+	for (const char* key : types) if (!record["mesh"]["ack_default"][key].is<bool>()) return false;
+	if (!record["led"]["enabled"].is<bool>() || !record["led"]["quiet"].is<bool>() ||
+		!record["led"]["state_patterns"].is<JsonObjectConst>() ||
+		!record["led"]["event_patterns"].is<JsonObjectConst>()) return false;
+	const char* states[] = {"unprovisioned", "locked", "unlocked"};
+	const char* events[] = {"tx", "rx", "msg_received", "delivered", "failed", "error", "pairing"};
+	for (const char* key : states) if (!validPattern(record["led"]["state_patterns"][key])) return false;
+	for (const char* key : events) if (!validPattern(record["led"]["event_patterns"][key])) return false;
+	return true;
+}
+
+bool ConfigStore::load() {
+	defaults();
+	writable_ = false;
+	status_ = Status::Unavailable;
+	lastError_ = nvs_flash_init();
+	if (lastError_ != ESP_OK) return false;
+
+	nvs_handle_t handle;
+	lastError_ = nvs_open("og_cfg", NVS_READONLY, &handle);
+	if (lastError_ == ESP_ERR_NVS_NOT_FOUND) {
+		status_ = Status::Defaults;
+		writable_ = true;
+		lastError_ = ESP_OK;
+		return true;
+	}
+	if (lastError_ != ESP_OK) return false;
+	size_t length = 0;
+	lastError_ = nvs_get_blob(handle, "settings", nullptr, &length);
+	if (lastError_ == ESP_ERR_NVS_NOT_FOUND) {
+		nvs_close(handle);
+		status_ = Status::Defaults;
+		writable_ = true;
+		lastError_ = ESP_OK;
+		return true;
+	}
+	if (lastError_ != ESP_OK || length == 0 || length > MaxRecordBytes) {
+		nvs_close(handle);
+		if (lastError_ == ESP_OK) {
+			status_ = Status::Invalid;
+			lastError_ = ESP_ERR_INVALID_SIZE;
+		}
+		return false;
+	}
+	lastError_ = nvs_get_blob(handle, "settings", bytes_, &length);
+	nvs_close(handle);
+	if (lastError_ != ESP_OK) return false;
+	const DeserializationError error = deserializeJson(candidate_, static_cast<const char*>(bytes_), length,
+													   DeserializationOption::NestingLimit(8));
+	if (error || !candidate_.is<JsonObject>()) {
+		status_ = Status::Invalid;
+		lastError_ = ESP_ERR_INVALID_ARG;
+		return false;
+	}
+	if (candidate_["schema"].is<uint32_t>() && candidate_["schema"].as<uint32_t>() != SchemaVersion) {
+		status_ = Status::UnsupportedVersion;
+		lastError_ = ESP_ERR_NOT_SUPPORTED;
+		return false;
+	}
+	if (!validRecord(candidate_.as<JsonObjectConst>())) {
+		status_ = Status::Invalid;
+		lastError_ = ESP_ERR_INVALID_ARG;
+		return false;
+	}
+	saved_.set(candidate_);
+	status_ = Status::Loaded;
+	writable_ = true;
+	return true;
+}
+
+void ConfigStore::copyTo(JsonDocument& configuration, uint32_t& lockTimeoutS) const {
+	configuration.clear();
+	configuration["radio"].set(saved_["radio"]);
+	configuration["mesh"].set(saved_["mesh"]);
+	configuration["led"].set(saved_["led"]);
+	lockTimeoutS = saved_["security"]["lock_timeout_s"];
+}
+
+bool ConfigStore::persist() {
+	if (!writable_) return false;
+	if (candidate_.overflowed() || !validRecord(candidate_.as<JsonObjectConst>())) {
+		lastError_ = ESP_ERR_INVALID_ARG;
+		return false;
+	}
+	const size_t length = measureJson(candidate_);
+	if (length > MaxRecordBytes) {
+		lastError_ = ESP_ERR_INVALID_SIZE;
+		return false;
+	}
+	const size_t written = serializeJson(candidate_, bytes_, sizeof(bytes_));
+	if (written != length) {
+		lastError_ = ESP_ERR_INVALID_SIZE;
+		return false;
+	}
+	nvs_handle_t handle;
+	lastError_ = nvs_open("og_cfg", NVS_READWRITE, &handle);
+	if (lastError_ != ESP_OK) return false;
+	lastError_ = nvs_set_blob(handle, "settings", bytes_, length);
+	if (lastError_ == ESP_OK) lastError_ = nvs_commit(handle);
+	nvs_close(handle);
+	if (lastError_ != ESP_OK) return false;
+	saved_.set(candidate_);
+	status_ = Status::Loaded;
+	return true;
+}
+
+bool ConfigStore::saveCategory(const char* category, JsonObjectConst configuration) {
+	if (category == nullptr || (strcmp(category, "radio") != 0 && strcmp(category, "mesh") != 0 &&
+							   strcmp(category, "led") != 0)) {
+		lastError_ = ESP_ERR_INVALID_ARG;
+		return false;
+	}
+	candidate_.set(saved_);
+	candidate_[category].set(configuration);
+	return persist();
+}
+
+bool ConfigStore::savePolicy(uint32_t lockTimeoutS) {
+	candidate_.set(saved_);
+	candidate_["security"]["lock_timeout_s"] = lockTimeoutS;
+	return persist();
+}
+
+bool ConfigStore::eraseAll() {
+	lastError_ = nvs_flash_init();
+	if (lastError_ != ESP_OK) return false;
+	nvs_handle_t handle;
+	lastError_ = nvs_open("og_cfg", NVS_READWRITE, &handle);
+	if (lastError_ != ESP_OK) return false;
+	lastError_ = nvs_erase_all(handle);
+	if (lastError_ == ESP_OK) lastError_ = nvs_commit(handle);
+	nvs_close(handle);
+	if (lastError_ != ESP_OK) return false;
+	defaults();
+	writable_ = true;
+	status_ = Status::Defaults;
+	return true;
+}
+
+ConfigStore::Status ConfigStore::status() const { return status_; }
+bool ConfigStore::writable() const { return writable_; }
+int32_t ConfigStore::lastError() const { return lastError_; }
+
+const char* ConfigStore::statusName() const {
+	switch (status_) {
+		case Status::Defaults: return "defaults";
+		case Status::Loaded: return "loaded";
+		case Status::Invalid: return "invalid";
+		case Status::UnsupportedVersion: return "unsupported_version";
+		default: return "unavailable";
+	}
+}
