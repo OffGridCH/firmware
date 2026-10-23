@@ -1,6 +1,7 @@
 #include "Commands.h"
 
 #include <string.h>
+#include <mbedtls/base64.h>
 
 namespace {
 class RequestReader {
@@ -44,6 +45,59 @@ Commands::Commands(SerialLink& link, StateHandler handler, void* context)
 
 void Commands::init() {
 	link_.setLineHandler(onLine, this);
+}
+
+bool Commands::stringArg(JsonObjectConst args, JsonObject response, const char* field,
+						 size_t minimum, size_t maximum, bool required) {
+	if (!required && !args.containsKey(field)) return true;
+	const JsonVariantConst value = args[field];
+	const JsonString text = value.as<JsonString>();
+	if (!value.is<const char*>() || text.size() < minimum || text.size() > maximum ||
+		memchr(text.c_str(), '\0', text.size()) != nullptr) {
+		fail(response, "E_INVALID_ARG", "expected a string within the allowed byte length", field);
+		return false;
+	}
+	return true;
+}
+
+bool Commands::integerArg(JsonObjectConst args, JsonObject response, const char* field,
+						  int64_t minimum, int64_t maximum, bool required) {
+	if (!required && !args.containsKey(field)) return true;
+	const JsonVariantConst value = args[field];
+	if (!value.is<int64_t>() || value.as<int64_t>() < minimum || value.as<int64_t>() > maximum) {
+		fail(response, "E_INVALID_ARG", "expected an integer within the allowed range", field);
+		return false;
+	}
+	return true;
+}
+
+bool Commands::boolArg(JsonObjectConst args, JsonObject response, const char* field,
+					   bool required) {
+	if (!required && !args.containsKey(field)) return true;
+	if (!args[field].is<bool>()) {
+		fail(response, "E_INVALID_ARG", "expected a boolean", field);
+		return false;
+	}
+	return true;
+}
+
+bool Commands::base64Arg(JsonObjectConst args, JsonObject response, const char* field,
+						 size_t decodedBytes) {
+	if (!stringArg(args, response, field, 1, 172)) return false;
+	const JsonString text = args[field].as<JsonString>();
+	uint8_t decoded[128];
+	unsigned char canonical[173];
+	size_t actual = 0;
+	size_t encoded = 0;
+	if (mbedtls_base64_decode(decoded, sizeof(decoded), &actual,
+		 reinterpret_cast<const unsigned char*>(text.c_str()), text.size()) != 0 ||
+		actual != decodedBytes ||
+		mbedtls_base64_encode(canonical, sizeof(canonical), &encoded, decoded, actual) != 0 ||
+		encoded != text.size() || memcmp(canonical, text.c_str(), encoded) != 0) {
+		fail(response, "E_INVALID_ARG", "expected canonical Base64 with the specified decoded length", field);
+		return false;
+	}
+	return true;
 }
 
 void Commands::fail(JsonObject response, const char* code, const char* message,

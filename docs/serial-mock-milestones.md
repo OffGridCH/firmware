@@ -9,7 +9,7 @@ behavior. The remaining domain modules stay placeholders until needed.
 
 The [host specification](offgrid-link.md) is the target API. A mock is not a vault
 or radio: use synthetic data only. Build flag `OFFGRID_MOCK_DEVICE=1`, firmware
-version `0.1.0-serial-mock.1`, and additive `mock` / `mock_stage` fields distinguish
+versioned `0.1.0-serial-mock.*` images, and additive `mock` / `mock_stage` fields distinguish
 it from real firmware. Never treat simulated unlock/delivery as a security result.
 
 ## Commit Boundaries
@@ -107,6 +107,11 @@ Only one host application should own the port at a time.
     no raw application debug prints, and no steadily decreasing heap.
 
 ## Validation Record
+
+Stage 2 is implemented and both UART/native-USB builds pass. The current command
+subset, deliberate authentication bypass, and RAM-only reboot behavior are
+documented in the [host README](../src/host/README.md). Earlier Stage 1 behavior
+above describes that historical commit, not the current supported command set.
 
 Stage 1 UART and native-USB images compile with the pinned PlatformIO setup.
 No USB serial board was detected during implementation. Upload, driver behavior,

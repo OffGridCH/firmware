@@ -17,6 +17,8 @@ public:
 	void tick(uint64_t nowMs);
 	bool sendJson(const JsonDocument& document);
 	bool sendError(const char* code, const char* message, uint64_t nowMs);
+	void setReceiveEnabled(bool enabled);
+	size_t availableTxSlots() const;
 
 private:
 	struct TxLine {
@@ -37,4 +39,5 @@ private:
 	TxLine tx_[BoardConfig::SerialTxSlots] = {};
 	size_t txHead_ = 0;
 	size_t txCount_ = 0;
+	bool receiveEnabled_ = true;
 };

@@ -23,6 +23,14 @@ void SerialLink::tick(uint64_t nowMs) {
 	receive(nowMs);
 }
 
+void SerialLink::setReceiveEnabled(bool enabled) {
+	receiveEnabled_ = enabled;
+}
+
+size_t SerialLink::availableTxSlots() const {
+	return BoardConfig::SerialTxSlots - txCount_;
+}
+
 bool SerialLink::sendJson(const JsonDocument& document) {
 	if (document.overflowed() || txCount_ == BoardConfig::SerialTxSlots) {
 		return false;
@@ -84,7 +92,7 @@ void SerialLink::drainTx() {
 }
 
 void SerialLink::receive(uint64_t nowMs) {
-	if (handler_ == nullptr || txCount_ == BoardConfig::SerialTxSlots) {
+	if (!receiveEnabled_ || handler_ == nullptr || txCount_ == BoardConfig::SerialTxSlots) {
 		return;
 	}
 
