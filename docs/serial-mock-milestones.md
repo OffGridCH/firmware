@@ -108,6 +108,10 @@ Only one host application should own the port at a time.
 
 ## Validation Record
 
+Stage 4 typed messages, mock receive/scenario controls, and deferred asynchronous
+events compile in both profiles. Real-device timing, queue saturation, and
+Android chat workflow checks remain pending.
+
 Stage 3 identity/pairing/contact handlers and byte-bounded pagination compile in
 both profiles. Device acceptance remains pending. Current behavior is documented
 in the host README; Stage 1's checklist remains a historical transport reference.

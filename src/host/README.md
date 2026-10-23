@@ -1,6 +1,6 @@
 # Host API and Serial Mock
 
-## Current Implementation: Stage 3
+## Current Implementation: Stage 4
 
 This folder implements the real JSON Lines transport and command-envelope
 boundary. The simulated device backend lives in `../main.cpp`, behind
@@ -66,7 +66,11 @@ raw prints or retain borrowed JSON views between ticks.
 | `pair.begin`, `pair.cancel`, `pair.complete` | Fresh salt, OG1 QR, 300-second expiry, self/duplicate rejection, replacement and fingerprint |
 | `contact.list/get/rename/delete` | 32 stable public-data slots; pagination bounded by count and wire size; deletion requires true confirmation |
 
-Message/configuration namespaces are added in subsequent separately committed stages.
+| `msg.send/cancel/pending` | Typed validation, eight RAM slots, monotonically allocated refs/counters, asynchronous status changes |
+| `mock.set_scenario` | Unlocked mock-only delivery outcome: delivered, timeout, or radio_error; applies to subsequently queued messages |
+| `mock.receive` | Unlocked mock-only incoming message fixture, using from/type/payload and optional increasing ctr, hops and retry |
+
+Configuration namespaces are added in the next separately committed stage.
 Arguments, result fields, and state rules follow the [host specification](../../docs/offgrid-link.md).
 
 ### Pairing and Contact Checks
@@ -84,7 +88,38 @@ locked and disappear on physical reset or confirmed factory reset. Replacing a
 contact resets its mock counters and pending/active state.
 
 Check self-pair, duplicate/replace, invalid QR, expiry, empty/full slots, pagination,
-rename, and confirmed delete. `contact.state` activation follows in Stage 4.
+rename, and confirmed delete. `contact.state` activation follows simulated
+incoming traffic or a simulated verified delivery receipt.
+
+### Message Scenarios
+
+After pairing a contact, these requests exercise real response/event shapes:
+
+```json
+{"id":20,"cmd":"msg.send","args":{"to":1,"type":"text","text":"Hello!","ack":true}}
+{"id":21,"cmd":"mock.set_scenario","args":{"outcome":"timeout"}}
+{"id":22,"cmd":"mock.receive","args":{"from":1,"type":"geo","lat":47.0517,"lon":8.3075}}
+```
+
+Delivery normally emits sent, relayed (when hops > 0), then delivered. No-ACK
+messages emit only sent and leave the queue. Timeout scenarios retry up to three
+times and fail with timeout; radio_error fails without claiming transmission.
+Timers use artificial short intervals (100/250/400 ms), not real airtime/retry
+budgets. The default SF9/125-kHz airtime estimate is calculated, not measured.
+
+Cancel returns its response before a cancelled status event. Lock and contact
+deletion/replacement fail queued messages with locked/contact_deleted. A simulated
+boot drops pending messages, as a real reboot would. A message ref is never reused
+during this MCU run; re-pair resets that contact's counters.
+
+`mock.receive` accepts the same typed payload fields as send, but uses `from`.
+It emits msg.received after its response, updates the mock RX counter and activates
+the contact. Its target.author is already from the receiving app's perspective.
+Counters must increase; this fixture is not an AEAD or replay-window test.
+
+Test all payloads, reaction removal, byte-overlong UTF-8 text, invalid coordinates,
+eight-slot exhaustion, cancel, timeout/retry, radio error, and lock/delete cleanup.
+Mock control commands are not part of the production host specification.
 
 ## Mock Security and Persistence
 

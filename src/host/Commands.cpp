@@ -2,6 +2,7 @@
 
 #include <string.h>
 #include <mbedtls/base64.h>
+#include <math.h>
 
 namespace {
 class RequestReader {
@@ -95,6 +96,18 @@ bool Commands::base64Arg(JsonObjectConst args, JsonObject response, const char* 
 		mbedtls_base64_encode(canonical, sizeof(canonical), &encoded, decoded, actual) != 0 ||
 		encoded != text.size() || memcmp(canonical, text.c_str(), encoded) != 0) {
 		fail(response, "E_INVALID_ARG", "expected canonical Base64 with the specified decoded length", field);
+		return false;
+	}
+	return true;
+}
+
+bool Commands::numberArg(JsonObjectConst args, JsonObject response, const char* field,
+						 double minimum, double maximum, bool required) {
+	if (!required && !args.containsKey(field)) return true;
+	const JsonVariantConst value = args[field];
+	const double number = value.as<double>();
+	if (!value.is<double>() || !isfinite(number) || number < minimum || number > maximum) {
+		fail(response, "E_INVALID_ARG", "expected a finite number within the allowed range", field);
 		return false;
 	}
 	return true;

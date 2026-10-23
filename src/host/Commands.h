@@ -22,6 +22,8 @@ public:
 						bool required = true);
 	static bool base64Arg(JsonObjectConst args, JsonObject response, const char* field,
 						  size_t decodedBytes);
+	static bool numberArg(JsonObjectConst args, JsonObject response, const char* field,
+						 double minimum, double maximum, bool required = true);
 
 private:
 	static void onLine(void* context, const char* line, size_t length, uint64_t nowMs);

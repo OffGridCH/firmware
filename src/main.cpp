@@ -9,6 +9,7 @@
 #include <mbedtls/ecp.h>
 #include <mbedtls/sha256.h>
 #include <mbedtls/platform_util.h>
+#include <math.h>
 
 #include "BoardConfig.h"
 #include "host/Commands.h"
@@ -61,12 +62,12 @@ public:
         document["t"] = nowMs;
         JsonObject data = document.createNestedObject("data");
         data["device_id"] = deviceId_;
-        data["fw"] = "0.1.0-serial-mock.3";
+        data["fw"] = "0.1.0-serial-mock.4";
         data["proto"] = "1.0";
         data["state"] = state();
         data["reset_reason"] = resetReason_;
         data["mock"] = true;
-        data["mock_stage"] = 3;
+        data["mock_stage"] = 4;
         serialLink.sendJson(document);
     }
 
@@ -96,6 +97,9 @@ public:
             resetArmed_ = false;
             lockTimeoutS_ = 15;
             for (Contact& contact : contacts_) contact = Contact{};
+            for (Message& message : messages_) message = Message{};
+            incomingPending_ = false;
+            contactEvent_ = -1;
             snprintf(name_, sizeof(name_), "Offgrid-%s", nodeId_);
             stateReason_ = "factory_reset";
             rebootPending_ = true;
@@ -112,15 +116,20 @@ public:
             event["data"]["reason"] = stateReason_;
             if (serialLink.sendJson(event)) stateReason_ = nullptr;
         }
+        tickMessages(nowMs);
         if (rebootPending_ && stateReason_ == nullptr && serialLink.availableTxSlots() > 0) {
             unlocked_ = false;
             session_ = false;
             resetArmed_ = false;
             resetReason_ = "software";
+            for (Message& message : messages_) message = Message{};
+            incomingPending_ = false;
+            pairing_ = false;
             emitBoot(nowMs);
             rebootPending_ = false;
         }
-        serialLink.setReceiveEnabled(stateReason_ == nullptr && !rebootPending_);
+        serialLink.setReceiveEnabled(stateReason_ == nullptr && !rebootPending_ &&
+                         !incomingPending_ && contactEvent_ < 0);
     }
 
     static void handle(void* context, const char* command, JsonObjectConst arguments,
@@ -139,6 +148,318 @@ private:
         uint32_t txCounter = 0;
         uint32_t rxCounter = 0;
     };
+
+    struct Message {
+        bool used = false;
+        uint8_t contact = 0;
+        char type[9] = {};
+        char text[84] = {};
+        char emoji[9] = {};
+        bool removeReaction = false;
+        bool targetOwn = false;
+        uint16_t targetRef = 0;
+        double lat = 0;
+        double lon = 0;
+        bool hasAltitude = false;
+        int16_t altitude = 0;
+        bool hasAge = false;
+        uint16_t age = 0;
+        uint32_t reference = 0;
+        uint32_t counter = 0;
+        uint8_t hops = 3;
+        bool ack = true;
+        uint8_t retry = 0;
+        uint8_t nextEvent = 0;
+        uint64_t created = 0;
+        uint64_t due = 0;
+        const char* status = "queued";
+        const char* outcome = "delivered";
+        const char* failure = nullptr;
+    };
+
+    size_t pendingCount() const {
+        size_t count = 0;
+        for (const Message& message : messages_) if (message.used) ++count;
+        return count;
+    }
+
+    bool readPayload(JsonObjectConst args, JsonObject response, Message& message) {
+        if (!Commands::stringArg(args, response, "type", 1, 8)) return false;
+        const char* type = args["type"];
+        snprintf(message.type, sizeof(message.type), "%s", type);
+        if (strcmp(type, "text") == 0) {
+            if (!Commands::stringArg(args, response, "text", 0, 2047)) return false;
+            if (args["text"].as<JsonString>().size() > 83) {
+                Commands::fail(response, "E_TOO_LONG", "text exceeds 83 UTF-8 bytes", "text");
+                return false;
+            }
+            snprintf(message.text, sizeof(message.text), "%s", args["text"].as<const char*>());
+        } else if (strcmp(type, "reaction") == 0) {
+            if (!args["target"].is<JsonObject>()) {
+                Commands::fail(response, "E_INVALID_ARG", "target must be an object", "target");
+                return false;
+            }
+            const JsonObjectConst target = args["target"];
+            if (!Commands::stringArg(target, response, "author", 1, 4)) {
+                response["error"]["field"] = "target.author";
+                return false;
+            }
+            if (strcmp(target["author"], "me") != 0 && strcmp(target["author"], "peer") != 0) {
+                Commands::fail(response, "E_INVALID_ARG", "author must be me or peer", "target.author");
+                return false;
+            }
+            if (!Commands::integerArg(target, response, "ref", 0, 65535)) {
+                response["error"]["field"] = "target.ref";
+                return false;
+            }
+            message.targetOwn = strcmp(target["author"], "me") == 0;
+            message.targetRef = target["ref"];
+            if (!args.containsKey("emoji")) {
+                Commands::fail(response, "E_INVALID_ARG", "emoji is required, null removes it", "emoji");
+                return false;
+            }
+            message.removeReaction = args["emoji"].isNull();
+            if (!message.removeReaction) {
+                if (!Commands::stringArg(args, response, "emoji", 1, 8)) return false;
+                const char* emoji = args["emoji"];
+                const char* allowed[] = {"\xF0\x9F\x91\x8D", "\xE2\x9D\xA4\xEF\xB8\x8F",
+                    "\xF0\x9F\x98\x82", "\xF0\x9F\x98\xAE", "\xF0\x9F\x98\xA2", "\xF0\x9F\x99\x8F"};
+                bool found = false;
+                for (const char* entry : allowed) if (strcmp(emoji, entry) == 0) found = true;
+                if (!found) {
+                    Commands::fail(response, "E_INVALID_ARG", "emoji is not in the protocol table", "emoji");
+                    return false;
+                }
+                snprintf(message.emoji, sizeof(message.emoji), "%s", emoji);
+            }
+        } else if (strcmp(type, "geo") == 0) {
+            if (!Commands::numberArg(args, response, "lat", -90, 90) ||
+                !Commands::numberArg(args, response, "lon", -180, 180)) return false;
+            message.lat = args["lat"];
+            message.lon = args["lon"];
+            message.hasAltitude = args.containsKey("alt_m") && !args["alt_m"].isNull();
+            message.hasAge = args.containsKey("age_s") && !args["age_s"].isNull();
+            if (message.hasAltitude && !Commands::integerArg(args, response, "alt_m", -32768, 32767)) return false;
+            if (message.hasAge && !Commands::integerArg(args, response, "age_s", 0, 2550)) return false;
+            message.altitude = args["alt_m"] | 0;
+            message.age = ((args["age_s"] | 0) + 5) / 10 * 10;
+        } else {
+            Commands::fail(response, "E_INVALID_ARG", "type must be text, reaction or geo", "type");
+            return false;
+        }
+        return true;
+    }
+
+    void writePayload(JsonObject output, const Message& message) const {
+        output["type"] = message.type;
+        if (strcmp(message.type, "text") == 0) output["text"] = message.text;
+        else if (strcmp(message.type, "reaction") == 0) {
+            output["target"]["author"] = message.targetOwn ? "me" : "peer";
+            output["target"]["ref"] = message.targetRef;
+            if (message.removeReaction) output["emoji"] = nullptr;
+            else output["emoji"] = message.emoji;
+        } else {
+            output["lat"] = message.lat;
+            output["lon"] = message.lon;
+            if (message.hasAltitude) output["alt_m"] = message.altitude;
+            else output["alt_m"] = nullptr;
+            if (message.hasAge) output["age_s"] = message.age;
+            else output["age_s"] = nullptr;
+        }
+    }
+
+    void failMessages(size_t contact, const char* reason) {
+        for (Message& message : messages_) {
+            if (message.used && message.contact == contact) message.failure = reason;
+        }
+    }
+
+    void tickMessages(uint64_t nowMs) {
+        if (!unlocked_) {
+            incomingPending_ = false;
+            contactEvent_ = -1;
+            for (Message& message : messages_) if (message.used && message.failure == nullptr) message.failure = "locked";
+        }
+        if (serialLink.availableTxSlots() == 0) return;
+        if (contactEvent_ >= 0) {
+            StaticJsonDocument<256> event;
+            event["evt"] = "contact.state";
+            event["t"] = nowMs;
+            event["data"]["contact_id"] = contactEvent_ + 1;
+            event["data"]["state"] = "active";
+            if (serialLink.sendJson(event)) contactEvent_ = -1;
+            return;
+        }
+        if (incomingPending_) {
+            StaticJsonDocument<1024> event;
+            event["evt"] = "msg.received";
+            event["t"] = nowMs;
+            JsonObject data = event.createNestedObject("data");
+            writePayload(data, incoming_);
+            data["from"] = incoming_.contact + 1;
+            data["ctr"] = incoming_.counter;
+            data["hops"] = incoming_.hops;
+            data["retry"] = incoming_.retry;
+            data["rssi"] = -92;
+            data["snr"] = 7.5;
+            if (serialLink.sendJson(event)) {
+                Contact& contact = contacts_[incoming_.contact];
+                contact.rxCounter = incoming_.counter;
+                if (!contact.active) { contact.active = true; contactEvent_ = incoming_.contact; }
+                incomingPending_ = false;
+            }
+            return;
+        }
+        for (Message& message : messages_) {
+            if (!message.used || (message.failure == nullptr && nowMs < message.due)) continue;
+            const char* status = message.failure != nullptr ? "failed" :
+                message.nextEvent == 3 ? "cancelled" : message.nextEvent == 0 ?
+                (message.retry == 0 ? "sent" : "retrying") : message.nextEvent == 1 ? "relayed" : "delivered";
+            if (message.nextEvent == 2 && message.failure == nullptr && strcmp(message.outcome, "timeout") == 0) {
+                if (message.retry < retries_) {
+                    ++message.retry;
+                    message.nextEvent = 0;
+                    message.due = nowMs + 400;
+                    continue;
+                }
+                message.failure = "timeout";
+                status = "failed";
+            }
+            if (message.nextEvent == 0 && strcmp(message.outcome, "radio_error") == 0) {
+                message.failure = "radio_error";
+                status = "failed";
+            }
+            if (message.nextEvent == 1 && message.hops == 0 && message.failure == nullptr) {
+                message.nextEvent = 2;
+                message.due = nowMs + 250;
+                continue;
+            }
+            StaticJsonDocument<512> event;
+            event["evt"] = "msg.status";
+            event["t"] = nowMs;
+            JsonObject data = event.createNestedObject("data");
+            data["msg_ref"] = message.reference;
+            data["to"] = message.contact + 1;
+            data["state"] = status;
+            data["retry"] = message.retry;
+            if (message.failure != nullptr) data["reason"] = message.failure;
+            if (strcmp(status, "delivered") == 0) {
+                data["hops"] = message.hops == 0 ? 0 : 1;
+                data["rtt_ms"] = nowMs - message.created;
+            }
+            if (!serialLink.sendJson(event)) return;
+            if (message.failure != nullptr || message.nextEvent == 3 || message.nextEvent == 2 ||
+                (!message.ack && message.nextEvent == 0)) {
+                if (strcmp(status, "delivered") == 0 && !contacts_[message.contact].active) {
+                    contacts_[message.contact].active = true;
+                    contactEvent_ = message.contact;
+                }
+                message = Message{};
+            } else {
+                message.status = status;
+                ++message.nextEvent;
+                message.due = nowMs + 250;
+            }
+            return;
+        }
+    }
+
+    void handleMessages(const char* command, JsonObjectConst args, JsonObject response,
+                        uint64_t nowMs) {
+        if (!requireUnlocked(response)) return;
+        JsonObject result = response["result"].as<JsonObject>();
+        if (strcmp(command, "mock.set_scenario") == 0) {
+            if (!Commands::stringArg(args, response, "outcome", 1, 11)) return;
+            const char* value = args["outcome"];
+            if (strcmp(value, "delivered") && strcmp(value, "timeout") && strcmp(value, "radio_error")) {
+                Commands::fail(response, "E_INVALID_ARG", "unknown mock delivery outcome", "outcome");
+                return;
+            }
+            outcome_ = strcmp(value, "timeout") == 0 ? "timeout" : strcmp(value, "radio_error") == 0 ? "radio_error" : "delivered";
+            result["outcome"] = outcome_;
+        } else if (strcmp(command, "msg.pending") == 0) {
+            JsonArray pending = result.createNestedArray("pending");
+            for (const Message& message : messages_) {
+                if (!message.used) continue;
+                JsonObject item = pending.createNestedObject();
+                item["msg_ref"] = message.reference;
+                item["to"] = message.contact + 1;
+                item["type"] = message.type;
+                item["ctr"] = message.counter;
+                item["state"] = message.status;
+                item["retry"] = message.retry;
+            }
+        } else if (strcmp(command, "msg.cancel") == 0) {
+            if (!Commands::integerArg(args, response, "msg_ref", 1, 4294967295LL)) return;
+            for (Message& message : messages_) {
+                if (message.used && message.reference == args["msg_ref"].as<uint32_t>()) {
+                    message.nextEvent = 3;
+                    message.failure = nullptr;
+                    message.due = nowMs;
+                    result["state"] = "cancelled";
+                    return;
+                }
+            }
+            Commands::fail(response, "E_INVALID_ARG", "message is not pending", "msg_ref");
+        } else if (strcmp(command, "msg.send") == 0 || strcmp(command, "mock.receive") == 0) {
+            const bool receiving = strcmp(command, "mock.receive") == 0;
+            const char* field = receiving ? "from" : "to";
+            if (!Commands::integerArg(args, response, field, 1, 32)) return;
+            const size_t contact = args[field].as<size_t>() - 1;
+            if (!contacts_[contact].used) {
+                Commands::fail(response, "E_NO_SUCH_CONTACT", "contact slot is empty", field);
+                return;
+            }
+            Message candidate;
+            candidate.contact = contact;
+            if (!readPayload(args, response, candidate) ||
+                !Commands::integerArg(args, response, "hops", 0, 7, false) ||
+                !Commands::boolArg(args, response, "ack", false)) return;
+            candidate.hops = args["hops"] | hopDefault_;
+            candidate.ack = args["ack"] | (strcmp(candidate.type, "text") == 0 ? ackText_ :
+                strcmp(candidate.type, "reaction") == 0 ? ackReaction_ : ackGeo_);
+            if (receiving) {
+                if (!Commands::integerArg(args, response, "ctr", 1, 16777215, false) ||
+                    !Commands::integerArg(args, response, "retry", 0, 3, false)) return;
+                candidate.counter = args["ctr"] | (contacts_[contact].rxCounter + 1);
+                if (candidate.counter > 16777215 || candidate.counter <= contacts_[contact].rxCounter) {
+                    Commands::fail(response, "E_INVALID_ARG", "mock incoming counter must increase", "ctr");
+                    return;
+                }
+                candidate.retry = args["retry"] | 0;
+                incoming_ = candidate;
+                incomingPending_ = true;
+                result["injected"] = true;
+                return;
+            }
+            Message* slot = nullptr;
+            for (Message& message : messages_) if (!message.used) { slot = &message; break; }
+            if (slot == nullptr) {
+                Commands::fail(response, "E_QUEUE_FULL", "all eight mock message slots are used");
+                return;
+            }
+            if (contacts_[contact].txCounter == 16777215 || nextReference_ == 0) {
+                Commands::fail(response, "E_BUSY", "mock counter exhausted; re-pair or reset");
+                return;
+            }
+            candidate.used = true;
+            candidate.counter = ++contacts_[contact].txCounter;
+            candidate.reference = nextReference_++;
+            candidate.created = nowMs;
+            candidate.due = nowMs + 100;
+            candidate.outcome = outcome_;
+            *slot = candidate;
+            const size_t length = strcmp(candidate.type, "text") == 0 ? 17 + strlen(candidate.text) :
+                strcmp(candidate.type, "reaction") == 0 ? 20 : 23 + (candidate.hasAltitude ? 2 : 0) + (candidate.hasAge ? 1 : 0);
+            result["msg_ref"] = candidate.reference;
+            result["ctr"] = candidate.counter;
+            result["ack_requested"] = candidate.ack;
+            result["hops"] = candidate.hops;
+            result["state"] = "queued";
+            result["bytes_on_air"] = length;
+            result["est_airtime_ms"] = static_cast<uint32_t>(ceil((12.25 + 8 + ceil((8.0 * length - 36 + 44) / 36) * 5) * 4.096));
+        } else Commands::fail(response, "E_UNKNOWN_CMD", "unknown message/mock command");
+    }
 
     size_t contactCount() const {
         size_t count = 0;
@@ -261,6 +582,7 @@ private:
             for (size_t index = 0; index < 32; ++index) {
                 if (index != slot && contacts_[index].used && strcmp(contacts_[index].nodeId, candidate.nodeId) == 0) collision = true;
             }
+            failMessages(slot, "contact_deleted");
             contacts_[slot] = candidate;
             writeContact(result.createNestedObject("contact"), slot);
             JsonArray warnings = result.createNestedArray("warnings");
@@ -303,6 +625,7 @@ private:
                     Commands::fail(response, "E_CONFIRM_REQUIRED", "confirm must be true", "confirm");
                     return;
                 }
+                failMessages(index, "contact_deleted");
                 contacts_[index] = Contact{};
                 result["deleted"] = true;
             } else writeContact(result.createNestedObject("contact"), index);
@@ -352,7 +675,9 @@ private:
                        uint64_t nowMs) {
         JsonObject result = response["result"].as<JsonObject>();
         lastActivity_ = nowMs;
-        if (strncmp(command, "id.", 3) == 0 || strncmp(command, "pair.", 5) == 0 ||
+        if (strncmp(command, "msg.", 4) == 0 || strncmp(command, "mock.", 5) == 0) {
+            handleMessages(command, args, response, nowMs);
+        } else if (strncmp(command, "id.", 3) == 0 || strncmp(command, "pair.", 5) == 0 ||
             strncmp(command, "contact.", 8) == 0) {
             handleContacts(command, args, response, nowMs);
         } else if (strcmp(command, "sys.ping") == 0) {
@@ -390,12 +715,12 @@ private:
             result["device"] = "heltec_wifi_lora_32_v3";
             result["chip"] = "ESP32-S3";
             result["device_id"] = deviceId_;
-            result["fw"]["version"] = "0.1.0-serial-mock.3";
+            result["fw"]["version"] = "0.1.0-serial-mock.4";
             result["fw"]["build"] = __DATE__;
             result["proto"] = "1.0";
             result["state"] = state();
             result["mock"] = true;
-            result["mock_stage"] = 3;
+            result["mock_stage"] = 4;
             result["authentication"] = "bypassed-envelope-shape-only";
             result["session"]["device_eph_pub"].set(encodedPublic);
             result["session"]["nonce"].set(encodedNonce);
@@ -410,7 +735,7 @@ private:
             result["heap_free"] = ESP.getFreeHeap();
             result["battery_mv"] = nullptr;
             result["mock"] = true;
-            result["mock_stage"] = 3;
+            result["mock_stage"] = 4;
             JsonObject radio = result.createNestedObject("radio");
             radio["running"] = unlocked_;
             radio["relay_only"] = false;
@@ -418,7 +743,7 @@ private:
             security["secure_boot"] = esp_secure_boot_enabled();
             security["flash_encryption"] = esp_flash_encryption_enabled();
             if (unlocked_) {
-                result["queue"]["pending"] = 0;
+                result["queue"]["pending"] = pendingCount();
                 result["queue"]["capacity"] = 8;
                 result["contacts"]["used"] = contactCount();
                 result["contacts"]["capacity"] = 32;
@@ -507,6 +832,17 @@ private:
 
     char deviceId_[13] = {};
     Contact contacts_[32] = {};
+    Message messages_[8] = {};
+    Message incoming_;
+    bool incomingPending_ = false;
+    int contactEvent_ = -1;
+    uint32_t nextReference_ = 1;
+    const char* outcome_ = "delivered";
+    uint8_t retries_ = 3;
+    uint8_t hopDefault_ = 3;
+    bool ackText_ = true;
+    bool ackReaction_ = false;
+    bool ackGeo_ = false;
     bool pairing_ = false;
     uint64_t pairingAt_ = 0;
     uint8_t pairingSalt_[16] = {};
