@@ -113,6 +113,10 @@ public:
             session_ = false;
             configStore_.copyTo(config_, lockTimeoutS_);
             syncMesh();
+#if OFFGRID_RADIO_DIAGNOSTICS
+            radioDriver.standby();
+            radioDriver.init(radioConfig(config_["radio"].as<JsonObjectConst>()));
+#endif
             for (Contact& contact : contacts_) contact = Contact{};
             for (Message& message : messages_) message = Message{};
             incomingPending_ = false;
@@ -127,6 +131,9 @@ public:
         if (unlocked_ && lockTimeoutS_ != 0 && nowMs - lastActivity_ >= lockTimeoutS_ * 1000ULL) {
             unlocked_ = false;
             stateReason_ = "heartbeat_timeout";
+#if OFFGRID_RADIO_DIAGNOSTICS
+            radioDriver.standby();
+#endif
         }
         if (stateReason_ != nullptr && serialLink.availableTxSlots() > 0) {
             StaticJsonDocument<384> event;
@@ -148,12 +155,19 @@ public:
             if (serialLink.sendJson(event)) logPending_ = false;
         }
         tickMessages(nowMs);
+    #if OFFGRID_RADIO_DIAGNOSTICS
+        tickRadio(nowMs);
+    #endif
         if (rebootPending_ && stateReason_ == nullptr && serialLink.availableTxSlots() > 0) {
             unlocked_ = false;
             session_ = false;
             resetArmed_ = false;
             resetReason_ = "software";
             resetConfig();
+#if OFFGRID_RADIO_DIAGNOSTICS
+            radioDriver.standby();
+            radioDriver.init(radioConfig(config_["radio"].as<JsonObjectConst>()));
+#endif
             for (Message& message : messages_) message = Message{};
             incomingPending_ = false;
             pairing_ = false;
@@ -173,6 +187,164 @@ public:
     }
 
 private:
+#if OFFGRID_RADIO_DIAGNOSTICS
+    static void radioFailure(JsonObject response) {
+        Commands::fail(response, radioDriver.lastError() == RadioDriver::Busy ? "E_BUSY" : "E_RADIO",
+                       "radio operation failed; inspect diag.radio.status");
+    }
+
+    static void writeRadioStats(JsonObject output) {
+        const RadioDriver::Stats& stats = radioDriver.stats();
+        output["tx_packets"] = stats.transmitted;
+        output["rx_packets"] = stats.received;
+        output["rx_crc_errors"] = stats.crcErrors;
+        output["rx_tag_failures"] = 0;
+        output["rx_dedupe_drops"] = 0;
+        output["relayed"] = 0;
+        output["relay_suppressed"] = 0;
+        output["acks_sent"] = 0;
+        output["acks_received"] = 0;
+        output["retries"] = 0;
+        output["tx_airtime_ms_total"] = stats.txAirtimeMs;
+        output["cad_scans"] = stats.cadScans;
+        output["cad_busy"] = stats.cadBusy;
+        output["failures"] = stats.failures;
+        output["timeouts"] = stats.timeouts;
+        output["dropped_events"] = stats.droppedEvents;
+        if (stats.hasSignal) { output["last_rssi"] = stats.lastRssi; output["last_snr"] = stats.lastSnr; }
+        else { output["last_rssi"] = nullptr; output["last_snr"] = nullptr; }
+    }
+
+    static int hexDigit(char value) {
+        if (value >= '0' && value <= '9') return value - '0';
+        if (value >= 'a' && value <= 'f') return value - 'a' + 10;
+        if (value >= 'A' && value <= 'F') return value - 'A' + 10;
+        return -1;
+    }
+
+    void handleRadioDiagnostics(const char* command, JsonObjectConst args, JsonObject response,
+                                uint64_t nowMs) {
+        JsonObject output = response["result"].as<JsonObject>();
+        if (strcmp(command, "diag.radio.status") == 0) {
+            output["initialized"] = radioDriver.ready();
+            output["state"] = radioDriver.stateName();
+            output["last_error"] = radioDriver.lastError();
+            output["config_pending"] = radioDriver.configPending();
+            const RadioDriver::Config& applied = radioDriver.config();
+            JsonObject settings = output.createNestedObject("applied");
+            settings["freq_mhz"] = applied.frequencyMhz;
+            settings["bw_khz"] = applied.bandwidthKhz;
+            settings["sf"] = applied.spreadingFactor;
+            settings["cr"] = applied.codingRate;
+            settings["tx_power_dbm"] = applied.powerDbm;
+            settings["preamble"] = applied.preamble;
+            settings["sync_word"] = applied.syncWord;
+            writeRadioStats(output.createNestedObject("stats"));
+            output["diagnostic"] = true;
+            return;
+        }
+        if (strcmp(command, "diag.radio.rx") == 0) {
+            if (!radioDriver.startReceive()) { radioFailure(response); return; }
+            output["state"] = radioDriver.stateName();
+        } else if (strcmp(command, "diag.radio.stop") == 0) {
+            if (!radioDriver.standby()) { radioFailure(response); return; }
+            output["state"] = radioDriver.stateName();
+        } else if (strcmp(command, "diag.radio.recover") == 0) {
+            if (!radioDriver.init(radioConfig(config_["radio"].as<JsonObjectConst>()))) {
+                radioFailure(response);
+                return;
+            }
+            output["state"] = radioDriver.stateName();
+        } else if (strcmp(command, "diag.radio.tx") == 0 || strcmp(command, "diag.radio.cad") == 0) {
+            if (radioOperation_ != 0) {
+                Commands::fail(response, "E_BUSY", "a radio diagnostic operation is pending");
+                return;
+            }
+            if (nextRadioOperation_ == 0) {
+                Commands::fail(response, "E_BUSY", "diagnostic reference exhausted; reset the board");
+                return;
+            }
+            if (strcmp(command, "diag.radio.cad") == 0) {
+                if (!radioDriver.startCad(nowMs)) { radioFailure(response); return; }
+            } else {
+                if (!Commands::stringArg(args, response, "hex", 2, 510) ||
+                    !Commands::boolArg(args, response, "cad", false) ||
+                    !Commands::integerArg(args, response, "backoff_slots", 0, 32, false)) return;
+                const JsonString hex = args["hex"].as<JsonString>();
+                if (hex.size() % 2 != 0) {
+                    Commands::fail(response, "E_INVALID_ARG", "hex requires pairs of digits", "hex");
+                    return;
+                }
+                uint8_t bytes[255];
+                const size_t length = hex.size() / 2;
+                for (size_t index = 0; index < length; ++index) {
+                    const int high = hexDigit(hex.c_str()[index * 2]);
+                    const int low = hexDigit(hex.c_str()[index * 2 + 1]);
+                    if (high < 0 || low < 0) {
+                        Commands::fail(response, "E_INVALID_ARG", "hex contains a non-hex digit", "hex");
+                        return;
+                    }
+                    bytes[index] = (high << 4) | low;
+                }
+                if (!radioDriver.startTransmit(bytes, length, nowMs,
+                    args["cad"] | config_["mesh"]["cad_enabled"].as<bool>(),
+                    args["backoff_slots"] | config_["mesh"]["backoff_slots"].as<uint8_t>())) {
+                    radioFailure(response);
+                    return;
+                }
+                output["len"] = length;
+                output["est_airtime_ms"] = RadioDriver::airtimeMs(radioDriver.config(), length);
+            }
+            radioOperation_ = nextRadioOperation_++;
+            output["op_ref"] = radioOperation_;
+            output["state"] = "queued";
+        } else Commands::fail(response, "E_UNKNOWN_CMD", "unknown radio diagnostic command");
+    }
+
+    void tickRadio(uint64_t nowMs) {
+        radioDriver.tick(nowMs);
+        if (!radioEventPending_) radioEventPending_ = radioDriver.popEvent(radioEvent_);
+        if (!radioEventPending_ || serialLink.availableTxSlots() == 0) return;
+        StaticJsonDocument<2048> event;
+        const RadioDriver::EventType type = radioEvent_.type;
+        const char* name = type == RadioDriver::EventType::Received ? "diag.radio.rx" :
+            type == RadioDriver::EventType::Transmitted ? "diag.radio.tx" :
+            type == RadioDriver::EventType::Configured ? "diag.radio.configured" :
+            type == RadioDriver::EventType::Failed ? "diag.radio.error" : "diag.radio.cad";
+        event["evt"] = name;
+        event["t"] = radioEvent_.timeMs;
+        JsonObject data = event.createNestedObject("data");
+        data["diagnostic"] = true;
+        const bool operation = type != RadioDriver::EventType::Received && type != RadioDriver::EventType::Configured;
+        if (operation && radioOperation_ != 0) data["op_ref"] = radioOperation_;
+        if (type == RadioDriver::EventType::Received || type == RadioDriver::EventType::Transmitted) {
+            char hex[511] = {};
+            for (size_t index = 0; index < radioEvent_.length; ++index) {
+                snprintf(hex + index * 2, 3, "%02X", radioEvent_.bytes[index]);
+            }
+            data["len"] = radioEvent_.length;
+            data["hex"].set(hex);
+            if (type == RadioDriver::EventType::Received) {
+                data["rssi"] = radioEvent_.rssi;
+                data["snr"] = radioEvent_.snr;
+            } else data["airtime_ms"] = radioEvent_.airtimeMs;
+        } else if (type == RadioDriver::EventType::Failed) {
+            data["code"] = "E_RADIO";
+            data["radio_error"] = radioEvent_.error;
+        } else if (type == RadioDriver::EventType::CadClear || type == RadioDriver::EventType::CadBusy) {
+            data["busy"] = type == RadioDriver::EventType::CadBusy;
+        } else data["state"] = radioDriver.stateName();
+        if (!serialLink.sendJson(event)) return;
+        if (operation) radioOperation_ = 0;
+        if (traceEnabled_ && (type == RadioDriver::EventType::Received || type == RadioDriver::EventType::Transmitted)) {
+            event["evt"] = type == RadioDriver::EventType::Received ? "rf.rx" : "rf.tx";
+            event["data"]["action"] = "diagnostic";
+            if (serialLink.availableTxSlots() > 0) serialLink.sendJson(event);
+        }
+        radioEventPending_ = false;
+    }
+#endif
+
     static RadioDriver::Config radioConfig(JsonObjectConst values) {
         RadioDriver::Config configuration;
         configuration.frequencyMhz = values["freq_mhz"];
@@ -210,12 +382,7 @@ private:
     }
 
     uint32_t airtime(size_t length) const {
-        const double sf = config_["radio"]["sf"].as<double>();
-        const double symbolMs = pow(2.0, sf) / config_["radio"]["bw_khz"].as<double>();
-        const double optimization = symbolMs >= 16 ? 1 : 0;
-        const double symbols = 8 + fmax(0, ceil((8.0 * length - 4 * sf + 44) /
-            (4 * (sf - 2 * optimization))) * config_["radio"]["cr"].as<double>());
-        return static_cast<uint32_t>(ceil((config_["radio"]["preamble"].as<double>() + 4.25 + symbols) * symbolMs));
+        return RadioDriver::airtimeMs(radioConfig(config_["radio"].as<JsonObjectConst>()), length);
     }
 
     static bool pattern(JsonVariantConst value, JsonObject response, const char* field) {
@@ -243,6 +410,11 @@ private:
         }
         if (strcmp(command, "radio.stats") == 0) {
             if (!requireUnlocked(response) || !Commands::boolArg(args, response, "reset", false)) return;
+#if OFFGRID_RADIO_DIAGNOSTICS
+            writeRadioStats(result);
+            if (args["reset"] | false) radioDriver.resetStats();
+            return;
+#endif
             const char* counters[] = {"rx_crc_errors", "rx_tag_failures", "rx_dedupe_drops", "relay_suppressed"};
             for (const char* key : counters) result[key] = 0;
             result["tx_packets"] = txPackets_;
@@ -366,10 +538,7 @@ private:
         }
         result.set(candidate);
         if (strcmp(category, "radio") == 0) {
-            const double sf = candidate["sf"];
-            const double symbol = pow(2.0, sf) / candidate["bw_khz"].as<double>();
-            result["est_airtime_ms_23b"] = static_cast<uint32_t>(ceil((candidate["preamble"].as<double>() + 12.25 +
-                fmax(0, ceil((184 - 4 * sf + 44) / (4 * (sf - (symbol >= 16 ? 2 : 0))))) * candidate["cr"].as<double>()) * symbol));
+            result["est_airtime_ms_23b"] = RadioDriver::airtimeMs(radioConfig(candidate), 23);
             result["max_text_bytes"] = 83;
             if (setting) {
                 JsonArray warnings = result.createNestedArray("warnings");
@@ -389,6 +558,12 @@ private:
             return;
         }
         if (setting) {
+#if OFFGRID_RADIO_DIAGNOSTICS
+            if (strcmp(category, "radio") == 0 && !radioDriver.ready()) {
+                Commands::fail(response, "E_RADIO", "recover the hardware before changing radio settings");
+                return;
+            }
+#endif
             configScratch_.set(config_);
             configScratch_[category].set(candidate);
             if (configScratch_.overflowed()) {
@@ -400,6 +575,12 @@ private:
                 return;
             }
             config_.set(configScratch_);
+#if OFFGRID_RADIO_DIAGNOSTICS
+            if (strcmp(category, "radio") == 0) {
+                radioDriver.queueConfig(radioConfig(candidate));
+                result["apply_pending"] = true;
+            }
+#endif
             syncMesh();
         }
     }
@@ -1005,6 +1186,16 @@ private:
                        uint64_t nowMs) {
         JsonObject result = response["result"].as<JsonObject>();
         lastActivity_ = nowMs;
+#if OFFGRID_RADIO_DIAGNOSTICS
+        if (strncmp(command, "diag.radio.", 11) == 0) {
+            handleRadioDiagnostics(command, args, response, nowMs);
+            return;
+        }
+        if (strncmp(command, "msg.", 4) == 0 || strncmp(command, "mock.", 5) == 0) {
+            Commands::fail(response, "E_BUSY", "mock chat is disabled in the real radio diagnostic image");
+            return;
+        }
+#endif
         if (strncmp(command, "radio.", 6) == 0 || strncmp(command, "mesh.", 5) == 0 ||
             strncmp(command, "led.", 4) == 0 || strncmp(command, "dbg.", 4) == 0) {
             handleConfig(command, args, response);
@@ -1164,6 +1355,9 @@ private:
             unlocked_ = false;
             result["state"] = state();
             stateReason_ = "lock";
+#if OFFGRID_RADIO_DIAGNOSTICS
+            radioDriver.standby();
+#endif
         } else if (strcmp(command, "sec.get_policy") == 0 || strcmp(command, "sec.set_policy") == 0) {
             if (!requireUnlocked(response)) return;
             if (strcmp(command, "sec.set_policy") == 0) {
@@ -1235,6 +1429,12 @@ private:
     uint64_t resetArmedAt_ = 0;
     uint64_t holdAt_ = 0;
     const char* resetReason_ = "other";
+#if OFFGRID_RADIO_DIAGNOSTICS
+    RadioDriver::Event radioEvent_;
+    bool radioEventPending_ = false;
+    uint32_t radioOperation_ = 0;
+    uint32_t nextRadioOperation_ = 1;
+#endif
 };
 
 MockDevice mockDevice;

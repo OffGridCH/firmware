@@ -266,7 +266,11 @@ void RadioDriver::tick(uint64_t nowMs) {
 			failTransfer(lastError_, nowMs);
 			return;
 		}
-		if (state_ == State::Cad && (flags & RADIOLIB_SX126X_IRQ_CAD_DONE)) {
+		if (state_ == State::Cad && (flags & (RADIOLIB_SX126X_IRQ_CAD_DONE | RADIOLIB_SX126X_IRQ_CAD_DETECTED))) {
+			if (cadForTransmit_ && nowMs >= channelDeadline_) {
+				failTransfer(ChannelBusy, nowMs);
+				return;
+			}
 			const bool detected = (flags & RADIOLIB_SX126X_IRQ_CAD_DETECTED) != 0;
 			if (!result(radio_.standby()) || !result(radio_.clearIrqFlags(RADIOLIB_SX126X_IRQ_ALL))) {
 				failTransfer(lastError_, nowMs);
@@ -298,6 +302,7 @@ void RadioDriver::tick(uint64_t nowMs) {
 			event.type = EventType::Transmitted;
 			event.timeMs = nowMs;
 			event.length = txLength_;
+			event.airtimeMs = static_cast<uint32_t>(nowMs - txStartedAt_);
 			memcpy(event.bytes, tx_, txLength_);
 			++stats_.transmitted;
 			stats_.txAirtimeMs += nowMs - txStartedAt_;

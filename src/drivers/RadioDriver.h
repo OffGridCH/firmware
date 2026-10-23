@@ -29,6 +29,7 @@ public:
 		float rssi = 0;
 		float snr = 0;
 		uint64_t timeMs = 0;
+		uint32_t airtimeMs = 0;
 		int16_t error = RADIOLIB_ERR_NONE;
 	};
 

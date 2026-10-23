@@ -113,6 +113,13 @@ receives RX, TX-complete, CAD-result, and failure notifications. Configuration
 changes wait for a safe hardware state. Register access and airtime helpers stay
 private; there is no separate manager or calculator class.
 
+The current wrapper uses pinned RadioLib 7.8.1, typed configuration/events and
+instance-owned ISR signaling. The radio_diag builds wire it through the temporary
+mock adapter for raw PHY checks while default builds retain the Android mock.
+RadioLib packet staging plus a bounded SX1262 launch avoids the convenience
+launcher's unbounded BUSY wait. See the [radio README](../src/drivers/README.md)
+for operation deadlines, timing caveats and two-board device acceptance.
+
 ### LedDriver
 
 Owns the onboard PWM LED and both external NeoPixel strips. Includes PWM/RMT

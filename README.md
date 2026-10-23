@@ -14,7 +14,7 @@ The mock validates wrapper shapes but **bypasses authentication**. Public identi
 QR pairing, 32-slot contact CRUD, typed messages, pending/cancel, and simulated
 incoming/delivery/failure events are implemented. Radio/mesh/LED configuration,
 synthetic statistics/logs/traces, and real NVS configuration persistence are available.
-Radio, LEDs, strips, and OLED are not initialized. Only configuration and timeout
+Default mock builds do not initialize radio, LEDs, strips, or OLED. Only configuration and timeout
 policy are stored in flash; identity, tokens, contacts and messages remain mocks.
 See the [host README](src/host/README.md) for API behavior and the
 [storage README](src/storage/README.md) for the record format and device checker.
@@ -25,6 +25,28 @@ must be run on your board with the single Python checker below.
 
 The [host specification](docs/offgrid-link.md)
 describes the complete target API, not the subset already implemented.
+
+## Radio Bring-Up
+
+`RadioDriver` now wraps pinned RadioLib 7.8.1 for real SX1262 initialization,
+asynchronous RX/TX, CAD/backoff, deadlines, configuration and recovery. Select
+the separate diagnostic image to use it; the Android mock remains available.
+
+```sh
+pio run -e radio_diag -t upload --upload-port /dev/ttyUSB0
+```
+
+Flash two boards, attach correct antennas and verify lawful RF settings. Then:
+
+```sh
+python3 tools/serial-check.py --port /dev/ttyUSB0 --radio-peer /dev/ttyUSB1 --allow-radio-transmit
+```
+
+The diagnostic image rejects mock chat sends and exposes raw diag.radio.*
+commands. It is not encrypted messaging and does not enforce duty cycle.
+See [radio setup and device checks](src/drivers/README.md) for commands,
+events, pins, timing limits, native-USB alternative and acceptance gates.
+Firmware builds pass; physical two-board verification remains pending.
 
 ## Storage Device Check
 
