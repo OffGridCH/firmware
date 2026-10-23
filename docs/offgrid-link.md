@@ -606,7 +606,7 @@ Errors: `E_NO_PAIRING`, `E_INVALID_QR`, `E_SELF_PAIR`, `E_CONTACT_EXISTS`, `E_ST
 | `name`, `node_id`, `public_key` | |
 | `state` | `pending` until the first valid packet from the peer verifies, then `active` |
 | `fingerprint` | See above |
-| `tx_ctr` | Next outgoing counter (informational) |
+| `tx_ctr` | Last allocated outgoing counter (informational); 0 before the first packet |
 | `rx_highest_ctr` | Highest verified counter received, `null` if none |
 | `last_rssi`, `last_snr` | From the last valid packet, `null` if none |
 
@@ -676,7 +676,7 @@ Result:
 | Field | Description |
 |---|---|
 | `msg_ref` | Local handle for status events |
-| `ctr` | Counter assigned to this message (the message ID within this conversation) |
+| `ctr` | Counter assigned to this message (1 to 16777215; the message ID within this conversation) |
 | `ack_requested`, `hops` | Effective values |
 | `state` | Always `queued` here |
 | `bytes_on_air`, `est_airtime_ms` | Size and estimated airtime at the current radio settings |

@@ -247,7 +247,9 @@ AD = header with HOP_LEFT bits zeroed || orig_CTR (3 B)   (ACK packets)
 
 ### Counter persistence
 
-Before using counter values, reserve `ctr + 256` in flash. After a reboot, resume from the reserved value. A nonce is then never reused, even after a power loss.
+Each contact has one transmit-counter sequence per direction, shared by data and ACK packets. The first transmitted counter is 1; 0 is reserved. Every new packet consumes the next counter. A data retry reuses that data packet's counter and increments `RETRY`; sending an ACK again uses a fresh counter and `RETRY = 0`.
+
+Persist an exclusive reservation end before using any counter in its block. For a next counter `n`, reserve `[n, min(n + 256, 2^24))`. After reboot, resume at the persisted reservation end and skip every unused value in the prior block. Never wrap: when the next counter reaches `2^24`, sending to that contact stops until the peers re-pair and derive new keys. This makes nonce reuse impossible after power loss, assuming the reservation commit succeeds before a counter is used.
 
 ---
 
@@ -399,11 +401,11 @@ See [section 10](#10-receive-receipts-ack).
 
 > **Message ID = (SRC, DST, CTR)**
 
-The counter is **per contact and per direction**, not one global counter per device.
+The counter is **per contact and per direction**, not one global counter per device. It is shared by all new encrypted packets in that direction, including ACKs; retransmissions of a data packet reuse its counter and are distinguished by `RETRY`.
 
 **Why not global?** With a global counter, A could talk to other contacts in the meantime and push the counter far ahead. If an ACK to B got lost, B would later see the retry of an old CTR fall outside its replay window and silently drop it, so no ACK would ever be sent. With per-contact counters, the window only moves with traffic in that very conversation.
 
-The CTR serves four purposes:
+The first counter is 1; counter 0 is reserved. The CTR serves four purposes:
 
 1. Part of the nonce
 2. Duplicate identification
@@ -434,11 +436,13 @@ Per contact the receiver keeps `highest_ctr` and a **64-bit sliding window bitma
 | greater than `highest_ctr` | accept, shift window (gaps of any size are fine) |
 | inside the window, not yet seen | accept (reordering) |
 | inside the window, already seen | duplicate: do not deliver again, **re-ACK if RETRY > 0** |
-| older than the window | drop |
+| more than 63 below `highest_ctr` | stale: drop, even when the tag is valid or `RETRY > 0` |
 
 The window state is updated **only after the tag has verified**.
 
 Persist `highest_ctr` about every 16 messages. After a reboot, treat everything at or below it as already seen.
+
+Per-contact counters prevent traffic to other contacts from advancing this window. Heavy traffic in the same direction can still move an unacknowledged packet outside it. Such a retry is rejected and the sender may eventually report `timeout`; this is the intentional security-first limit of the 64-counter replay window.
 
 ---
 
@@ -492,16 +496,21 @@ Offgrid uses **managed flooding**.
 ### 11.1 Receive algorithm
 
 ```
-1. Check sync word and PHY CRC. Length must be ≥ 16.
-   Drop if SRC == own ID.
-2. Dedupe lookup.
-   Hit  → cancel own pending rebroadcast of this packet, drop (see 9.3 for re-ACK case).
-3. If DST == own ID:
+1. Check sync word, PHY CRC, packet length (at least 16 bytes), and routing fields.
+2. If DST == own ID, try authentication with every contact whose NodeID matches SRC. On success, apply replay handling: deliver a new packet once; for an authenticated duplicate, do not deliver again and send a fresh ACK when the original requested one and `RETRY > 0`.
+3. Check the relay dedupe cache using the packet with HOP_LEFT zeroed and the MIC included. A hit cancels any pending rebroadcast and suppresses forwarding. Local transmissions are inserted into this cache before radio launch, so this also suppresses self-echoes.
+4. If DST == own ID and authentication failed for every candidate (or no contact matched), treat it as transit traffic. A 16-bit NodeID collision must not make a node swallow another node's packet.
+5. If HOP_LEFT > 0, schedule rebroadcast with HOP_LEFT − 1.
+
+Never drop a packet solely because `SRC == own ID`: NodeIDs can collide. Endpoint authentication/replay handling runs before relay dedupe so a duplicate addressed packet can trigger the required fresh ACK without being delivered twice.
+
+The endpoint authentication step is:
+
+```
+if DST == own ID:
    for each contact whose NodeID == SRC: try to verify the tag
-      success → replay check, deliver, send ACK if requested, DO NOT relay
-4. If the tag failed for all candidates (or no contact matched):
-   treat as transit traffic.
-5. If HOP_LEFT > 0: schedule rebroadcast with HOP_LEFT − 1.
+        success → replay check, deliver once, ACK duplicates as specified
+```
 ```
 
 Step 4 matters: a 16-bit NodeID can collide. A collision must never make a node swallow someone else's packet.
@@ -540,7 +549,7 @@ Everyone relays everyone's packets, including those of strangers. This is also g
 
 ### 12.2 Retransmission
 
-- Same **CTR**, **RETRY** incremented (1, 2, 3)
+- Same **CTR**, **RETRY** incremented (1, 2, 3); each retry starts with `HOP_LEFT = HOP_START`
 - New nonce, new ciphertext, new MIC. Relays therefore do not treat it as a duplicate, while the receiver recognises the same CTR in its window.
 - Timeout: `(2 × hops + 2) × (airtime + max_jitter) × 2^retry`
   Example at SF9 and 3 hops: about 6 s, then 12 s, then 24 s.
@@ -580,9 +589,9 @@ There is no running shared state that has to be tracked packet by packet:
 | Mutable HOP_LEFT would break the tag | HOP_LEFT zeroed in AD |
 | Dedupe poisoning with predicted counters | MIC included in dedupe key, keyed hash (9.2) |
 | 16-bit ID collisions | Trial verification, transit fallback (11.1) |
-| Echo and loops | Dedupe, `SRC == self` drop, hop limit |
+| Echo and loops | Locally originated packets enter the normalized dedupe cache before TX; hop limit |
 | Retransmit swallowed by mesh | RETRY field changes MIC and dedupe key |
-| Retry outside replay window | Per-contact counters (9.1) |
+| Retry outside replay window | Drop as stale; same-contact traffic can advance the 64-counter window (9.3), so sender may time out |
 | ACK forgery or mix-up | AD bound to original CTR, replay window |
 | ACK storm | One ACK per message, small hop limit, no ACK for ACK |
 | Flooding exhausts airtime | CAD and backoff now, airtime budget before deployment |
@@ -845,25 +854,16 @@ Bob decodes the position as 47.05170° N, 8.30751° E (about 1 to 2 m rounding e
 
 Requires `pip install cryptography`. This is the exact code used to generate the vectors in section 15.
 
-```python
 import hashlib
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
-from cryptography.hazmat.primitives.ciphers.aead import AESCCM
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+2. If DST == own ID, try authentication with every contact whose NodeID matches SRC. On success, apply replay handling and do not relay:
+    - New counter in the replay window: deliver once and send an ACK if requested.
+    - Previously accepted counter: do not deliver again; send a fresh ACK if the original requested one and `RETRY > 0`.
+    - Counter older than the replay window: drop as stale.
+3. For packets not accepted as addressed traffic, check the relay dedupe cache using the packet with HOP_LEFT zeroed and the MIC included. A hit cancels any pending rebroadcast and suppresses forwarding. Local transmissions are inserted into this cache before radio launch, so this also suppresses self-echoes.
+4. If DST == own ID and authentication failed for every candidate (or no contact matched), treat it as transit traffic. A 16-bit NodeID collision must not make a node swallow someone else's packet.
+5. If HOP_LEFT > 0, schedule rebroadcast with HOP_LEFT − 1.
 
-RAW = dict(encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw)
-
-
-def keypair(seed: str):                       # deterministic, for test vectors only
-    sk = X25519PrivateKey.from_private_bytes(hashlib.sha256(seed.encode()).digest())
-    return sk, sk.public_key().public_bytes(**RAW)
-
-
-def node_id(pub: bytes) -> bytes:             # 16-bit node ID
-    return hashlib.sha256(pub).digest()[:2]
-
-
+Never drop a packet solely because `SRC == own ID`: NodeIDs can collide. Endpoint authentication/replay handling runs before relay dedupe so a duplicate addressed packet can trigger the required fresh ACK without being delivered twice.
 def derive(sk, pub_self, salt_self, pub_peer, salt_peer):
     """Returns (k_out, k_in) from the point of view of 'self'."""
     dh = sk.exchange(X25519PublicKey.from_public_bytes(pub_peer))
