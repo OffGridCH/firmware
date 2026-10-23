@@ -15,7 +15,24 @@ boundary. The simulated device backend lives in `../main.cpp`, behind
 Request views are valid only during dispatch. Copy any data retained for later
 work into owned fixed buffers. Domain implementations can replace the mock
 callback without changing the transport. `ConfigStore` now provides real NVS
-persistence; security, mesh, and hardware drivers remain mocked.
+persistence; security and mesh remain mocked. The separate radio_diag profiles
+connect real RadioDriver hardware without changing the default Android mock.
+
+## Radio Diagnostic Images
+
+Only radio_diag/radio_diag_usb expose diag.radio.status/rx/tx/cad/stop/recover.
+They advertise radio_diagnostics true in boot/hello and use actual radio state,
+packet statistics and raw events. They reject msg.* and mock.* with E_BUSY so
+simulated delivery cannot be confused with encrypted radio communication.
+The diagnostic commands intentionally work without provisioning; use them only
+in controlled lab setups with synthetic bytes. Normal radio.set and radio.stats
+retain their specified unlocked access check (authentication is still mocked).
+
+Radio updates are queued after persistent configuration commits. An accepted
+set response adds apply_pending; inspect diag.radio.status.applied/config_pending
+or wait for diag.radio.configured / diag.radio.error for the hardware outcome.
+No new mesh or encryption behavior is supplied. See the
+[radio README](../drivers/README.md) for the two-board check and raw event shapes.
 
 ## Connection
 
@@ -30,6 +47,20 @@ port-open, so an already-running device may not repeat its boot event. Native
 USB attempts boot replay when its connection indicator becomes active.
 
 ## Requests and Output
+
+The existing Python tool can send a single command without running its test flow:
+
+```sh
+python3 tools/serial-check.py --port /dev/ttyUSB0 --command radio.get
+python3 tools/serial-check.py --port /dev/ttyUSB0 --command radio.set --args '{"preset":"lab_default","persist":true}' --allow-mock-changes
+```
+
+Read-only public commands need no modification opt-in. Other commands require
+allow-mock-changes, which verifies the mock marker and automatically provisions
+or unlocks for commands needing unlocked state. It never attempts mock unlock on
+production firmware. Raw diag.radio.tx additionally requires allow-radio-transmit.
+Command mode cannot be combined with storage or two-board checker modes.
+For radio.set, queued hardware application is awaited before exiting.
 
 ```json
 {"id":1,"cmd":"sys.hello","args":{"app":"offgrid-android","app_proto":"1.0"}}
