@@ -5,7 +5,7 @@
 > **Execution:** C++17, one cooperative application loop on Arduino/ESP-IDF
 > **Companion specifications:** [Host interface](offgrid-link.md) and [over-the-air protocol](offgrid-protocol.md)
 
-> **Development exception:** During the [serial mock stages](serial-mock-milestones.md),
+> **Development exception:** During [serial mock development](../src/host/README.md),
 > `main.cpp` temporarily owns the mock device handler and serial wiring. It does
 > not yet delegate to `App`. Mock behavior stays outside the reusable host modules.
 
@@ -231,6 +231,11 @@ Owns plaintext NVS access for radio, mesh, LED configuration, security policy,
 vault salt, and active generation metadata. Includes defaults, versioned record
 encoding, validation on load, persistence, and reset. NVS open/read/write helpers
 remain private; a separate `NvsPartition` class is unnecessary.
+
+The current implementation persists radio/mesh/LED settings and timeout policy
+in one schema-1 `og_cfg/settings` blob. Vault salt/generation metadata remain
+future work. See the [storage module README](../src/storage/README.md) for current
+interfaces, corruption handling, and the physical-reset device check.
 
 ### VaultStore
 

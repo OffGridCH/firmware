@@ -1,6 +1,6 @@
 # Host API and Serial Mock
 
-## Current Implementation: Stage 5
+## Current Implementation: Serial Mock With Real Configuration Storage
 
 This folder implements the real JSON Lines transport and command-envelope
 boundary. The simulated device backend lives in `../main.cpp`, behind
@@ -14,7 +14,8 @@ boundary. The simulated device backend lives in `../main.cpp`, behind
 
 Request views are valid only during dispatch. Copy any data retained for later
 work into owned fixed buffers. Domain implementations can replace the mock
-callback without changing the transport. No domain modules are initialized.
+callback without changing the transport. `ConfigStore` now provides real NVS
+persistence; security, mesh, and hardware drivers remain mocked.
 
 ## Connection
 
@@ -56,7 +57,7 @@ raw prints or retain borrowed JSON views between ticks.
 | `sys.status`, `sys.ping` | Public runtime snapshot and heartbeat; private counts appear only while unlocked |
 | `sys.set_log_level` | Validates/stores off/error/warn/info/debug; non-off selection emits a synthetic log event after the response |
 | `sys.reboot` | Response first, then simulated boot in locked state if provisioned |
-| `sys.factory_reset` | Requires `confirm: "ERASE"`; arms a ten-second window requiring a fresh debounced PRG hold of three seconds |
+| `sys.factory_reset` | Requires `confirm: "ERASE"`; fresh PRG hold erases real og_cfg settings and clears mock state; unrelated namespaces are untouched |
 | `sec.provision`, `sec.unlock` | State/session checks, canonical Base64 of 32-byte public key and 60-byte wrapper; accepts the structurally valid envelope without authentication |
 | `sec.lock` | Locks and emits `sec.state` after the response |
 | `sec.rotate_token` | Requires unlocked state and fresh session; validates the envelope and returns simulated success |
@@ -139,16 +140,22 @@ Mock control commands are not part of the production host specification.
   in hello explicitly advertise the limitation.
 - Identity is a generated public-key fixture with a SHA-256-derived NodeID; no
   identity private key is retained. Provision/unlock are not security tests.
-- All settings and provisioning are RAM-only. `persist: true` (default) saves
-  that configuration category to a second RAM snapshot; `persist: false` changes
-  only its live copy. Simulated reboot restores saved radio/mesh/LED settings and
-  timeout policy, retains contacts/provisioning, and clears pending work,
-  session/unlocked/reset-arm state and trace enablement. It does not reset MCU
-  uptime. A physical reset/power cycle starts unprovisioned with defaults.
+- Radio/mesh/LED settings and timeout policy now use real `ConfigStore` NVS.
+  `persist: true` (default) commits before live application; `persist: false`
+  changes only the live copy. Storage failure returns `E_INTERNAL` without
+  changing live values. Simulated reboot reloads NVS and retains mock contacts
+  and provisioning. A physical reset starts unprovisioned but loads saved settings.
+  Identity, tokens, contacts and messages are never stored by ConfigStore.
 - Heartbeat timeout locks without a response and emits `sec.state`. Poll/ping
   at least every five seconds. Timeout zero disables auto-lock in this mock.
-- Factory reset clears mock state only. It requires a new press after arming;
-  holding PRG before arming is insufficient. It does not erase other firmware's NVS.
+- Factory reset requires a new press after arming; holding PRG before arming is
+  insufficient. It clears real `og_cfg` configuration plus mock RAM state, not
+  the entire NVS partition. Failed erasure cancels the reset and emits an error.
+
+Hello reports `config_storage: "nvs"` and `config_schema: 1`; status adds
+`storage: {backend, config_status, writable, last_error}`. Invalid/unknown-version
+records are preserved and persistent writes disabled until explicit recovery.
+See the [storage README](../storage/README.md) for schema and failure behavior.
 
 ## Configuration and Events
 
@@ -177,7 +184,7 @@ python tools/serial-check.py --port /dev/ttyUSB0 --allow-mock-changes
 ```
 
 Run from the repository root and substitute the actual port. The opt-in flag is
-required because checks modify mock provisioning, policy, contacts and settings.
+required because checks modify mock provisioning, contacts and now real saved settings.
 The script checks mock markers before changes, uses synthetic wrapper bytes,
 pairs/replaces the Bob fixture, sends/receives messages, exercises radio-error
 events, validates atomic configuration, checks persistence across simulated
@@ -185,19 +192,20 @@ reboot, then deletes its fixture contact and leaves the device locked. Existing
 mock Bob contacts/settings may change. It prints request/response transcripts.
 
 The script does not automate physical PRG holds, Android USB permissions, all
-framing/overflow cases, queue exhaustion, reconnects, or long soak tests. Use the
-milestone checklist for those hardware gates. Reset the board before running if
-you want a fresh fixture state.
+framing/overflow cases, queue exhaustion, reconnects, or long soak tests.
+The same script's `--storage-phase` modes provide a separate focused persistence
+check across physical reset, with a snapshot and restore phase. Use the
+[storage device-check instructions](../storage/README.md) for that workflow.
+Physical reset clears mock provisioning, but no longer clears saved settings.
 
 ## Checks and Limits
 
-Both firmware profiles compile. Device/Android checks are pending until hardware
-is available. Check hello keys/nonce lengths, version rejection, consumed
+The UART configuration image compiles. Physical NVS/Android checks still require
+the flashed board. Check hello keys/nonce lengths, version rejection, consumed
 sessions, wrong-state errors, response-before-state-event ordering, heartbeat,
 reboot, and reset expiry/hold on-device.
 
-The [milestone checklist](../../docs/serial-mock-milestones.md) includes transport
-boundary/reconnect/load checks. Parser nesting/capacity, full UTF-8 validation,
+Parser nesting/capacity, full UTF-8 validation,
 and strict RFC 8259 compliance still need verification. Mock incoming counters
 only support increasing values; they do not implement the production replay
 window. Authentication failures/rate limiting and encrypted storage remain out
