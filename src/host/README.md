@@ -1,6 +1,6 @@
 # Host API and Serial Mock
 
-## Current Implementation: Stage 4
+## Current Implementation: Stage 5
 
 This folder implements the real JSON Lines transport and command-envelope
 boundary. The simulated device backend lives in `../main.cpp`, behind
@@ -54,23 +54,26 @@ raw prints or retain borrowed JSON views between ticks.
 |---|---|
 | `sys.hello` | Validates optional app/version fields, rejects incompatible major versions, replaces the one-use session, reports limits and mock markers |
 | `sys.status`, `sys.ping` | Public runtime snapshot and heartbeat; private counts appear only while unlocked |
-| `sys.set_log_level` | Validates/stores off/error/warn/info/debug; log producers arrive with later stages |
+| `sys.set_log_level` | Validates/stores off/error/warn/info/debug; non-off selection emits a synthetic log event after the response |
 | `sys.reboot` | Response first, then simulated boot in locked state if provisioned |
 | `sys.factory_reset` | Requires `confirm: "ERASE"`; arms a ten-second window requiring a fresh debounced PRG hold of three seconds |
 | `sec.provision`, `sec.unlock` | State/session checks, canonical Base64 of 32-byte public key and 60-byte wrapper; accepts the structurally valid envelope without authentication |
 | `sec.lock` | Locks and emits `sec.state` after the response |
 | `sec.rotate_token` | Requires unlocked state and fresh session; validates the envelope and returns simulated success |
 | `sec.get_policy`, `sec.set_policy` | Unlocked only; timeout 0..3600 seconds, default 15; validates optional persist boolean |
-
 | `id.get`, `id.set_name` | Public identity fixture and UTF-8 byte-limited display name |
 | `pair.begin`, `pair.cancel`, `pair.complete` | Fresh salt, OG1 QR, 300-second expiry, self/duplicate rejection, replacement and fingerprint |
 | `contact.list/get/rename/delete` | 32 stable public-data slots; pagination bounded by count and wire size; deletion requires true confirmation |
-
 | `msg.send/cancel/pending` | Typed validation, eight RAM slots, monotonically allocated refs/counters, asynchronous status changes |
 | `mock.set_scenario` | Unlocked mock-only delivery outcome: delivered, timeout, or radio_error; applies to subsequently queued messages |
 | `mock.receive` | Unlocked mock-only incoming message fixture, using from/type/payload and optional increasing ctr, hops and retry |
+| `radio.get/set` | Defaults, presets, strict ranges, warnings and calculated airtime; no radio is initialized |
+| `radio.stats` | Synthetic packet/ACK/retry counters and signal values; optional reset reads then clears counters |
+| `mesh.get/set` | Validated settings, nested ACK-default merging; hop defaults, ACK defaults, retries and locked relay state affect the mock |
+| `led.get/set/test` | Built-in/custom pattern validation, nested merging, brightness/quiet/enabled settings and simulated preview; no LEDs are driven |
+| `dbg.rf_trace` | Enables deferred rf.tx/rf.rx fixtures while unlocked; bytes are marked mock, not actual encrypted RF captures |
 
-Configuration namespaces are added in the next separately committed stage.
+All command namespaces listed by the target specification now have mock handlers.
 Arguments, result fields, and state rules follow the [host specification](../../docs/offgrid-link.md).
 
 ### Pairing and Contact Checks
@@ -105,7 +108,10 @@ Delivery normally emits sent, relayed (when hops > 0), then delivered. No-ACK
 messages emit only sent and leave the queue. Timeout scenarios retry up to three
 times and fail with timeout; radio_error fails without claiming transmission.
 Timers use artificial short intervals (100/250/400 ms), not real airtime/retry
-budgets. The default SF9/125-kHz airtime estimate is calculated, not measured.
+budgets. Airtime estimates use the current radio configuration and are calculated,
+not measured. CAD, duty cycle, SNR, radio failures and relay operations are not
+physically exercised. Retry-base configuration is stored but does not replace
+the intentionally accelerated scenario timers.
 
 Cancel returns its response before a cancelled status event. Lock and contact
 deletion/replacement fail queued messages with locked/contact_deleted. A simulated
@@ -133,13 +139,55 @@ Mock control commands are not part of the production host specification.
   in hello explicitly advertise the limitation.
 - Identity is a generated public-key fixture with a SHA-256-derived NodeID; no
   identity private key is retained. Provision/unlock are not security tests.
-- All settings and provisioning are RAM-only, even with `persist: true`.
-  Simulated reboot keeps that data but clears session/unlocked/reset-arm state;
-  it does not reset MCU uptime. A physical reset/power cycle starts unprovisioned.
+- All settings and provisioning are RAM-only. `persist: true` (default) saves
+  that configuration category to a second RAM snapshot; `persist: false` changes
+  only its live copy. Simulated reboot restores saved radio/mesh/LED settings and
+  timeout policy, retains contacts/provisioning, and clears pending work,
+  session/unlocked/reset-arm state and trace enablement. It does not reset MCU
+  uptime. A physical reset/power cycle starts unprovisioned with defaults.
 - Heartbeat timeout locks without a response and emits `sec.state`. Poll/ping
   at least every five seconds. Timeout zero disables auto-lock in this mock.
 - Factory reset clears mock state only. It requires a new press after arming;
   holding PRG before arming is insufficient. It does not erase other firmware's NVS.
+
+## Configuration and Events
+
+All set requests validate a candidate before changing live configuration. Unknown
+fields are ignored; supported nested fields merge. A preset applies before
+explicit radio fields. Results include the complete effective configuration.
+LED custom patterns require 1..16 steps of 10..10000 ms and repeat 1..255;
+`led.test.repeat` uses the same range. The repeat cap is a mock implementation
+limit where the draft specification does not define one.
+
+`radio.stats` contains simulated activity counts, not measured PHY statistics.
+Counters without a simulated source remain zero. Trace payloads have valid
+length/hex shapes and recognizable routing headers, but their body/tag bytes are
+fixtures, not ciphertext or valid authentication tags. Never use them as crypto
+vectors. `log` output is a synthetic level-change notification, not a complete
+production logging subsystem. No events expose token/private-key material.
+
+## Run the Real-Device Exerciser
+
+Flash Stage 5, close other serial applications, and use a Python environment with
+`pyserial` installed. The script opens a real port; it does not emulate firmware.
+
+```sh
+python -m pip install pyserial
+python tools/serial-check.py --port /dev/ttyUSB0 --allow-mock-changes
+```
+
+Run from the repository root and substitute the actual port. The opt-in flag is
+required because checks modify mock provisioning, policy, contacts and settings.
+The script checks mock markers before changes, uses synthetic wrapper bytes,
+pairs/replaces the Bob fixture, sends/receives messages, exercises radio-error
+events, validates atomic configuration, checks persistence across simulated
+reboot, then deletes its fixture contact and leaves the device locked. Existing
+mock Bob contacts/settings may change. It prints request/response transcripts.
+
+The script does not automate physical PRG holds, Android USB permissions, all
+framing/overflow cases, queue exhaustion, reconnects, or long soak tests. Use the
+milestone checklist for those hardware gates. Reset the board before running if
+you want a fresh fixture state.
 
 ## Checks and Limits
 
@@ -149,5 +197,8 @@ sessions, wrong-state errors, response-before-state-event ordering, heartbeat,
 reboot, and reset expiry/hold on-device.
 
 The [milestone checklist](../../docs/serial-mock-milestones.md) includes transport
-boundary/reconnect/load checks. Parser nesting/capacity and strict RFC 8259
-compliance still need verification. Compilation is not USB interoperability proof.
+boundary/reconnect/load checks. Parser nesting/capacity, full UTF-8 validation,
+and strict RFC 8259 compliance still need verification. Mock incoming counters
+only support increasing values; they do not implement the production replay
+window. Authentication failures/rate limiting and encrypted storage remain out
+of scope. Compilation is not USB interoperability proof.

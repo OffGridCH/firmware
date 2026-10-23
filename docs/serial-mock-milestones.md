@@ -108,6 +108,14 @@ Only one host application should own the port at a time.
 
 ## Validation Record
 
+Stage 5 implements the remaining configuration/statistics/log/trace command
+contracts, fixed-buffer candidate updates and live/saved RAM snapshots. Both
+firmware profiles compile. The real-port exerciser is supplied as
+`tools/serial-check.py`; its CLI/syntax checks do not establish device acceptance.
+No USB board was detected, so real-port and Android checks remain pending.
+See the host README for the current Stage 5 contract and explicit deviations;
+the stage-specific notes below describe earlier commits.
+
 Stage 4 typed messages, mock receive/scenario controls, and deferred asynchronous
 events compile in both profiles. Real-device timing, queue saturation, and
 Android chat workflow checks remain pending.

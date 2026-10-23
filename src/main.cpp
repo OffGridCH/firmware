@@ -32,6 +32,7 @@ SerialLink serialLink(hostPort);
 class MockDevice {
 public:
     void init() {
+        resetConfig();
     pinMode(0, INPUT_PULLUP);
     rawButton_ = digitalRead(0) == LOW;
     stableButton_ = rawButton_;
@@ -62,12 +63,12 @@ public:
         document["t"] = nowMs;
         JsonObject data = document.createNestedObject("data");
         data["device_id"] = deviceId_;
-        data["fw"] = "0.1.0-serial-mock.4";
+        data["fw"] = "0.1.0-serial-mock.5";
         data["proto"] = "1.0";
         data["state"] = state();
         data["reset_reason"] = resetReason_;
         data["mock"] = true;
-        data["mock_stage"] = 4;
+        data["mock_stage"] = 5;
         serialLink.sendJson(document);
     }
 
@@ -96,10 +97,14 @@ public:
             session_ = false;
             resetArmed_ = false;
             lockTimeoutS_ = 15;
+            savedTimeoutS_ = 15;
+            resetConfig();
             for (Contact& contact : contacts_) contact = Contact{};
             for (Message& message : messages_) message = Message{};
             incomingPending_ = false;
             contactEvent_ = -1;
+            tracePending_ = false;
+            traceEnabled_ = false;
             snprintf(name_, sizeof(name_), "Offgrid-%s", nodeId_);
             stateReason_ = "factory_reset";
             rebootPending_ = true;
@@ -116,20 +121,34 @@ public:
             event["data"]["reason"] = stateReason_;
             if (serialLink.sendJson(event)) stateReason_ = nullptr;
         }
+        if (logPending_ && serialLink.availableTxSlots() > 0) {
+            StaticJsonDocument<384> event;
+            event["evt"] = "log";
+            event["t"] = nowMs;
+            event["data"]["level"] = logLevel_;
+            event["data"]["msg"] = "mock log level updated";
+            if (serialLink.sendJson(event)) logPending_ = false;
+        }
         tickMessages(nowMs);
         if (rebootPending_ && stateReason_ == nullptr && serialLink.availableTxSlots() > 0) {
             unlocked_ = false;
             session_ = false;
             resetArmed_ = false;
             resetReason_ = "software";
+            config_.set(savedConfig_);
+            syncMesh();
+            lockTimeoutS_ = savedTimeoutS_;
             for (Message& message : messages_) message = Message{};
             incomingPending_ = false;
             pairing_ = false;
+            tracePending_ = false;
+            traceEnabled_ = false;
             emitBoot(nowMs);
             rebootPending_ = false;
         }
         serialLink.setReceiveEnabled(stateReason_ == nullptr && !rebootPending_ &&
-                         !incomingPending_ && contactEvent_ < 0);
+                                     !incomingPending_ && contactEvent_ < 0 &&
+                                     !tracePending_ && !logPending_);
     }
 
     static void handle(void* context, const char* command, JsonObjectConst arguments,
@@ -138,6 +157,233 @@ public:
     }
 
 private:
+    void resetConfig() {
+        deserializeJson(config_, R"json({
+          "radio":{"freq_mhz":869.525,"bw_khz":125,"sf":9,"cr":5,"tx_power_dbm":14,"preamble":8,"sync_word":79},
+          "mesh":{"hop_default":3,"relay_enabled":true,"relay_when_locked":false,"cad_enabled":true,"backoff_slots":8,"retries":3,"retry_base_ms":0,"rate_limit_per_src":20,"ack_default":{"text":true,"reaction":false,"geo":false}},
+          "led":{"enabled":true,"quiet":false,"brightness":128,"state_patterns":{"unprovisioned":"pulse","locked":"blink_slow","unlocked":"off"},"event_patterns":{"tx":"flash","rx":"flash","msg_received":"double","delivered":"off","failed":{"steps":[100,100],"repeat":3},"error":"blink_fast","pairing":"heartbeat"}}
+        })json");
+        savedConfig_.set(config_);
+        syncMesh();
+    }
+
+    void syncMesh() {
+        hopDefault_ = config_["mesh"]["hop_default"];
+        retries_ = config_["mesh"]["retries"];
+        ackText_ = config_["mesh"]["ack_default"]["text"];
+        ackReaction_ = config_["mesh"]["ack_default"]["reaction"];
+        ackGeo_ = config_["mesh"]["ack_default"]["geo"];
+    }
+
+    bool radioRunning() const {
+        return unlocked_ || (provisioned_ && config_["mesh"]["relay_when_locked"].as<bool>());
+    }
+
+    uint32_t airtime(size_t length) const {
+        const double sf = config_["radio"]["sf"].as<double>();
+        const double symbolMs = pow(2.0, sf) / config_["radio"]["bw_khz"].as<double>();
+        const double optimization = symbolMs >= 16 ? 1 : 0;
+        const double symbols = 8 + fmax(0, ceil((8.0 * length - 4 * sf + 44) /
+            (4 * (sf - 2 * optimization))) * config_["radio"]["cr"].as<double>());
+        return static_cast<uint32_t>(ceil((config_["radio"]["preamble"].as<double>() + 4.25 + symbols) * symbolMs));
+    }
+
+    static bool pattern(JsonVariantConst value, JsonObject response, const char* field) {
+        if (value.is<const char*>()) {
+            const char* names[] = {"off", "on", "flash", "blink_slow", "blink_fast", "double", "heartbeat", "pulse"};
+            for (const char* name : names) if (strcmp(value.as<const char*>(), name) == 0) return true;
+        } else if (value.is<JsonObject>()) {
+            const JsonObjectConst object = value.as<JsonObjectConst>();
+            const JsonArrayConst steps = object["steps"].as<JsonArrayConst>();
+            bool valid = object["steps"].is<JsonArray>() && steps.size() >= 1 && steps.size() <= 16;
+            for (JsonVariantConst step : steps) {
+                valid = valid && step.is<int>() && step.as<int>() >= 10 && step.as<int>() <= 10000;
+            }
+            if (object.containsKey("repeat")) valid = valid && object["repeat"].is<int>() &&
+                object["repeat"].as<int>() >= 1 && object["repeat"].as<int>() <= 255;
+            if (valid) return true;
+        }
+        Commands::fail(response, "E_INVALID_ARG", "expected a built-in pattern or 1..16 valid steps and repeat 1..255", field);
+        return false;
+    }
+
+    static void copyPattern(JsonVariant destination, JsonVariantConst source) {
+        if (source.is<const char*>()) destination.set(source);
+        else {
+            JsonObject output = destination.to<JsonObject>();
+            output["steps"].set(source["steps"]);
+            output["repeat"] = source["repeat"] | 1;
+        }
+    }
+
+    void handleConfig(const char* command, JsonObjectConst args, JsonObject response) {
+        JsonObject result = response["result"].as<JsonObject>();
+        if (strcmp(command, "dbg.rf_trace") == 0) {
+            if (!requireUnlocked(response) || !Commands::boolArg(args, response, "enabled")) return;
+            traceEnabled_ = args["enabled"];
+            result["enabled"] = traceEnabled_;
+            return;
+        }
+        if (strcmp(command, "radio.stats") == 0) {
+            if (!requireUnlocked(response) || !Commands::boolArg(args, response, "reset", false)) return;
+            const char* counters[] = {"rx_crc_errors", "rx_tag_failures", "rx_dedupe_drops", "relay_suppressed"};
+            for (const char* key : counters) result[key] = 0;
+            result["tx_packets"] = txPackets_;
+            result["rx_packets"] = rxPackets_;
+            result["relayed"] = relayed_;
+            result["acks_sent"] = acksSent_;
+            result["acks_received"] = acksReceived_;
+            result["retries"] = retryPackets_;
+            result["tx_airtime_ms_total"] = txAirtime_;
+            if (rxPackets_ > 0) { result["last_rssi"] = -92; result["last_snr"] = 7.5; }
+            else { result["last_rssi"] = nullptr; result["last_snr"] = nullptr; }
+            if (args["reset"] | false) {
+                txPackets_ = rxPackets_ = relayed_ = acksSent_ = acksReceived_ = retryPackets_ = 0;
+                txAirtime_ = 0;
+            }
+            return;
+        }
+        if (strcmp(command, "led.test") == 0) {
+            if (!requireUnlocked(response) || !pattern(args["pattern"], response, "pattern") ||
+                !Commands::integerArg(args, response, "repeat", 1, 255, false)) return;
+            result["preview"] = true;
+            result["repeat"] = args["repeat"] | 1;
+            return;
+        }
+        const char* category = strncmp(command, "radio.", 6) == 0 ? "radio" :
+            strncmp(command, "mesh.", 5) == 0 ? "mesh" : "led";
+        const char* verb = strchr(command, '.');
+        const bool setting = verb != nullptr && strcmp(verb, ".set") == 0;
+        if (verb == nullptr || (!setting && strcmp(verb, ".get") != 0)) {
+            Commands::fail(response, "E_UNKNOWN_CMD", "unknown configuration command");
+            return;
+        }
+        if (setting && (!requireUnlocked(response) || !Commands::boolArg(args, response, "persist", false))) return;
+        candidateConfig_.clear();
+        candidateConfig_.set(config_[category]);
+        JsonObject candidate = candidateConfig_.as<JsonObject>();
+        if (setting && strcmp(category, "radio") == 0) {
+            if (!Commands::stringArg(args, response, "preset", 1, 16, false)) return;
+            if (args.containsKey("preset")) {
+                const char* preset = args["preset"];
+                if (strcmp(preset, "lab_default") && strcmp(preset, "fast") && strcmp(preset, "long_range")) {
+                    Commands::fail(response, "E_INVALID_ARG", "unknown radio preset", "preset");
+                    return;
+                }
+                candidate["freq_mhz"] = 869.525;
+                candidate["bw_khz"] = strcmp(preset, "fast") == 0 ? 250 : 125;
+                candidate["sf"] = strcmp(preset, "fast") == 0 ? 7 : strcmp(preset, "long_range") == 0 ? 11 : 9;
+                candidate["cr"] = 5;
+                candidate["tx_power_dbm"] = 14;
+                candidate["preamble"] = 8;
+                candidate["sync_word"] = 79;
+            }
+            if (!Commands::numberArg(args, response, "freq_mhz", 150, 960, false) ||
+                !Commands::numberArg(args, response, "bw_khz", 62.5, 500, false) ||
+                !Commands::integerArg(args, response, "sf", 5, 12, false) ||
+                !Commands::integerArg(args, response, "cr", 5, 8, false) ||
+                !Commands::integerArg(args, response, "tx_power_dbm", -9, 22, false) ||
+                !Commands::integerArg(args, response, "preamble", 6, 64, false) ||
+                !Commands::integerArg(args, response, "sync_word", 0, 255, false)) return;
+            if (args.containsKey("bw_khz")) {
+                const double bandwidth = args["bw_khz"];
+                if (bandwidth != 62.5 && bandwidth != 125 && bandwidth != 250 && bandwidth != 500) {
+                    Commands::fail(response, "E_INVALID_ARG", "unsupported bandwidth", "bw_khz");
+                    return;
+                }
+            }
+            const char* keys[] = {"freq_mhz", "bw_khz", "sf", "cr", "tx_power_dbm", "preamble", "sync_word"};
+            for (const char* key : keys) if (args.containsKey(key)) candidate[key].set(args[key]);
+        } else if (setting && strcmp(category, "mesh") == 0) {
+            if (!Commands::integerArg(args, response, "hop_default", 0, 7, false) ||
+                !Commands::integerArg(args, response, "backoff_slots", 0, 32, false) ||
+                !Commands::integerArg(args, response, "retries", 0, 3, false) ||
+                !Commands::integerArg(args, response, "retry_base_ms", 0, 60000, false) ||
+                !Commands::integerArg(args, response, "rate_limit_per_src", 0, 255, false)) return;
+            const char* flags[] = {"relay_enabled", "relay_when_locked", "cad_enabled"};
+            for (const char* key : flags) if (!Commands::boolArg(args, response, key, false)) return;
+            if (args.containsKey("ack_default")) {
+                if (!args["ack_default"].is<JsonObject>()) {
+                    Commands::fail(response, "E_INVALID_ARG", "ack_default must be an object", "ack_default");
+                    return;
+                }
+                JsonObjectConst defaults = args["ack_default"];
+                const char* types[] = {"text", "reaction", "geo"};
+                for (const char* key : types) {
+                    if (!Commands::boolArg(defaults, response, key, false)) {
+                        char field[40];
+                        snprintf(field, sizeof(field), "ack_default.%s", key);
+                        response["error"]["field"].set(field);
+                        return;
+                    }
+                    if (defaults.containsKey(key)) candidate["ack_default"][key].set(defaults[key]);
+                }
+            }
+            const char* keys[] = {"hop_default", "relay_enabled", "relay_when_locked", "cad_enabled", "backoff_slots", "retries", "retry_base_ms", "rate_limit_per_src"};
+            for (const char* key : keys) if (args.containsKey(key)) candidate[key].set(args[key]);
+        } else if (setting) {
+            if (!Commands::boolArg(args, response, "enabled", false) ||
+                !Commands::boolArg(args, response, "quiet", false) ||
+                !Commands::integerArg(args, response, "brightness", 0, 255, false)) return;
+            const char* groups[] = {"state_patterns", "event_patterns"};
+            const char* states[] = {"unprovisioned", "locked", "unlocked"};
+            const char* events[] = {"tx", "rx", "msg_received", "delivered", "failed", "error", "pairing"};
+            for (size_t group = 0; group < 2; ++group) {
+                if (!args.containsKey(groups[group])) continue;
+                if (!args[groups[group]].is<JsonObject>()) {
+                    Commands::fail(response, "E_INVALID_ARG", "patterns must be an object", groups[group]);
+                    return;
+                }
+                const char* const* keys = group == 0 ? states : events;
+                for (size_t index = 0; index < (group == 0 ? 3 : 7); ++index) {
+                    if (!args[groups[group]].containsKey(keys[index])) continue;
+                    char field[64];
+                    snprintf(field, sizeof(field), "%s.%s", groups[group], keys[index]);
+                    JsonVariantConst value = args[groups[group]][keys[index]];
+                    if (!pattern(value, response, field)) return;
+                    copyPattern(candidate[groups[group]][keys[index]], value);
+                }
+            }
+            const char* keys[] = {"enabled", "quiet", "brightness"};
+            for (const char* key : keys) if (args.containsKey(key)) candidate[key].set(args[key]);
+        }
+        result.set(candidate);
+        if (strcmp(category, "radio") == 0) {
+            const double sf = candidate["sf"];
+            const double symbol = pow(2.0, sf) / candidate["bw_khz"].as<double>();
+            result["est_airtime_ms_23b"] = static_cast<uint32_t>(ceil((candidate["preamble"].as<double>() + 12.25 +
+                fmax(0, ceil((184 - 4 * sf + 44) / (4 * (sf - (symbol >= 16 ? 2 : 0))))) * candidate["cr"].as<double>()) * symbol));
+            result["max_text_bytes"] = 83;
+            if (setting) {
+                JsonArray warnings = result.createNestedArray("warnings");
+                const double frequency = candidate["freq_mhz"];
+                if (frequency < 863 || frequency > 870) warnings.add("outside_eu868");
+                if (candidate["tx_power_dbm"].as<int>() > 14) warnings.add("above_eu868_power_limit");
+                if (candidate["sync_word"] == 18 || candidate["sync_word"] == 52) warnings.add("reserved_sync_word");
+                warnings.add("mesh_incompatible");
+            }
+        } else if (strcmp(category, "led") == 0) {
+            JsonArray names = result.createNestedArray("builtin_patterns");
+            const char* builtins[] = {"off", "on", "flash", "blink_slow", "blink_fast", "double", "heartbeat", "pulse"};
+            for (const char* name : builtins) names.add(name);
+        }
+        if (candidateConfig_.overflowed() || measureJson(response) + 1 > BoardConfig::SerialMaxLineBytes) {
+            Commands::fail(response, "E_TOO_LONG", "configuration response exceeds the serial line limit");
+            return;
+        }
+        if (setting) {
+            configScratch_.set(config_);
+            configScratch_[category].set(candidate);
+            config_.set(configScratch_);
+            if (args["persist"] | true) {
+                configScratch_.set(savedConfig_);
+                configScratch_[category].set(candidate);
+                savedConfig_.set(configScratch_);
+            }
+            syncMesh();
+        }
+    }
+
     struct Contact {
         bool used = false;
         bool active = false;
@@ -181,6 +427,20 @@ private:
         size_t count = 0;
         for (const Message& message : messages_) if (message.used) ++count;
         return count;
+    }
+
+    static size_t packetBytes(const Message& message) {
+        return strcmp(message.type, "text") == 0 ? 17 + strlen(message.text) :
+            strcmp(message.type, "reaction") == 0 ? 20 :
+            23 + (message.hasAltitude ? 2 : 0) + (message.hasAge ? 1 : 0);
+    }
+
+    void queueTrace(const Message& message, bool transmit, bool ack = false) {
+        if (!traceEnabled_) return;
+        traceMessage_ = message;
+        traceTransmit_ = transmit;
+        traceAck_ = ack;
+        tracePending_ = true;
     }
 
     bool readPayload(JsonObjectConst args, JsonObject response, Message& message) {
@@ -278,9 +538,46 @@ private:
         if (!unlocked_) {
             incomingPending_ = false;
             contactEvent_ = -1;
+            tracePending_ = false;
             for (Message& message : messages_) if (message.used && message.failure == nullptr) message.failure = "locked";
         }
         if (serialLink.availableTxSlots() == 0) return;
+        if (tracePending_) {
+            const size_t length = traceAck_ ? 16 : packetBytes(traceMessage_);
+            uint8_t wire[100] = {};
+            wire[0] = (traceMessage_.hops << 5) | (traceMessage_.hops << 2) | traceMessage_.retry;
+            unsigned own = 0;
+            unsigned peer = 0;
+            sscanf(nodeId_, "%x", &own);
+            sscanf(contacts_[traceMessage_.contact].nodeId, "%x", &peer);
+            const unsigned destination = traceTransmit_ ? peer : own;
+            const unsigned source = traceTransmit_ ? own : peer;
+            wire[1] = destination >> 8;
+            wire[2] = destination;
+            wire[3] = source >> 8;
+            wire[4] = source;
+            wire[5] = traceMessage_.counter >> 16;
+            wire[6] = traceMessage_.counter >> 8;
+            wire[7] = traceMessage_.counter;
+            for (size_t index = 8; index < length; ++index) wire[index] = 0xa5 ^ index;
+            char hex[201] = {};
+            for (size_t index = 0; index < length; ++index) snprintf(hex + index * 2, 3, "%02X", wire[index]);
+            StaticJsonDocument<1024> event;
+            event["evt"] = traceTransmit_ ? "rf.tx" : "rf.rx";
+            event["t"] = nowMs;
+            JsonObject data = event.createNestedObject("data");
+            data["len"] = length;
+            data["hex"].set(hex);
+            data["mock"] = true;
+            if (traceTransmit_) data["airtime_ms"] = airtime(length);
+            else {
+                data["rssi"] = -92;
+                data["snr"] = 7.5;
+                data["action"] = traceAck_ ? "ack_matched" : "delivered";
+            }
+            if (serialLink.sendJson(event)) tracePending_ = false;
+            return;
+        }
         if (contactEvent_ >= 0) {
             StaticJsonDocument<256> event;
             event["evt"] = "contact.state";
@@ -305,6 +602,9 @@ private:
             if (serialLink.sendJson(event)) {
                 Contact& contact = contacts_[incoming_.contact];
                 contact.rxCounter = incoming_.counter;
+                ++rxPackets_;
+                if (incoming_.ack) { ++acksSent_; ++txPackets_; txAirtime_ += airtime(16); }
+                queueTrace(incoming_, false);
                 if (!contact.active) { contact.active = true; contactEvent_ = incoming_.contact; }
                 incomingPending_ = false;
             }
@@ -348,6 +648,16 @@ private:
                 data["rtt_ms"] = nowMs - message.created;
             }
             if (!serialLink.sendJson(event)) return;
+            if (strcmp(status, "sent") == 0 || strcmp(status, "retrying") == 0) {
+                ++txPackets_;
+                txAirtime_ += airtime(packetBytes(message));
+                if (message.retry > 0) ++retryPackets_;
+                queueTrace(message, true);
+            } else if (strcmp(status, "delivered") == 0) {
+                ++acksReceived_;
+                ++rxPackets_;
+                queueTrace(message, false, true);
+            }
             if (message.failure != nullptr || message.nextEvent == 3 || message.nextEvent == 2 ||
                 (!message.ack && message.nextEvent == 0)) {
                 if (strcmp(status, "delivered") == 0 && !contacts_[message.contact].active) {
@@ -457,7 +767,7 @@ private:
             result["hops"] = candidate.hops;
             result["state"] = "queued";
             result["bytes_on_air"] = length;
-            result["est_airtime_ms"] = static_cast<uint32_t>(ceil((12.25 + 8 + ceil((8.0 * length - 36 + 44) / 36) * 5) * 4.096));
+            result["est_airtime_ms"] = airtime(length);
         } else Commands::fail(response, "E_UNKNOWN_CMD", "unknown message/mock command");
     }
 
@@ -480,8 +790,8 @@ private:
         output["tx_ctr"] = contact.txCounter;
         if (contact.rxCounter != 0) output["rx_highest_ctr"] = contact.rxCounter;
         else output["rx_highest_ctr"] = nullptr;
-        output["last_rssi"] = nullptr;
-        output["last_snr"] = nullptr;
+        if (contact.active) { output["last_rssi"] = -92; output["last_snr"] = 7.5; }
+        else { output["last_rssi"] = nullptr; output["last_snr"] = nullptr; }
     }
 
     void handleContacts(const char* command, JsonObjectConst args, JsonObject response,
@@ -675,7 +985,10 @@ private:
                        uint64_t nowMs) {
         JsonObject result = response["result"].as<JsonObject>();
         lastActivity_ = nowMs;
-        if (strncmp(command, "msg.", 4) == 0 || strncmp(command, "mock.", 5) == 0) {
+        if (strncmp(command, "radio.", 6) == 0 || strncmp(command, "mesh.", 5) == 0 ||
+            strncmp(command, "led.", 4) == 0 || strncmp(command, "dbg.", 4) == 0) {
+            handleConfig(command, args, response);
+        } else if (strncmp(command, "msg.", 4) == 0 || strncmp(command, "mock.", 5) == 0) {
             handleMessages(command, args, response, nowMs);
         } else if (strncmp(command, "id.", 3) == 0 || strncmp(command, "pair.", 5) == 0 ||
             strncmp(command, "contact.", 8) == 0) {
@@ -715,12 +1028,12 @@ private:
             result["device"] = "heltec_wifi_lora_32_v3";
             result["chip"] = "ESP32-S3";
             result["device_id"] = deviceId_;
-            result["fw"]["version"] = "0.1.0-serial-mock.4";
+            result["fw"]["version"] = "0.1.0-serial-mock.5";
             result["fw"]["build"] = __DATE__;
             result["proto"] = "1.0";
             result["state"] = state();
             result["mock"] = true;
-            result["mock_stage"] = 4;
+            result["mock_stage"] = 5;
             result["authentication"] = "bypassed-envelope-shape-only";
             result["session"]["device_eph_pub"].set(encodedPublic);
             result["session"]["nonce"].set(encodedNonce);
@@ -735,10 +1048,10 @@ private:
             result["heap_free"] = ESP.getFreeHeap();
             result["battery_mv"] = nullptr;
             result["mock"] = true;
-            result["mock_stage"] = 4;
+            result["mock_stage"] = 5;
             JsonObject radio = result.createNestedObject("radio");
-            radio["running"] = unlocked_;
-            radio["relay_only"] = false;
+            radio["running"] = radioRunning();
+            radio["relay_only"] = radioRunning() && !unlocked_;
             JsonObject security = result.createNestedObject("security");
             security["secure_boot"] = esp_secure_boot_enabled();
             security["flash_encryption"] = esp_flash_encryption_enabled();
@@ -771,6 +1084,7 @@ private:
                 return;
             }
             snprintf(logLevel_, sizeof(logLevel_), "%s", level);
+            logPending_ = strcmp(logLevel_, "off") != 0;
             result["level"] = logLevel_;
         } else if (strcmp(command, "sec.provision") == 0 || strcmp(command, "sec.unlock") == 0 ||
                    strcmp(command, "sec.rotate_token") == 0) {
@@ -823,6 +1137,7 @@ private:
                 if (!Commands::integerArg(args, response, "lock_timeout_s", 0, 3600, false) ||
                     !Commands::boolArg(args, response, "persist", false)) return;
                 if (args.containsKey("lock_timeout_s")) lockTimeoutS_ = args["lock_timeout_s"];
+                if (args["persist"] | true) savedTimeoutS_ = lockTimeoutS_;
             }
             result["lock_timeout_s"] = lockTimeoutS_;
         } else {
@@ -854,6 +1169,24 @@ private:
     bool unlocked_ = false;
     bool session_ = false;
     uint32_t lockTimeoutS_ = 15;
+    uint32_t savedTimeoutS_ = 15;
+    StaticJsonDocument<16384> config_;
+    StaticJsonDocument<16384> savedConfig_;
+    StaticJsonDocument<8192> candidateConfig_;
+    StaticJsonDocument<16384> configScratch_;
+    bool logPending_ = false;
+    bool traceEnabled_ = false;
+    bool tracePending_ = false;
+    bool traceTransmit_ = false;
+    bool traceAck_ = false;
+    Message traceMessage_;
+    uint32_t txPackets_ = 0;
+    uint32_t rxPackets_ = 0;
+    uint32_t relayed_ = 0;
+    uint32_t acksSent_ = 0;
+    uint32_t acksReceived_ = 0;
+    uint32_t retryPackets_ = 0;
+    uint64_t txAirtime_ = 0;
     uint64_t lastActivity_ = 0;
     const char* stateReason_ = nullptr;
     bool rebootPending_ = false;

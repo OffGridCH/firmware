@@ -121,7 +121,7 @@ void Commands::fail(JsonObject response, const char* code, const char* message,
 	error["code"] = code;
 	error["message"] = message;
 	if (field != nullptr) {
-		error["field"] = field;
+		error["field"].set(const_cast<char*>(field));
 	}
 }
 

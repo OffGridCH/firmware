@@ -5,17 +5,22 @@ Firmware for the Heltec WiFi LoRa 32 V3. This branch currently builds a
 
 ## Current Stage
 
-Serial mock Stage 4 implements bounded JSON Lines communication, system commands,
+Serial mock Stage 5 implements bounded JSON Lines communication, system commands,
 hello/session envelopes, mock provisioning/unlock/lock, heartbeat, policy, simulated
 reboot, and physically confirmed mock reset. Status and boot events include
-`mock: true` and `mock_stage: 4`. Firmware version is `0.1.0-serial-mock.4`.
+`mock: true` and `mock_stage: 5`. Firmware version is `0.1.0-serial-mock.5`.
 
 The mock validates wrapper shapes but **bypasses authentication**. Public identity,
 QR pairing, 32-slot contact CRUD, typed messages, pending/cancel, and simulated
-incoming/delivery/failure events are implemented. Configuration commands follow.
+incoming/delivery/failure events are implemented. Radio/mesh/LED configuration,
+synthetic statistics/logs/traces, and simulated persistence are also available.
 Radio, LEDs, strips, and OLED are not initialized. No application data is written
 to flash. See the [host README](src/host/README.md) for supported commands and
 the RAM-only persistence/simulated reboot limitations.
+
+Stages 2 through 5 are separate commits. The host README also documents the
+real-port exerciser in `tools/serial-check.py`. Both firmware profiles compile;
+hardware/Android acceptance is still pending because no USB board was detected.
 
 See [serial stages and device checks](docs/serial-mock-milestones.md) for commit
 boundaries and acceptance scenarios. The [host specification](docs/offgrid-link.md)
@@ -25,6 +30,10 @@ describes the complete target API, not the subset already implemented.
 
 Use PlatformIO Core or the PlatformIO terminal in VS Code. Versions and C++17
 mode are configured in `platformio.ini`. Find the actual port with `pio device list`.
+
+For VS Code C++ IntelliSense, generate the local ESP32 compilation database with
+`pio run -e heltec_wifi_lora_32_V3 -t compiledb`. The checked-in editor configuration
+uses that database rather than generic Arduino/AVR include paths.
 
 Default USB-UART bridge image, 115200 baud, 8N1, explicitly using `Serial0`:
 
