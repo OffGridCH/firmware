@@ -15,6 +15,7 @@
 #include "host/Commands.h"
 #include "host/SerialLink.h"
 #include "storage/ConfigStore.h"
+#include "drivers/RadioDriver.h"
 
 #if !defined(OFFGRID_MOCK_DEVICE) || OFFGRID_MOCK_DEVICE != 1
 #error "This entry point is a serial development mock, not production firmware."
@@ -29,11 +30,17 @@ auto& hostPort = Serial0;
 #endif
 
 SerialLink serialLink(hostPort);
+#if OFFGRID_RADIO_DIAGNOSTICS
+RadioDriver radioDriver;
+#endif
 
 class MockDevice {
 public:
     void init() {
         resetConfig();
+    #if OFFGRID_RADIO_DIAGNOSTICS
+        radioDriver.init(radioConfig(config_["radio"].as<JsonObjectConst>()));
+    #endif
     pinMode(0, INPUT_PULLUP);
     rawButton_ = digitalRead(0) == LOW;
     stableButton_ = rawButton_;
@@ -70,6 +77,7 @@ public:
         data["reset_reason"] = resetReason_;
         data["mock"] = true;
         data["mock_stage"] = 5;
+        data["radio_diagnostics"] = OFFGRID_RADIO_DIAGNOSTICS != 0;
         data["config_storage"] = "nvs";
         data["config_status"] = configStore_.statusName();
         serialLink.sendJson(document);
@@ -165,6 +173,18 @@ public:
     }
 
 private:
+    static RadioDriver::Config radioConfig(JsonObjectConst values) {
+        RadioDriver::Config configuration;
+        configuration.frequencyMhz = values["freq_mhz"];
+        configuration.bandwidthKhz = values["bw_khz"];
+        configuration.spreadingFactor = values["sf"];
+        configuration.codingRate = values["cr"];
+        configuration.powerDbm = values["tx_power_dbm"];
+        configuration.preamble = values["preamble"];
+        configuration.syncWord = values["sync_word"];
+        return configuration;
+    }
+
     void resetConfig() {
                 if (!configStore_.load()) {
                         storageNotice_ = "configuration load failed; using defaults with persistent writes disabled";
@@ -182,7 +202,11 @@ private:
     }
 
     bool radioRunning() const {
+#if OFFGRID_RADIO_DIAGNOSTICS
+        return radioDriver.ready() && radioDriver.state() != RadioDriver::State::Standby;
+#else
         return unlocked_ || (provisioned_ && config_["mesh"]["relay_when_locked"].as<bool>());
+#endif
     }
 
     uint32_t airtime(size_t length) const {
@@ -1030,6 +1054,7 @@ private:
             result["state"] = state();
             result["mock"] = true;
             result["mock_stage"] = 5;
+            result["radio_diagnostics"] = OFFGRID_RADIO_DIAGNOSTICS != 0;
             result["config_storage"] = "nvs";
             result["config_schema"] = 1;
             result["authentication"] = "bypassed-envelope-shape-only";
@@ -1054,6 +1079,12 @@ private:
             JsonObject radio = result.createNestedObject("radio");
             radio["running"] = radioRunning();
             radio["relay_only"] = radioRunning() && !unlocked_;
+#if OFFGRID_RADIO_DIAGNOSTICS
+            radio["initialized"] = radioDriver.ready();
+            radio["state"] = radioDriver.stateName();
+            radio["last_error"] = radioDriver.lastError();
+            radio["relay_only"] = false;
+#endif
             JsonObject security = result.createNestedObject("security");
             security["secure_boot"] = esp_secure_boot_enabled();
             security["flash_encryption"] = esp_flash_encryption_enabled();
