@@ -30,4 +30,9 @@ constexpr uint8_t RadioDio1 = 14;
 constexpr float RadioTcxoVoltage = 1.8f;
 constexpr uint32_t RadioSpiTimeoutMs = 20;
 constexpr uint32_t RadioChannelTimeoutMs = 10000;
+constexpr uint8_t OledSda = 17;
+constexpr uint8_t OledScl = 18;
+constexpr uint8_t OledReset = 21;
+constexpr uint8_t VextControl = 36;
 }
+

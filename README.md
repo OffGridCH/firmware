@@ -26,6 +26,16 @@ must be run on your board with the single Python checker below.
 The [host specification](docs/offgrid-link.md)
 describes the complete target API, not the subset already implemented.
 
+## App Core and UI Work
+
+`App` now owns initialization and the cooperative loop; `main.cpp` only delegates.
+The temporary mock backend is in `src/host/MockDevice.h`. LED/OLED receive copied
+public snapshots and typed events, with LED settings/preview already connected.
+Their hardware implementations remain no-op stubs and report unavailable through
+`sys.status.result.ui`. A failed peripheral never blocks the other modules.
+See the short [LED/OLED handoff](docs/app-core-handoff.md) for independent work
+boundaries, driver contracts, button ownership and device checks.
+
 ## Radio Bring-Up
 
 `RadioDriver` now wraps pinned RadioLib 7.8.1 for real SX1262 initialization,
