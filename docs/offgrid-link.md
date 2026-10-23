@@ -6,6 +6,11 @@
 > **Companion document:** [Offgrid Protocol v1](offgrid-protocol.md), the over-the-air protocol this interface drives
 > **Key idea:** The Heltec is a locked vault plus radio. All keys live on the Heltec, and it only works while the right phone has unlocked it.
 
+> **Implementation note:** This is the complete target API. The serial development
+> mock implements only the subset listed in the
+> [serial implementation stages](serial-mock-milestones.md). Mock images are not
+> secure vault firmware; unsupported commands must not be assumed to work.
+
 ---
 
 ## Table of Contents
