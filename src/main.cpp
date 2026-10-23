@@ -14,6 +14,7 @@
 #include "BoardConfig.h"
 #include "host/Commands.h"
 #include "host/SerialLink.h"
+#include "storage/ConfigStore.h"
 
 #if !defined(OFFGRID_MOCK_DEVICE) || OFFGRID_MOCK_DEVICE != 1
 #error "This entry point is a serial development mock, not production firmware."
@@ -63,12 +64,14 @@ public:
         document["t"] = nowMs;
         JsonObject data = document.createNestedObject("data");
         data["device_id"] = deviceId_;
-        data["fw"] = "0.1.0-serial-mock.5";
+        data["fw"] = "0.1.0-config-store.1";
         data["proto"] = "1.0";
         data["state"] = state();
         data["reset_reason"] = resetReason_;
         data["mock"] = true;
         data["mock_stage"] = 5;
+        data["config_storage"] = "nvs";
+        data["config_status"] = configStore_.statusName();
         serialLink.sendJson(document);
     }
 
@@ -92,13 +95,16 @@ public:
         }
         if (resetArmed_ && nowMs - resetArmedAt_ >= 10000) resetArmed_ = false;
         if (resetArmed_ && stableButton_ && holdAt_ != 0 && nowMs - holdAt_ >= 3000) {
+            resetArmed_ = false;
+            holdAt_ = 0;
+            if (!configStore_.eraseAll()) {
+                storageNotice_ = "configuration erase failed; factory reset cancelled";
+            } else {
             provisioned_ = false;
             unlocked_ = false;
             session_ = false;
-            resetArmed_ = false;
-            lockTimeoutS_ = 15;
-            savedTimeoutS_ = 15;
-            resetConfig();
+            configStore_.copyTo(config_, lockTimeoutS_);
+            syncMesh();
             for (Contact& contact : contacts_) contact = Contact{};
             for (Message& message : messages_) message = Message{};
             incomingPending_ = false;
@@ -108,6 +114,7 @@ public:
             snprintf(name_, sizeof(name_), "Offgrid-%s", nodeId_);
             stateReason_ = "factory_reset";
             rebootPending_ = true;
+            }
         }
         if (unlocked_ && lockTimeoutS_ != 0 && nowMs - lastActivity_ >= lockTimeoutS_ * 1000ULL) {
             unlocked_ = false;
@@ -120,6 +127,9 @@ public:
             event["data"]["state"] = state();
             event["data"]["reason"] = stateReason_;
             if (serialLink.sendJson(event)) stateReason_ = nullptr;
+        }
+        if (storageNotice_ != nullptr && serialLink.availableTxSlots() > 0) {
+            if (serialLink.sendError("E_INTERNAL", storageNotice_, nowMs)) storageNotice_ = nullptr;
         }
         if (logPending_ && serialLink.availableTxSlots() > 0) {
             StaticJsonDocument<384> event;
@@ -135,9 +145,7 @@ public:
             session_ = false;
             resetArmed_ = false;
             resetReason_ = "software";
-            config_.set(savedConfig_);
-            syncMesh();
-            lockTimeoutS_ = savedTimeoutS_;
+            resetConfig();
             for (Message& message : messages_) message = Message{};
             incomingPending_ = false;
             pairing_ = false;
@@ -148,7 +156,7 @@ public:
         }
         serialLink.setReceiveEnabled(stateReason_ == nullptr && !rebootPending_ &&
                                      !incomingPending_ && contactEvent_ < 0 &&
-                                     !tracePending_ && !logPending_);
+                                     !tracePending_ && !logPending_ && storageNotice_ == nullptr);
     }
 
     static void handle(void* context, const char* command, JsonObjectConst arguments,
@@ -158,12 +166,10 @@ public:
 
 private:
     void resetConfig() {
-        deserializeJson(config_, R"json({
-          "radio":{"freq_mhz":869.525,"bw_khz":125,"sf":9,"cr":5,"tx_power_dbm":14,"preamble":8,"sync_word":79},
-          "mesh":{"hop_default":3,"relay_enabled":true,"relay_when_locked":false,"cad_enabled":true,"backoff_slots":8,"retries":3,"retry_base_ms":0,"rate_limit_per_src":20,"ack_default":{"text":true,"reaction":false,"geo":false}},
-          "led":{"enabled":true,"quiet":false,"brightness":128,"state_patterns":{"unprovisioned":"pulse","locked":"blink_slow","unlocked":"off"},"event_patterns":{"tx":"flash","rx":"flash","msg_received":"double","delivered":"off","failed":{"steps":[100,100],"repeat":3},"error":"blink_fast","pairing":"heartbeat"}}
-        })json");
-        savedConfig_.set(config_);
+                if (!configStore_.load()) {
+                        storageNotice_ = "configuration load failed; using defaults with persistent writes disabled";
+                }
+                configStore_.copyTo(config_, lockTimeoutS_);
         syncMesh();
     }
 
@@ -189,20 +195,7 @@ private:
     }
 
     static bool pattern(JsonVariantConst value, JsonObject response, const char* field) {
-        if (value.is<const char*>()) {
-            const char* names[] = {"off", "on", "flash", "blink_slow", "blink_fast", "double", "heartbeat", "pulse"};
-            for (const char* name : names) if (strcmp(value.as<const char*>(), name) == 0) return true;
-        } else if (value.is<JsonObject>()) {
-            const JsonObjectConst object = value.as<JsonObjectConst>();
-            const JsonArrayConst steps = object["steps"].as<JsonArrayConst>();
-            bool valid = object["steps"].is<JsonArray>() && steps.size() >= 1 && steps.size() <= 16;
-            for (JsonVariantConst step : steps) {
-                valid = valid && step.is<int>() && step.as<int>() >= 10 && step.as<int>() <= 10000;
-            }
-            if (object.containsKey("repeat")) valid = valid && object["repeat"].is<int>() &&
-                object["repeat"].as<int>() >= 1 && object["repeat"].as<int>() <= 255;
-            if (valid) return true;
-        }
+        if (ConfigStore::validPattern(value)) return true;
         Commands::fail(response, "E_INVALID_ARG", "expected a built-in pattern or 1..16 valid steps and repeat 1..255", field);
         return false;
     }
@@ -303,7 +296,7 @@ private:
             const char* flags[] = {"relay_enabled", "relay_when_locked", "cad_enabled"};
             for (const char* key : flags) if (!Commands::boolArg(args, response, key, false)) return;
             if (args.containsKey("ack_default")) {
-                if (!args["ack_default"].is<JsonObject>()) {
+                if (!args["ack_default"].is<JsonObjectConst>()) {
                     Commands::fail(response, "E_INVALID_ARG", "ack_default must be an object", "ack_default");
                     return;
                 }
@@ -330,7 +323,7 @@ private:
             const char* events[] = {"tx", "rx", "msg_received", "delivered", "failed", "error", "pairing"};
             for (size_t group = 0; group < 2; ++group) {
                 if (!args.containsKey(groups[group])) continue;
-                if (!args[groups[group]].is<JsonObject>()) {
+                if (!args[groups[group]].is<JsonObjectConst>()) {
                     Commands::fail(response, "E_INVALID_ARG", "patterns must be an object", groups[group]);
                     return;
                 }
@@ -374,12 +367,15 @@ private:
         if (setting) {
             configScratch_.set(config_);
             configScratch_[category].set(candidate);
-            config_.set(configScratch_);
-            if (args["persist"] | true) {
-                configScratch_.set(savedConfig_);
-                configScratch_[category].set(candidate);
-                savedConfig_.set(configScratch_);
+            if (configScratch_.overflowed()) {
+                Commands::fail(response, "E_INTERNAL", "configuration capacity exceeded");
+                return;
             }
+            if ((args["persist"] | true) && !configStore_.saveCategory(category, candidate)) {
+                Commands::fail(response, "E_INTERNAL", "configuration storage failed; live settings unchanged");
+                return;
+            }
+            config_.set(configScratch_);
             syncMesh();
         }
     }
@@ -1028,12 +1024,14 @@ private:
             result["device"] = "heltec_wifi_lora_32_v3";
             result["chip"] = "ESP32-S3";
             result["device_id"] = deviceId_;
-            result["fw"]["version"] = "0.1.0-serial-mock.5";
+            result["fw"]["version"] = "0.1.0-config-store.1";
             result["fw"]["build"] = __DATE__;
             result["proto"] = "1.0";
             result["state"] = state();
             result["mock"] = true;
             result["mock_stage"] = 5;
+            result["config_storage"] = "nvs";
+            result["config_schema"] = 1;
             result["authentication"] = "bypassed-envelope-shape-only";
             result["session"]["device_eph_pub"].set(encodedPublic);
             result["session"]["nonce"].set(encodedNonce);
@@ -1049,6 +1047,10 @@ private:
             result["battery_mv"] = nullptr;
             result["mock"] = true;
             result["mock_stage"] = 5;
+            result["storage"]["backend"] = "nvs";
+            result["storage"]["config_status"] = configStore_.statusName();
+            result["storage"]["writable"] = configStore_.writable();
+            result["storage"]["last_error"] = configStore_.lastError();
             JsonObject radio = result.createNestedObject("radio");
             radio["running"] = radioRunning();
             radio["relay_only"] = radioRunning() && !unlocked_;
@@ -1136,8 +1138,12 @@ private:
             if (strcmp(command, "sec.set_policy") == 0) {
                 if (!Commands::integerArg(args, response, "lock_timeout_s", 0, 3600, false) ||
                     !Commands::boolArg(args, response, "persist", false)) return;
-                if (args.containsKey("lock_timeout_s")) lockTimeoutS_ = args["lock_timeout_s"];
-                if (args["persist"] | true) savedTimeoutS_ = lockTimeoutS_;
+                const uint32_t candidate = args["lock_timeout_s"] | lockTimeoutS_;
+                if ((args["persist"] | true) && !configStore_.savePolicy(candidate)) {
+                    Commands::fail(response, "E_INTERNAL", "policy storage failed; live policy unchanged");
+                    return;
+                }
+                lockTimeoutS_ = candidate;
             }
             result["lock_timeout_s"] = lockTimeoutS_;
         } else {
@@ -1169,9 +1175,9 @@ private:
     bool unlocked_ = false;
     bool session_ = false;
     uint32_t lockTimeoutS_ = 15;
-    uint32_t savedTimeoutS_ = 15;
+    ConfigStore configStore_;
+    const char* storageNotice_ = nullptr;
     StaticJsonDocument<16384> config_;
-    StaticJsonDocument<16384> savedConfig_;
     StaticJsonDocument<8192> candidateConfig_;
     StaticJsonDocument<16384> configScratch_;
     bool logPending_ = false;
