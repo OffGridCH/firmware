@@ -5,13 +5,14 @@ Firmware for the Heltec WiFi LoRa 32 V3. This branch currently builds a
 
 ## Current Stage
 
-Serial mock Stage 2 implements bounded JSON Lines communication, system commands,
+Serial mock Stage 3 implements bounded JSON Lines communication, system commands,
 hello/session envelopes, mock provisioning/unlock/lock, heartbeat, policy, simulated
 reboot, and physically confirmed mock reset. Status and boot events include
-`mock: true` and `mock_stage: 2`. Firmware version is `0.1.0-serial-mock.2`.
+`mock: true` and `mock_stage: 3`. Firmware version is `0.1.0-serial-mock.3`.
 
-The mock validates wrapper shapes but **bypasses authentication**. Pairing,
-contacts, messages, and configuration commands are not implemented yet.
+The mock validates wrapper shapes but **bypasses authentication**. Public identity,
+QR pairing and 32-slot contact CRUD are implemented with synthetic data. Messages
+and configuration commands are not implemented yet.
 Radio, LEDs, strips, and OLED are not initialized. No application data is written
 to flash. See the [host README](src/host/README.md) for supported commands and
 the RAM-only persistence/simulated reboot limitations.

@@ -1,6 +1,6 @@
 # Host API and Serial Mock
 
-## Current Implementation: Stage 2
+## Current Implementation: Stage 3
 
 This folder implements the real JSON Lines transport and command-envelope
 boundary. The simulated device backend lives in `../main.cpp`, behind
@@ -62,8 +62,29 @@ raw prints or retain borrowed JSON views between ticks.
 | `sec.rotate_token` | Requires unlocked state and fresh session; validates the envelope and returns simulated success |
 | `sec.get_policy`, `sec.set_policy` | Unlocked only; timeout 0..3600 seconds, default 15; validates optional persist boolean |
 
-All other namespaces are added in subsequent separately committed stages.
+| `id.get`, `id.set_name` | Public identity fixture and UTF-8 byte-limited display name |
+| `pair.begin`, `pair.cancel`, `pair.complete` | Fresh salt, OG1 QR, 300-second expiry, self/duplicate rejection, replacement and fingerprint |
+| `contact.list/get/rename/delete` | 32 stable public-data slots; pagination bounded by count and wire size; deletion requires true confirmation |
+
+Message/configuration namespaces are added in subsequent separately committed stages.
 Arguments, result fields, and state rules follow the [host specification](../../docs/offgrid-link.md).
+
+### Pairing and Contact Checks
+
+Provision the mock, call `pair.begin`, then complete with a different device's
+QR or the Bob QR test vector from the specification. The mock parses public
+payloads but derives no shared/contact keys. Its fingerprint uses the specified
+ordered-public-key SHA-256 calculation. Successful completion consumes the
+pending pairing; errors leave it available until expiry/cancel/lock.
+
+List pages can contain fewer than `limit` contacts to fit 2048 bytes. Advance
+`offset` by the returned array length, not the requested limit. Contacts remain
+public mock data in RAM across simulated reboot/lock, but are inaccessible while
+locked and disappear on physical reset or confirmed factory reset. Replacing a
+contact resets its mock counters and pending/active state.
+
+Check self-pair, duplicate/replace, invalid QR, expiry, empty/full slots, pagination,
+rename, and confirmed delete. `contact.state` activation follows in Stage 4.
 
 ## Mock Security and Persistence
 

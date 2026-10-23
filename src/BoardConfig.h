@@ -14,6 +14,6 @@ constexpr size_t SerialTxSlots = 6;
 constexpr size_t SerialRxBytesPerTick = 256;
 constexpr size_t SerialTxBytesPerTick = 256;
 constexpr size_t RequestDocumentBytes = 8192;
-constexpr size_t ResponseDocumentBytes = 2048;
+constexpr size_t ResponseDocumentBytes = 8192;
 constexpr uint8_t JsonNestingLimit = 8;
 }

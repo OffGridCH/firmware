@@ -61,16 +61,20 @@ public:
         document["t"] = nowMs;
         JsonObject data = document.createNestedObject("data");
         data["device_id"] = deviceId_;
-        data["fw"] = "0.1.0-serial-mock.2";
+        data["fw"] = "0.1.0-serial-mock.3";
         data["proto"] = "1.0";
         data["state"] = state();
         data["reset_reason"] = resetReason_;
         data["mock"] = true;
-        data["mock_stage"] = 2;
+        data["mock_stage"] = 3;
         serialLink.sendJson(document);
     }
 
     void tick(uint64_t nowMs) {
+        if ((!unlocked_ || nowMs - pairingAt_ >= 300000) && pairing_) {
+            pairing_ = false;
+            mbedtls_platform_zeroize(pairingSalt_, sizeof(pairingSalt_));
+        }
         const bool pressed = digitalRead(0) == LOW;
         if (pressed != rawButton_) {
             rawButton_ = pressed;
@@ -91,6 +95,7 @@ public:
             session_ = false;
             resetArmed_ = false;
             lockTimeoutS_ = 15;
+            for (Contact& contact : contacts_) contact = Contact{};
             snprintf(name_, sizeof(name_), "Offgrid-%s", nodeId_);
             stateReason_ = "factory_reset";
             rebootPending_ = true;
@@ -124,6 +129,186 @@ public:
     }
 
 private:
+    struct Contact {
+        bool used = false;
+        bool active = false;
+        uint8_t publicKey[32] = {};
+        char name[25] = {};
+        char nodeId[5] = {};
+        char fingerprint[15] = {};
+        uint32_t txCounter = 0;
+        uint32_t rxCounter = 0;
+    };
+
+    size_t contactCount() const {
+        size_t count = 0;
+        for (const Contact& contact : contacts_) if (contact.used) ++count;
+        return count;
+    }
+
+    void writeContact(JsonObject output, size_t index) const {
+        const Contact& contact = contacts_[index];
+        char encoded[45] = {};
+        encode(contact.publicKey, 32, encoded, sizeof(encoded));
+        output["contact_id"] = index + 1;
+        output["name"] = contact.name;
+        output["node_id"] = contact.nodeId;
+        output["public_key"].set(encoded);
+        output["state"] = contact.active ? "active" : "pending";
+        output["fingerprint"] = contact.fingerprint;
+        output["tx_ctr"] = contact.txCounter;
+        if (contact.rxCounter != 0) output["rx_highest_ctr"] = contact.rxCounter;
+        else output["rx_highest_ctr"] = nullptr;
+        output["last_rssi"] = nullptr;
+        output["last_snr"] = nullptr;
+    }
+
+    void handleContacts(const char* command, JsonObjectConst args, JsonObject response,
+                        uint64_t nowMs) {
+        if (!requireUnlocked(response)) return;
+        JsonObject result = response["result"].as<JsonObject>();
+        if (strcmp(command, "id.get") == 0) {
+            identity(result);
+        } else if (strcmp(command, "id.set_name") == 0) {
+            if (!Commands::stringArg(args, response, "name", 1, 24)) return;
+            snprintf(name_, sizeof(name_), "%s", args["name"].as<const char*>());
+            identity(result);
+        } else if (strcmp(command, "pair.begin") == 0) {
+            uint8_t raw[75] = {};
+            memcpy(raw, "OG1", 3);
+            memcpy(raw + 3, publicKey_, 32);
+            esp_fill_random(pairingSalt_, sizeof(pairingSalt_));
+            memcpy(raw + 35, pairingSalt_, 16);
+            memcpy(raw + 51, name_, strlen(name_));
+            char qr[101] = {};
+            const size_t length = 51 + strlen(name_);
+            encode(raw, length, qr, sizeof(qr));
+            pairing_ = true;
+            pairingAt_ = nowMs;
+            result["qr"].set(qr);
+            result["qr_bytes"] = length;
+            result["expires_s"] = 300;
+        } else if (strcmp(command, "pair.cancel") == 0) {
+            pairing_ = false;
+            mbedtls_platform_zeroize(pairingSalt_, sizeof(pairingSalt_));
+            result["cancelled"] = true;
+        } else if (strcmp(command, "pair.complete") == 0) {
+            if (!pairing_ || nowMs - pairingAt_ >= 300000) {
+                Commands::fail(response, "E_NO_PAIRING", "call pair.begin first");
+                return;
+            }
+            if (!Commands::stringArg(args, response, "qr", 1, 100) ||
+                !Commands::stringArg(args, response, "name", 1, 24, false) ||
+                !Commands::boolArg(args, response, "replace", false)) return;
+            uint8_t raw[75] = {};
+            size_t length = 0;
+            char canonical[101] = {};
+            const char* qr = args["qr"];
+            const bool decoded = mbedtls_base64_decode(raw, sizeof(raw), &length,
+                reinterpret_cast<const unsigned char*>(qr), strlen(qr)) == 0;
+            if (decoded) encode(raw, length, canonical, sizeof(canonical));
+            if (!decoded || length < 51 || length > 75 || strcmp(qr, canonical) != 0 ||
+                memcmp(raw, "OG1", 3) != 0 || memchr(raw + 51, 0, length - 51) != nullptr) {
+                Commands::fail(response, "E_INVALID_QR", "invalid OG1 QR payload", "qr");
+                return;
+            }
+            if (memcmp(raw + 3, publicKey_, 32) == 0) {
+                Commands::fail(response, "E_SELF_PAIR", "cannot pair with own identity");
+                return;
+            }
+            size_t slot = 32;
+            for (size_t index = 0; index < 32; ++index) {
+                if (contacts_[index].used && memcmp(contacts_[index].publicKey, raw + 3, 32) == 0) {
+                    if (!(args["replace"] | false)) {
+                        Commands::fail(response, "E_CONTACT_EXISTS", "contact already exists");
+                        return;
+                    }
+                    slot = index;
+                    break;
+                }
+            }
+            if (slot == 32) {
+                for (size_t index = 0; index < 32; ++index) {
+                    if (!contacts_[index].used) { slot = index; break; }
+                }
+            }
+            if (slot == 32) {
+                Commands::fail(response, "E_STORAGE_FULL", "all mock contact slots are used");
+                return;
+            }
+            Contact candidate;
+            candidate.used = true;
+            memcpy(candidate.publicKey, raw + 3, 32);
+            uint8_t hash[32];
+            mbedtls_sha256_ret(candidate.publicKey, 32, hash, 0);
+            snprintf(candidate.nodeId, sizeof(candidate.nodeId), "%02X%02X", hash[0], hash[1]);
+            if (args.containsKey("name")) snprintf(candidate.name, sizeof(candidate.name), "%s", args["name"].as<const char*>());
+            else if (length > 51) memcpy(candidate.name, raw + 51, length - 51);
+            else snprintf(candidate.name, sizeof(candidate.name), "Offgrid-%s", candidate.nodeId);
+            uint8_t fingerprintInput[70];
+            memcpy(fingerprintInput, "og1-fp", 6);
+            const bool ownFirst = memcmp(publicKey_, candidate.publicKey, 32) < 0;
+            memcpy(fingerprintInput + 6, ownFirst ? publicKey_ : candidate.publicKey, 32);
+            memcpy(fingerprintInput + 38, ownFirst ? candidate.publicKey : publicKey_, 32);
+            mbedtls_sha256_ret(fingerprintInput, sizeof(fingerprintInput), hash, 0);
+            uint64_t digits = 0;
+            for (size_t index = 0; index < 8; ++index) digits = (digits << 8) | hash[index];
+            digits %= 1000000000000ULL;
+            snprintf(candidate.fingerprint, sizeof(candidate.fingerprint), "%04u %04u %04u",
+                static_cast<unsigned>(digits / 100000000),
+                static_cast<unsigned>((digits / 10000) % 10000), static_cast<unsigned>(digits % 10000));
+            bool collision = strcmp(candidate.nodeId, nodeId_) == 0;
+            for (size_t index = 0; index < 32; ++index) {
+                if (index != slot && contacts_[index].used && strcmp(contacts_[index].nodeId, candidate.nodeId) == 0) collision = true;
+            }
+            contacts_[slot] = candidate;
+            writeContact(result.createNestedObject("contact"), slot);
+            JsonArray warnings = result.createNestedArray("warnings");
+            if (collision) warnings.add("node_id_collision");
+            pairing_ = false;
+            mbedtls_platform_zeroize(pairingSalt_, sizeof(pairingSalt_));
+        } else if (strcmp(command, "contact.list") == 0) {
+            if (!Commands::integerArg(args, response, "offset", 0, 32, false) ||
+                !Commands::integerArg(args, response, "limit", 1, 10, false)) return;
+            const size_t offset = args["offset"] | 0;
+            const size_t limit = args["limit"] | 10;
+            result["total"] = contactCount();
+            result["offset"] = offset;
+            JsonArray list = result.createNestedArray("contacts");
+            size_t skipped = 0;
+            for (size_t index = 0; index < 32 && list.size() < limit; ++index) {
+                if (!contacts_[index].used) continue;
+                if (skipped++ < offset) continue;
+                writeContact(list.createNestedObject(), index);
+                if (measureJson(response) + 1 > BoardConfig::SerialMaxLineBytes) {
+                    list.remove(list.size() - 1);
+                    break;
+                }
+            }
+        } else if (strcmp(command, "contact.get") == 0 || strcmp(command, "contact.rename") == 0 ||
+                   strcmp(command, "contact.delete") == 0) {
+            if (!Commands::integerArg(args, response, "contact_id", 1, 32)) return;
+            const size_t index = args["contact_id"].as<size_t>() - 1;
+            if (!contacts_[index].used) {
+                Commands::fail(response, "E_NO_SUCH_CONTACT", "contact slot is empty", "contact_id");
+                return;
+            }
+            if (strcmp(command, "contact.rename") == 0) {
+                if (!Commands::stringArg(args, response, "name", 1, 24)) return;
+                snprintf(contacts_[index].name, sizeof(contacts_[index].name), "%s", args["name"].as<const char*>());
+            }
+            if (strcmp(command, "contact.delete") == 0) {
+                if (args.containsKey("confirm") && !Commands::boolArg(args, response, "confirm")) return;
+                if (!(args["confirm"] | false)) {
+                    Commands::fail(response, "E_CONFIRM_REQUIRED", "confirm must be true", "confirm");
+                    return;
+                }
+                contacts_[index] = Contact{};
+                result["deleted"] = true;
+            } else writeContact(result.createNestedObject("contact"), index);
+        } else Commands::fail(response, "E_UNKNOWN_CMD", "unknown identity/pairing/contact command");
+    }
+
     static int rng(void*, unsigned char* output, size_t length) {
         esp_fill_random(output, length);
         return 0;
@@ -167,7 +352,10 @@ private:
                        uint64_t nowMs) {
         JsonObject result = response["result"].as<JsonObject>();
         lastActivity_ = nowMs;
-        if (strcmp(command, "sys.ping") == 0) {
+        if (strncmp(command, "id.", 3) == 0 || strncmp(command, "pair.", 5) == 0 ||
+            strncmp(command, "contact.", 8) == 0) {
+            handleContacts(command, args, response, nowMs);
+        } else if (strcmp(command, "sys.ping") == 0) {
             result["uptime_ms"] = nowMs;
         } else if (strcmp(command, "sys.hello") == 0) {
             if (!Commands::stringArg(args, response, "app", 0, 128, false) ||
@@ -202,12 +390,12 @@ private:
             result["device"] = "heltec_wifi_lora_32_v3";
             result["chip"] = "ESP32-S3";
             result["device_id"] = deviceId_;
-            result["fw"]["version"] = "0.1.0-serial-mock.2";
+            result["fw"]["version"] = "0.1.0-serial-mock.3";
             result["fw"]["build"] = __DATE__;
             result["proto"] = "1.0";
             result["state"] = state();
             result["mock"] = true;
-            result["mock_stage"] = 2;
+            result["mock_stage"] = 3;
             result["authentication"] = "bypassed-envelope-shape-only";
             result["session"]["device_eph_pub"].set(encodedPublic);
             result["session"]["nonce"].set(encodedNonce);
@@ -222,7 +410,7 @@ private:
             result["heap_free"] = ESP.getFreeHeap();
             result["battery_mv"] = nullptr;
             result["mock"] = true;
-            result["mock_stage"] = 2;
+            result["mock_stage"] = 3;
             JsonObject radio = result.createNestedObject("radio");
             radio["running"] = unlocked_;
             radio["relay_only"] = false;
@@ -232,7 +420,7 @@ private:
             if (unlocked_) {
                 result["queue"]["pending"] = 0;
                 result["queue"]["capacity"] = 8;
-                result["contacts"]["used"] = 0;
+                result["contacts"]["used"] = contactCount();
                 result["contacts"]["capacity"] = 32;
             }
         } else if (strcmp(command, "sys.reboot") == 0) {
@@ -294,7 +482,7 @@ private:
             identity(result);
             result["state"] = state();
             if (!provision) {
-                result["contacts"] = 0;
+                result["contacts"] = contactCount();
                 result["radio"]["running"] = true;
                 result["radio"]["relay_only"] = false;
             }
@@ -318,6 +506,10 @@ private:
     }
 
     char deviceId_[13] = {};
+    Contact contacts_[32] = {};
+    bool pairing_ = false;
+    uint64_t pairingAt_ = 0;
+    uint8_t pairingSalt_[16] = {};
     uint8_t publicKey_[32] = {};
     char nodeId_[5] = {};
     char name_[25] = {};

@@ -108,6 +108,10 @@ Only one host application should own the port at a time.
 
 ## Validation Record
 
+Stage 3 identity/pairing/contact handlers and byte-bounded pagination compile in
+both profiles. Device acceptance remains pending. Current behavior is documented
+in the host README; Stage 1's checklist remains a historical transport reference.
+
 Stage 2 is implemented and both UART/native-USB builds pass. The current command
 subset, deliberate authentication bypass, and RAM-only reboot behavior are
 documented in the [host README](../src/host/README.md). Earlier Stage 1 behavior
