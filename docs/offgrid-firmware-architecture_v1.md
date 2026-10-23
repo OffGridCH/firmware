@@ -5,6 +5,11 @@
 > **Execution:** C++17, one cooperative application loop on Arduino/ESP-IDF
 > **Companion specifications:** [Host interface](offgrid-link.md) and [over-the-air protocol](offgrid-protocol.md)
 
+> **Development exception:** During [serial mock development](../src/host/README.md),
+> `App` owns serial wiring, UI drivers and the temporary `host/MockDevice.h` backend.
+> `main.cpp` only delegates to App. Mock behavior stays outside the reusable
+> transport/parser modules. See the [UI handoff](app-core-handoff.md).
+
 ## 1. Design Rules
 
 Use a small number of cohesive modules rather than a class for every helper.
@@ -75,6 +80,8 @@ firmware/
 ```
 
 There are 30 module files plus `main.cpp`, `BoardConfig.h`, and `Types.h`.
+The temporary `host/MockDevice.h` adapter is additional development-only code,
+not a new permanent domain module in this target structure.
 No separate `core/`, `ui/`, `radio/`, `handlers/`, or generic `utils/` directory
 is needed. A driver here is the complete peripheral-facing module, including its
 small state machine and presentation logic, not necessarily a register-only HAL.
@@ -98,6 +105,13 @@ Use direct calls and a small set of fixed callbacks instead of a generic
 long-running work. Shared notifications carry values, not pointers to temporary
 buffers. A small private wrap-safe timing helper replaces `SystemClock`.
 
+The current minimal App owns the mock backend instead of functional Security or
+MeshEngine modules. It feeds secret-free `UiSnapshot` values, typed events and
+copied LED settings/previews to independently initialized LED/OLED drivers.
+Those drivers are unavailable no-op stubs until their hardware implementations
+land. Driver failure never stops the other modules. UI ticks continue when
+native USB is disconnected. `sys.status.result.ui` exposes readiness and page.
+
 ### RadioDriver
 
 Owns all SX1262 operations: SPI/init, TCXO, RF switch, DIO1 IRQ handling,
@@ -108,6 +122,13 @@ Only `RadioDriver` accesses radio hardware. `MeshEngine` requests operations and
 receives RX, TX-complete, CAD-result, and failure notifications. Configuration
 changes wait for a safe hardware state. Register access and airtime helpers stay
 private; there is no separate manager or calculator class.
+
+The current wrapper uses pinned RadioLib 7.8.1, typed configuration/events and
+instance-owned ISR signaling. The radio_diag builds wire it through the temporary
+mock adapter for raw PHY checks while default builds retain the Android mock.
+RadioLib packet staging plus a bounded SX1262 launch avoids the convenience
+launcher's unbounded BUSY wait. See the [radio README](../src/drivers/README.md)
+for operation deadlines, timing caveats and two-board device acceptance.
 
 ### LedDriver
 
@@ -125,8 +146,9 @@ separate strip-driver or animator files are required for two fixed strips.
 
 Owns SSD1306 power/reset/init, framebuffer, dirty-region transfers, text/icons,
 and page rendering. Includes home/security status, RF telemetry, pairing expiry
-and fingerprint overlay, factory-reset prompt/progress, and short-press page
-cycling. Receives a display snapshot and UI notifications, never private keys.
+and fingerprint overlay, factory-reset prompt/progress, and the page selected by
+App on a short press. Receives a display snapshot and UI notifications, never
+private keys.
 
 Refresh presentation only when needed; send bounded chunks independently of the
 render rate. Measure actual I2C transfer time before choosing the chunk size.
@@ -138,6 +160,10 @@ Owns PRG sampling, debounce, press duration, short-press detection, and hold
 progress. Reports actions to `App`; it cannot erase flash itself. A reset hold is
 accepted only under the agreed armed-window rules and must not be satisfied by
 a hold that predates arming. Page cycling and reset confirmation stay distinct.
+
+For now Button is a placeholder: the existing mock backend samples/debounces
+GPIO0 and confirms resets, and App consumes short-press page advances. Neither
+UI driver should add another button sampler or erase configuration.
 
 ### SerialLink
 
@@ -180,11 +206,15 @@ also respect actual serialized output size, not just a contact-count limit.
 
 ### CryptoEngine
 
-Provides RNG, SHA-256, HMAC, HKDF, X25519, AES-256-GCM, AES-128-CCM, SipHash,
-and secure zeroization through vetted libraries. Rejects invalid DH results and
-propagates crypto failures. It contains primitives, not device state, pairing
-policy, JSON, flash access, or radio scheduling. Never implement new crypto
-algorithms merely to reduce dependencies or file count.
+Provides RNG, SHA-256, HMAC, HKDF-SHA256, X25519, AES-256-GCM, AES-128-CCM,
+and secure zeroization through ESP-IDF/Mbed TLS. It rejects all-zero DH results
+and propagates crypto failures. The bundled ESP32-S3 SDK does not link its direct
+HKDF entry point and its PSA HKDF provider reports `NOT_SUPPORTED`; the current
+HKDF implementation follows RFC 5869 extract/expand using Mbed TLS HMAC and is
+checked against RFC and protocol vectors on-device. SipHash is deferred until a
+vetted implementation is selected for MeshEngine; do not handwrite a primitive.
+CryptoEngine contains no device state, pairing policy, JSON, flash access, or
+radio scheduling.
 
 ### Security
 
@@ -227,6 +257,11 @@ Owns plaintext NVS access for radio, mesh, LED configuration, security policy,
 vault salt, and active generation metadata. Includes defaults, versioned record
 encoding, validation on load, persistence, and reset. NVS open/read/write helpers
 remain private; a separate `NvsPartition` class is unnecessary.
+
+The current implementation persists radio/mesh/LED settings and timeout policy
+in one schema-1 `og_cfg/settings` blob. Vault salt/generation metadata remain
+future work. See the [storage module README](../src/storage/README.md) for current
+interfaces, corruption handling, and the physical-reset device check.
 
 ### VaultStore
 

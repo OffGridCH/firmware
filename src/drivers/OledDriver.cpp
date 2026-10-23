@@ -267,3 +267,4 @@ void OledDriver::drawHome(const HomeView &v) {
     renderHome(display, v);
     display.sendBuffer();
 }
+
