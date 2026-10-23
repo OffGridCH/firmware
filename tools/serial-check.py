@@ -316,14 +316,30 @@ def main():
                         help="confirm antennas and lawful frequency/power/airtime before raw RF transmission")
     parser.add_argument("--radio-count", type=int, default=1,
                         help="diagnostic frames per direction (1..10, default 1; no duty-cycle enforcement)")
+    parser.add_argument("--command", help="send one API command instead of running a checker")
+    parser.add_argument("--args", dest="command_args", default="{}",
+                        help="JSON object of arguments for --command")
     args = parser.parse_args()
+    try:
+        command_args = json.loads(args.command_args)
+    except json.JSONDecodeError as error:
+        parser.error(f"--args is not valid JSON: {error}")
+    if not isinstance(command_args, dict):
+        parser.error("--args must be a JSON object")
+    if args.command and (args.radio_peer or args.storage_phase):
+        parser.error("--command cannot be combined with a checker mode")
+    read_only = {"sys.hello", "sys.status", "sys.ping", "radio.get", "mesh.get", "led.get", "diag.radio.status"}
+    if args.command and args.command not in read_only and not args.allow_mock_changes:
+        parser.error("non-read-only commands require --allow-mock-changes")
+    if args.command == "diag.radio.tx" and not args.allow_radio_transmit:
+        parser.error("diag.radio.tx also requires --allow-radio-transmit")
     if args.radio_peer and (args.storage_phase or not args.allow_radio_transmit):
         parser.error("radio mode is separate from storage mode and requires --allow-radio-transmit")
     if args.radio_peer == args.port or not 1 <= args.radio_count <= 10:
         parser.error("radio ports must differ and radio-count must be 1..10")
     if args.storage_phase and not args.allow_config_changes:
         parser.error("--allow-config-changes is required; storage checks modify real NVS settings")
-    if not args.storage_phase and not args.radio_peer and not args.allow_mock_changes:
+    if not args.command and not args.storage_phase and not args.radio_peer and not args.allow_mock_changes:
         parser.error("--allow-mock-changes is required; this modifies a flashed mock")
     import serial
 
@@ -334,7 +350,9 @@ def main():
     connection.open()
     with connection:
         connection.reset_input_buffer()
-        if args.radio_peer:
+        if args.command:
+            send_command(Device(connection), args.command, command_args, args.allow_mock_changes)
+        elif args.radio_peer:
             peer = serial.Serial(port=None, baudrate=args.baud, timeout=0.2, write_timeout=3)
             peer.dtr = False
             peer.rts = False
@@ -347,6 +365,23 @@ def main():
             exercise_storage(Device(connection), args.storage_phase, args.state)
         else:
             exercise(Device(connection))
+
+
+def send_command(device, command, arguments, allow_mock_changes):
+    hello = device.connect()
+    if allow_mock_changes:
+        if hello.get("mock") is not True:
+            raise RuntimeError("refusing automatic mock unlock on non-mock firmware")
+        unlocked_commands = {"radio.set", "radio.stats", "mesh.set", "led.set", "led.test",
+                             "sec.lock", "sec.get_policy", "sec.set_policy", "sec.rotate_token"}
+        if command in unlocked_commands or command.startswith(("id.", "pair.", "contact.", "msg.", "mock.", "dbg.")):
+            unlock_mock(device, hello)
+            if command == "sec.rotate_token":
+                device.call("sys.hello")
+    result = device.call(command, arguments)
+    if command == "radio.set" and result.get("apply_pending"):
+        device.event("diag.radio.configured", timeout=10)
+        device.call("diag.radio.status")
 
 
 def exercise_radio(first, second, count):

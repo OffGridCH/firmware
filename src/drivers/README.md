@@ -108,6 +108,24 @@ any mock state; this is not a secure locked-relay implementation.
 
 Match frequency, bandwidth, SF, CR, preamble and sync word. On board B:
 
+If saved settings differ, set the same preset on each board using single-command
+mode (this persists settings and automatically provisions/unlocks only a mock):
+
+```sh
+python3 tools/serial-check.py --port /dev/ttyUSB0 --command radio.set --args '{"preset":"lab_default","persist":true}' --allow-mock-changes
+python3 tools/serial-check.py --port /dev/ttyUSB1 --command radio.set --args '{"preset":"lab_default","persist":true}' --allow-mock-changes
+```
+
+The tool waits for diag.radio.configured and prints applied settings before
+exiting. No firmware reflash is required to add this host-tool mode. Settings
+survive reset; mock provisioning does not. Query without changing settings:
+
+```sh
+python3 tools/serial-check.py --port /dev/ttyUSB0 --command diag.radio.status
+```
+
+For manual serial communication, start reception on board B:
+
 ```json
 {"id":1,"cmd":"diag.radio.status"}
 {"id":2,"cmd":"diag.radio.rx"}

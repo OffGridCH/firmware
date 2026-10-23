@@ -48,6 +48,20 @@ USB attempts boot replay when its connection indicator becomes active.
 
 ## Requests and Output
 
+The existing Python tool can send a single command without running its test flow:
+
+```sh
+python3 tools/serial-check.py --port /dev/ttyUSB0 --command radio.get
+python3 tools/serial-check.py --port /dev/ttyUSB0 --command radio.set --args '{"preset":"lab_default","persist":true}' --allow-mock-changes
+```
+
+Read-only public commands need no modification opt-in. Other commands require
+allow-mock-changes, which verifies the mock marker and automatically provisions
+or unlocks for commands needing unlocked state. It never attempts mock unlock on
+production firmware. Raw diag.radio.tx additionally requires allow-radio-transmit.
+Command mode cannot be combined with storage or two-board checker modes.
+For radio.set, queued hardware application is awaited before exiting.
+
 ```json
 {"id":1,"cmd":"sys.hello","args":{"app":"offgrid-android","app_proto":"1.0"}}
 {"id":2,"cmd":"sys.status"}
