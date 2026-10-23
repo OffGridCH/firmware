@@ -5,6 +5,10 @@
 > **Execution:** C++17, one cooperative application loop on Arduino/ESP-IDF
 > **Companion specifications:** [Host interface](offgrid-link.md) and [over-the-air protocol](offgrid-protocol.md)
 
+> **Development exception:** During the [serial mock stages](serial-mock-milestones.md),
+> `main.cpp` temporarily owns the mock device handler and serial wiring. It does
+> not yet delegate to `App`. Mock behavior stays outside the reusable host modules.
+
 ## 1. Design Rules
 
 Use a small number of cohesive modules rather than a class for every helper.
