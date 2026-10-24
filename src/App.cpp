@@ -85,6 +85,8 @@ void App::handleCommand(void* context, const char* command,
 		ui["led_ready"] = app.ledReady_;
 		ui["oled_ready"] = app.oledReady_;
 		ui["page"] = static_cast<uint8_t>(UiPage::Home);
+		ui["led_duty"] = app.ledDriver_.duty();
+		ui["strip_pixels"] = BoardConfig::StripPixels;
 	}
 }
 

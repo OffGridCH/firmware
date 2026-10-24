@@ -1,5 +1,28 @@
 # Radio Driver
 
+## LED outputs
+
+Owner-confirmed wiring: onboard GPIO35 PWM, four GRB 800 kHz NeoPixels on GPIO45
+and four on GPIO46. Both external pins are strapping pins: external circuitry must
+not force incorrect levels at boot. Power/level integrity still needs physical
+inspection. Adafruit NeoPixel 1.12.5 owns stable allocated pixel buffers; its ESP32
+RMT `show()` is synchronous, not a claimed asynchronous transfer. Each strip sends
+only four pixels (120 microseconds of data plus driver overhead); output updates
+are limited to 100 Hz and skipped when unchanged/not ready. Measure mixed RF load
+separately. UI never touches RF, storage or private data.
+
+State timing continues beneath finite event/preview overrides. Configuration and
+preview values are copied, outer repeat wins, quiet/disabled forces all outputs
+off, and brightness scales PWM and pixels equally. On/off event cycles last
+1000 ms; pulse lasts 1500 ms. State cycles always loop.
+
+`tools/serial-check.py --led-check --allow-mock-changes` passed on the connected
+board: readiness, output level, master switches, brightness and preview expiry.
+It restores temporary settings and locks. `sys.status.ui.led_duty` is software
+driver-level evidence, not an optical or electrical measurement. Visual/power
+acceptance remains pending. With both strips active, 134 startup/Home pings had
+maximum RTT 16.7 ms, below the exerciser's 250 ms threshold.
+
 `RadioDriver` wraps pinned RadioLib 7.8.1 for the Heltec WiFi LoRa 32 V3 SX1262.
 Pins and the 1.8 V DIO3 TCXO supply are defined in `BoardConfig.h`; verify against
 your board revision. DIO2 controls the RF switch. LoRa uses explicit headers,

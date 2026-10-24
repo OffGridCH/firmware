@@ -34,5 +34,8 @@ constexpr uint8_t OledSda = 17;
 constexpr uint8_t OledScl = 18;
 constexpr uint8_t OledReset = 21;
 constexpr uint8_t VextControl = 36;
+constexpr uint8_t OnboardLed = 35;
+constexpr uint8_t LedPwmChannel = 0;
+constexpr uint8_t StripPins[] = {45, 46};
+constexpr uint16_t StripPixels = 4;
 }
-

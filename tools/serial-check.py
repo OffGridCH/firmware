@@ -212,6 +212,43 @@ def exercise_ui(device):
     print(f"PASS: {count} pings across startup/Home; maximum RTT {maximum * 1000:.1f} ms (<250 ms).")
 
 
+def exercise_led(device):
+    hello = device.connect()
+    if hello.get("mock") is not True:
+        raise RuntimeError("LED checker currently requires the explicit development mock")
+    unlock_mock(device, hello)
+    original = device.call("led.get")
+    original.pop("builtin_patterns", None)
+
+    def expect_duty(expected):
+        time.sleep(0.05)
+        ui = device.call("sys.status")["ui"]
+        require_equal(ui["led_ready"], True, "LED initialization")
+        require_equal(ui["strip_pixels"], 4, "confirmed strip count")
+        require_equal(ui["led_duty"], expected, "PWM/pixel output level")
+
+    try:
+        device.call("led.set", {"enabled": True, "quiet": False, "brightness": 73,
+                               "state_patterns": {"unlocked": "on"}, "persist": False})
+        expect_duty(73)
+        device.call("led.set", {"quiet": True, "persist": False})
+        device.call("led.test", {"pattern": "on"})
+        expect_duty(0)
+        device.call("led.set", {"quiet": False, "enabled": False, "persist": False})
+        device.call("led.test", {"pattern": "on"})
+        expect_duty(0)
+        device.call("led.set", {"enabled": True, "state_patterns": {"unlocked": "off"},
+                               "persist": False})
+        device.call("led.test", {"pattern": "on", "repeat": 1})
+        expect_duty(73)
+        time.sleep(1.05)
+        expect_duty(0)
+    finally:
+        device.call("led.set", dict(original, persist=False))
+        device.call("sec.lock")
+    print("PASS: onboard/strip driver levels, quiet/enabled, brightness and finite preview; visual acceptance pending.")
+
+
 def unlock_mock(device, hello=None):
     if hello is None:
         hello = device.call("sys.hello")
@@ -331,6 +368,8 @@ def main():
                         help="run NVS checks; reset verifies buttonless rejection without erasing")
     parser.add_argument("--ui-check", action="store_true",
                         help="measure ping RTT across OLED startup/Home without changing settings")
+    parser.add_argument("--led-check", action="store_true",
+                        help="check LED output levels using temporary settings and restore them")
     parser.add_argument("--state", type=Path, default=Path("config-check-state.json"),
                         help="local original/expected settings snapshot for storage checks")
     parser.add_argument("--allow-config-changes", action="store_true",
@@ -350,7 +389,7 @@ def main():
         parser.error(f"--args is not valid JSON: {error}")
     if not isinstance(command_args, dict):
         parser.error("--args must be a JSON object")
-    if sum(bool(mode) for mode in (args.command, args.radio_peer, args.storage_phase, args.ui_check)) > 1:
+    if sum(bool(mode) for mode in (args.command, args.radio_peer, args.storage_phase, args.ui_check, args.led_check)) > 1:
         parser.error("choose only one command/checker mode")
     read_only = {"sys.hello", "sys.status", "sys.ping", "radio.get", "mesh.get", "led.get",
                  "diag.radio.status", "mock.crypto.selftest"}
@@ -364,6 +403,8 @@ def main():
         parser.error("radio ports must differ and radio-count must be 1..10")
     if args.storage_phase and not args.allow_config_changes:
         parser.error("--allow-config-changes is required; storage checks modify real NVS settings")
+    if args.led_check and not args.allow_mock_changes:
+        parser.error("--led-check requires --allow-mock-changes")
     if not args.command and not args.storage_phase and not args.radio_peer and not args.ui_check and not args.allow_mock_changes:
         parser.error("--allow-mock-changes is required; this modifies a flashed mock")
     import serial
@@ -379,6 +420,8 @@ def main():
             send_command(Device(connection), args.command, command_args, args.allow_mock_changes)
         elif args.ui_check:
             exercise_ui(Device(connection))
+        elif args.led_check:
+            exercise_led(Device(connection))
         elif args.radio_peer:
             peer = serial.Serial(port=None, baudrate=args.baud, timeout=0.2, write_timeout=3)
             peer.dtr = False

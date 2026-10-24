@@ -849,6 +849,11 @@ A pattern is a **name** or a **custom object**.
 | `heartbeat` | `[100, 150, 100, 650]` | |
 | `pulse` | smooth fade, 1.5 s | PWM ramp up and down |
 
+On this hardware, the same monochrome level also drives two owner-confirmed
+four-pixel GRB 800 kHz NeoPixel strips on GPIO45 and GPIO46. `enabled`, `quiet`
+and brightness cover all outputs. For finite event/preview repetitions, `on`
+and `off` each occupy 1000 ms (owner-approved); state versions remain steady.
+
 Custom: `{"steps": [on_ms, off_ms, ...], "repeat": N}`. Up to 16 entries of 10 to 10000 ms each. `repeat` applies to event patterns (default 1). State patterns always loop.
 
 An event pattern temporarily overrides the state pattern, which then resumes.

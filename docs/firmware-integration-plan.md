@@ -46,7 +46,7 @@ specification conflict explicitly; do not silently weaken a security requirement
 | `PacketCodec` | Placeholder | Encode/decode TEXT, REACTION, GEO and ACK; construct authenticated headers/nonces; encrypt and verify packets |
 | `MeshEngine` | Placeholder; delivery/retry/relay events are simulated | Real outbound queue, direct receive/delivery, ACKs, retries, replay decisions, relaying and congestion controls |
 | `OledDriver` | U8g2 startup animation and home renderer using `HomeView`, `begin`, `drawHome` | Adapt to App's `init/show/onEvent/tick`; bounded animation/transfers; state-driven overlays; independent failure handling |
-| `LedDriver` | App-compatible no-op interface, config/preview wiring | Implement actual confirmed outputs, animations, quiet/enabled/brightness behavior and nonblocking transfers |
+| `LedDriver` | Onboard PWM and owner-confirmed dual four-pixel GRB NeoPixels; copied settings/preview and master switches | Visual/power and mixed-RF timing acceptance pending; RMT transfers are synchronous and bounded by four pixels |
 | Buttonless core | GPIO0 sampling, page advance, hold/reset paths and placeholder removed | Reset stays unavailable pending approved maintenance policy |
 | Existing device exerciser | Serial API checks, settings persistence phases, raw two-board checks, crypto diagnostic command | Extend the existing tool incrementally for real unlock, pairing, encrypted delivery and relay acceptance; remove button-required reset expectations |
 
@@ -406,5 +406,20 @@ host responsiveness, recovery, and the release gates separately with evidence.
 - Branches are stacked from the merged main tip: `feature/oled-core-integration`,
   then `feature/buttonless-core`; neither was merged into main by the agent.
 
-Next: confirmed onboard LED output, vault/security and packet codec. External
-strip wiring/counts are unknown; neither vault nor meshing is implemented yet.
+- Stage 2: owner confirmed GPIO45/GPIO46, four GRB 800 kHz NeoPixels each, and
+  1000 ms on/off event repetitions. Implemented onboard GPIO35 PWM, both strips,
+  all patterns, independent state/override timing and master brightness/quiet/
+  enabled. UART/native-USB builds and on-device driver-level checks pass.
+  134 startup/Home pings had maximum RTT 16.7 ms. Physical visual inspection,
+  strapping-pin power integrity and mixed-RF transfer timing remain pending.
+- Owner changed the reset requirement during execution: support registered-app
+  authenticated reset and a fleet maintenance master key. Approved private-key
+  generation outside the repository and destructive tests of synthetic vault
+  data with original settings restored. Proposed implementation: fresh token
+  authentication for app reset; single-use device-bound signed challenge for
+  maintenance, public trust key only in firmware. No global secret in firmware,
+  eFuse changes, partition-wide erase or fallback to mock authentication.
+  Until that real authorization path is implemented, `E_BUSY` remains correct.
+
+Next: vault/security, authenticated recovery and packet codec. Neither vault nor
+meshing is implemented yet; full multi-board acceptance needs additional boards.

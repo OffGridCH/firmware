@@ -14,7 +14,7 @@ The mock validates wrapper shapes but **bypasses authentication**. Public identi
 QR pairing, 32-slot contact CRUD, typed messages, pending/cancel, and simulated
 incoming/delivery/failure events are implemented. Radio/mesh/LED configuration,
 synthetic statistics/logs/traces, and real NVS configuration persistence are available.
-Default mock builds initialize OLED but not radio, LEDs or strips. Only configuration and timeout
+Default mock builds initialize OLED, onboard LED and two four-pixel strips but not radio. Only configuration and timeout
 policy are stored in flash; identity, tokens, contacts and messages remain mocks.
 See the [host README](src/host/README.md) for API behavior and the
 [storage README](src/storage/README.md) for the record format and device checker.
@@ -32,7 +32,7 @@ describes the complete target API, not the subset already implemented.
 The temporary mock backend is in `src/host/MockDevice.h`. LED/OLED receive copied
 public snapshots and typed events, with LED settings/preview already connected.
 OLED uses the merged U8g2 renderer with cooperative startup and dirty-row
-transfers; LED output remains a no-op stub. Readiness is reported through
+transfers; LED output uses PWM and two GRB 800 kHz NeoPixel strips. Readiness is reported through
 `sys.status.result.ui`. A failed peripheral never blocks the other modules.
 See the short [LED/OLED handoff](docs/app-core-handoff.md) for independent work
 boundaries, driver contracts, automatic overlays and device checks. GPIO0 is not
@@ -73,7 +73,9 @@ python3 tools/serial-check.py --port /dev/ttyUSB0 --storage-phase restore --allo
 Requires `pyserial`. Keep the generated snapshot until restore succeeds.
 The optional `--storage-phase reset` checks reset rejection and unchanged
 configuration; it performs no erase. `--ui-check` measures serial responsiveness
-across startup and Home rendering without changing settings.
+across startup and Home rendering without changing settings. `--led-check
+--allow-mock-changes` verifies output levels and preview/quiet/enabled behavior
+using temporary settings, then restores them.
 
 ## Build and Upload
 

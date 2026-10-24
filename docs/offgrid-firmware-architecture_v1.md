@@ -107,8 +107,8 @@ buffers. A small private wrap-safe timing helper replaces `SystemClock`.
 The current minimal App owns the mock backend instead of functional Security or
 MeshEngine modules. It feeds secret-free `UiSnapshot` values, typed events and
 copied LED settings/previews to independently initialized LED/OLED drivers.
-OLED initialization and cooperative rendering are implemented; LED output is
-still a stub. Driver failure never stops the other modules. UI ticks continue when
+OLED initialization/cooperative rendering and onboard/strip LED output are
+implemented. Driver failure never stops the other modules. UI ticks continue when
 native USB is disconnected. `sys.status.result.ui` exposes readiness and page.
 
 ### RadioDriver

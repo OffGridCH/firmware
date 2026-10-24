@@ -87,7 +87,7 @@ python3 tools/serial-check.py --port /dev/ttyUSB0 --command led.test --args '{"p
 ```
 
 `sys.status.result.ui` reports led_ready, oled_ready and numeric page (0..2).
-OLED readiness is true on the connected board; LED remains a stub. Check timed
+OLED and LED readiness are true on the connected board. Check timed
 overlays, idle updates with the host disconnected and independent driver failure
 on hardware. Use synthetic pairing data; factory reset must not erase configuration.
 Commit each driver in small buildable stages. No new test suite is needed.

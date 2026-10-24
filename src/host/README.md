@@ -19,7 +19,8 @@ callback without changing the transport. `ConfigStore` now provides real NVS
 persistence; security and mesh remain mocked. The separate radio_diag profiles
 connect real RadioDriver hardware without changing the default Android mock.
 
-OLED has cooperative startup and rendering; LED is still an unavailable stub.
+OLED has cooperative startup/rendering; LED drives onboard PWM and two confirmed
+four-pixel GRB NeoPixel outputs (GPIO45 and GPIO46).
 `sys.status.result.ui` adds `led_ready`, `oled_ready` and numeric `page` (Home=0,
 Radio=1, Pairing=2). Home is the default, with automatic timed overlays.
 See the [App/UI handoff](../../docs/app-core-handoff.md) for driver integration.
@@ -109,7 +110,7 @@ raw prints or retain borrowed JSON views between ticks.
 | `radio.get/set` | Defaults, presets, strict ranges, warnings and calculated airtime; no radio is initialized |
 | `radio.stats` | Synthetic packet/ACK/retry counters and signal values; optional reset reads then clears counters |
 | `mesh.get/set` | Validated settings, nested ACK-default merging; hop defaults, ACK defaults, retries and locked relay state affect the mock |
-| `led.get/set/test` | Pattern validation, nested merging and real settings persistence; App forwards copied settings/preview to LedDriver, whose current stub drives no LEDs |
+| `led.get/set/test` | Pattern validation, nested merging and real settings persistence; copied settings/preview drive onboard PWM and two NeoPixel strips |
 | `dbg.rf_trace` | Enables deferred rf.tx/rf.rx fixtures while unlocked; bytes are marked mock, not actual encrypted RF captures |
 
 All command namespaces listed by the target specification now have mock handlers.
