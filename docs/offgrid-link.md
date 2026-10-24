@@ -232,8 +232,6 @@ stateDiagram-v2
     Unlocked --> Locked: sec.lock or heartbeat timeout
     Unlocked --> Boot: reboot or power loss
     Locked --> Boot: reboot or power loss
-    Locked --> Unprovisioned: factory reset
-    Unlocked --> Unprovisioned: factory reset
 ```
 
 | State | Meaning | Radio |
@@ -354,7 +352,7 @@ The device locks when **any** of these happens:
 | `sec.lock` | Explicit |
 | **Heartbeat timeout** | No valid line from the app for `lock_timeout_s` (default 15 s, configurable, 0 disables). Any valid command counts as activity, `sys.ping` is the dedicated heartbeat |
 | Reboot or power loss | Always boots into `locked` |
-| `sys.factory_reset` | Wipes everything |
+| `sys.factory_reset` | Unavailable on buttonless hardware; no lifecycle change |
 
 On lock the device: zeroes the keys in RAM, fails all in-flight messages (`msg.status` with `failed`, reason `locked`), clears the queue and stops the radio. If `mesh.relay_when_locked` is true the radio keeps running as a **keyless relay** (see [Offgrid Protocol §11](offgrid-protocol.md): relays never need keys).
 
@@ -382,7 +380,7 @@ eFuse settings are **irreversible**, so enable them only on devices you are happ
 ### 6.9 Limitations
 
 - **Active man-in-the-middle on the cable.** The wrap uses an unauthenticated ephemeral exchange, so it defeats passive sniffing but not a device that sits in the middle and impersonates the Heltec. Optional hardening is a device attestation key pinned by the app at provisioning time.
-- **Lost or wiped phone.** If the Keystore key is gone, the token is gone and the device can only be factory-reset. This is by design. A recovery mechanism is future work.
+- **Lost or wiped phone.** If the Keystore key is gone, the token is gone. Buttonless maintenance recovery requires an owner-approved policy and is a release gate.
 - **Cleartext messages on the cable** are visible to anything that can tap the USB link.
 - **RAM while unlocked** holds the keys.
 
@@ -392,13 +390,12 @@ eFuse settings are **irreversible**, so enable them only on devices you are happ
 
 ### 6.11 Factory reset
 
-Always possible, so a lost phone does not leave a bricked device, and it needs **physical presence**:
-
-1. App calls `sys.factory_reset` with `"confirm": "ERASE"`. The device arms the reset for 10 s.
-2. The user holds the PRG button for 3 s.
-3. The device wipes the vault, configuration and counters and reboots into `unprovisioned`.
-
-All keys and contacts are gone. A thief can reuse the hardware but gets none of your data.
+The connected hardware has no usable application button. The old PRG-hold
+workflow is cancelled. `sys.factory_reset` without `"confirm": "ERASE"` returns
+`E_CONFIRM_REQUIRED`; with it, returns `E_BUSY` explaining buttonless reset is
+unavailable. It never arms, erases or changes state. An owner-approved maintenance
+or recovery policy is required before reset can be enabled. Do not substitute an
+unauthenticated serial wipe.
 
 ---
 
@@ -463,11 +460,12 @@ Heartbeat and activity signal. Resets the auto-lock timer.
 Sends the response, then restarts. The device comes back `locked`. A `sys.boot` event follows.
 
 #### `sys.factory_reset`
-Arms a factory reset ([section 6.11](#611-factory-reset)). Without `"confirm": "ERASE"` it fails with `E_CONFIRM_REQUIRED`.
+Unavailable on buttonless boards ([section 6.11](#611-factory-reset)).
+Without `"confirm": "ERASE"` it fails with `E_CONFIRM_REQUIRED`; otherwise `E_BUSY`.
 
 ```json
 → {"id":4,"cmd":"sys.factory_reset","args":{"confirm":"ERASE"}}
-← {"id":4,"ok":true,"result":{"armed":true,"expires_s":10,"action":"hold PRG button for 3 s"}}
+← {"id":4,"ok":false,"error":{"code":"E_BUSY","message":"factory reset unavailable on buttonless hardware; approved maintenance recovery required"}}
 ```
 
 #### `sys.set_log_level`
@@ -1138,7 +1136,7 @@ The first byte is `68` here because one relay already decremented `HOP_LEFT` fro
 | Heartbeat | App pings every 5 s |
 | Default `lock_timeout_s` | 15 s |
 | Pairing expiry | 300 s |
-| Factory reset window | 10 s arm time, then 3 s button hold |
+| Factory reset | Disabled on buttonless hardware; approved recovery policy pending |
 | Unlock failure delay | 2 s, doubling, max 60 s, after 3 failures |
 | Unlock token | 32 bytes |
 | Wrapped token | 60 bytes (12 IV + 32 ciphertext + 16 tag) |

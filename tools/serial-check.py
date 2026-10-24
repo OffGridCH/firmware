@@ -111,6 +111,7 @@ def exercise(device):
     assert hello.get("mock") is True and hello.get("mock_stage") == 5, hello
     assert len(base64.b64decode(hello["session"]["device_eph_pub"], validate=True)) == 32
     assert len(base64.b64decode(hello["session"]["nonce"], validate=True)) == 16
+    exercise_reset_rejection(device)
     device.call("sys.hello", {"app_proto": "2.0"}, error="E_PROTO_MISMATCH")
     hello = device.call("sys.hello")
     wrapper = {
@@ -125,6 +126,7 @@ def exercise(device):
         device.event("sec.state", lambda data: data["reason"] == "unlock")
     device.call("sec.set_policy", {"lock_timeout_s": 15})
     device.call("sys.ping")
+    exercise_reset_rejection(device)
     device.call("id.get")
     device.call("pair.begin")
     contact = device.call("pair.complete", {
@@ -167,12 +169,47 @@ def exercise(device):
     device.event("sec.state", lambda data: data["reason"] == "unlock")
     device.call("sec.lock")
     device.event("sec.state", lambda data: data["reason"] == "lock")
+    exercise_reset_rejection(device)
     print("PASS: real-port mock API checks completed; device remains locked")
 
 
 def require_equal(actual, expected, label):
     if actual != expected:
         raise RuntimeError(f"{label}: expected {expected!r}, got {actual!r}")
+
+
+def exercise_reset_rejection(device):
+    before = device.call("sys.status")
+    configuration = {category: device.call(f"{category}.get")
+                     for category in ("radio", "mesh", "led")}
+    device.call("sys.factory_reset", error="E_CONFIRM_REQUIRED")
+    device.call("sys.factory_reset", {"confirm": "ERASE"}, error="E_BUSY")
+    after = device.call("sys.status")
+    require_equal(after["state"], before["state"], "reset must not change lifecycle")
+    require_equal(after["storage"], before["storage"], "reset must not change storage")
+    require_equal(after["ui"]["page"], 0, "buttonless Home page")
+    for category, expected in configuration.items():
+        require_equal(device.call(f"{category}.get"), expected, f"reset preserves {category}")
+    print("PASS: buttonless reset rejected without changing state or configuration.")
+
+
+def exercise_ui(device):
+    device.connect()
+    deadline = time.monotonic() + 8
+    maximum = 0
+    count = 0
+    while time.monotonic() < deadline:
+        started = time.monotonic()
+        device.call("sys.ping")
+        maximum = max(maximum, time.monotonic() - started)
+        count += 1
+        time.sleep(0.05)
+    status = device.call("sys.status")
+    require_equal(status["ui"]["oled_ready"], True, "connected OLED initialized")
+    require_equal(status["ui"]["page"], 0, "buttonless Home page")
+    if maximum >= 0.25:
+        raise RuntimeError(f"UI responsiveness exceeded 250 ms: {maximum * 1000:.1f} ms")
+    print(f"PASS: {count} pings across startup/Home; maximum RTT {maximum * 1000:.1f} ms (<250 ms).")
 
 
 def unlock_mock(device, hello=None):
@@ -211,7 +248,7 @@ def exercise_storage(device, phase, state_path):
         raise RuntimeError("refusing to change a non-mock or non-NVS firmware image")
     storage = device.call("sys.status")["storage"]
     if not storage["writable"] and phase != "reset":
-        raise RuntimeError(f"storage is read-only: {storage}; use confirmed factory reset to recover")
+        raise RuntimeError(f"storage is read-only: {storage}; approved operator recovery required")
 
     if phase == "write":
         if state_path.exists():
@@ -261,21 +298,7 @@ def exercise_storage(device, phase, state_path):
         return
 
     if phase == "reset":
-        device.events.clear()
-        device.call("sys.factory_reset", {"confirm": "ERASE"})
-        print("NOW release PRG if held, then hold it for 3 seconds within the 10-second window.", flush=True)
-        device.event("sec.state", lambda data: data["reason"] == "factory_reset", timeout=12)
-        device.event("sys.boot", lambda data: data["config_status"] == "defaults")
-        unlock_mock(device)
-        actual = read_configuration(device)
-        require_equal(actual["radio"]["freq_mhz"], 869.525, "reset frequency")
-        require_equal(actual["radio"]["sf"], 9, "reset spreading factor")
-        require_equal(actual["mesh"]["hop_default"], 3, "reset hop default")
-        require_equal(actual["led"]["brightness"], 128, "reset brightness")
-        require_equal(actual["policy"]["lock_timeout_s"], 15, "reset policy")
-        require_equal(device.call("sys.status")["storage"]["config_status"], "defaults", "erased namespace")
-        device.call("sec.lock")
-        print("PASS: physically confirmed configuration reset restored defaults.")
+        exercise_reset_rejection(device)
         return
 
     snapshot = json.loads(state_path.read_text(encoding="utf-8"))
@@ -305,7 +328,9 @@ def main():
     parser.add_argument("--allow-mock-changes", action="store_true",
                         help="permit synthetic provisioning, settings changes, pairing and deletion")
     parser.add_argument("--storage-phase", choices=("write", "verify", "restore", "reset"),
-                        help="run the NVS device check instead of the general mock API check")
+                        help="run NVS checks; reset verifies buttonless rejection without erasing")
+    parser.add_argument("--ui-check", action="store_true",
+                        help="measure ping RTT across OLED startup/Home without changing settings")
     parser.add_argument("--state", type=Path, default=Path("config-check-state.json"),
                         help="local original/expected settings snapshot for storage checks")
     parser.add_argument("--allow-config-changes", action="store_true",
@@ -325,8 +350,8 @@ def main():
         parser.error(f"--args is not valid JSON: {error}")
     if not isinstance(command_args, dict):
         parser.error("--args must be a JSON object")
-    if args.command and (args.radio_peer or args.storage_phase):
-        parser.error("--command cannot be combined with a checker mode")
+    if sum(bool(mode) for mode in (args.command, args.radio_peer, args.storage_phase, args.ui_check)) > 1:
+        parser.error("choose only one command/checker mode")
     read_only = {"sys.hello", "sys.status", "sys.ping", "radio.get", "mesh.get", "led.get",
                  "diag.radio.status", "mock.crypto.selftest"}
     if args.command and args.command not in read_only and not args.allow_mock_changes:
@@ -339,7 +364,7 @@ def main():
         parser.error("radio ports must differ and radio-count must be 1..10")
     if args.storage_phase and not args.allow_config_changes:
         parser.error("--allow-config-changes is required; storage checks modify real NVS settings")
-    if not args.command and not args.storage_phase and not args.radio_peer and not args.allow_mock_changes:
+    if not args.command and not args.storage_phase and not args.radio_peer and not args.ui_check and not args.allow_mock_changes:
         parser.error("--allow-mock-changes is required; this modifies a flashed mock")
     import serial
 
@@ -352,6 +377,8 @@ def main():
         connection.reset_input_buffer()
         if args.command:
             send_command(Device(connection), args.command, command_args, args.allow_mock_changes)
+        elif args.ui_check:
+            exercise_ui(Device(connection))
         elif args.radio_peer:
             peer = serial.Serial(port=None, baudrate=args.baud, timeout=0.2, write_timeout=3)
             peer.dtr = False

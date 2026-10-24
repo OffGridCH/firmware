@@ -33,7 +33,6 @@ private:
 	OledDriver oledDriver_;
 	UiSnapshot snapshot_;
 	LedConfig ledConfig_;
-	UiPage page_ = UiPage::Home;
 	bool ledReady_ = false;
 	bool oledReady_ = false;
 #if OFFGRID_SERIAL_NATIVE_USB

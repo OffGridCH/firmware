@@ -66,17 +66,16 @@ can still be used. Boot emits an error event when loading fails; `sys.status`
 includes `storage.backend`, `config_status`, `writable`, and `last_error`.
 Hello advertises `config_storage: "nvs"` and `config_schema: 1`.
 
-Factory reset still requires `confirm: "ERASE"` followed by a fresh three-second
-PRG hold in the ten-second arm window. It now erases real configuration from
-`og_cfg`, but does not erase other NVS namespaces or the whole partition. On erase
-failure the reset is cancelled and an error event is emitted. If NVS cannot
-initialize at all, operator recovery may be required; the module does not erase
-the partition as an automatic recovery shortcut.
+Factory reset is unavailable on buttonless hardware. `confirm: "ERASE"` returns
+`E_BUSY`, with no erase or arm window; missing confirmation still returns
+`E_CONFIRM_REQUIRED`. Recovery requires an owner-approved maintenance policy.
+The internal `eraseAll()` primitive has no serial command path. If NVS cannot
+initialize, the module never erases the partition as an automatic recovery shortcut.
 
 `sys.reboot` is still simulated, but reloads configuration from actual NVS. A
 physical reset/power cycle also reloads it. Mock provisioning and contacts are
 RAM-only, so physical reset returns the mock to unprovisioned while configuration
-and policy remain saved. No hardware radio/LED/display driver is initialized.
+and policy remain saved. OLED is initialized independently; default RF stays off.
 
 ## One Device Checker
 
@@ -116,15 +115,14 @@ Use the same `--state /path/to/snapshot.json` in every phase if overriding its
 location. The script refuses a different board ID. A fresh write phase starts by
 reloading saved settings, so existing temporary overrides are discarded.
 
-Optional destructive namespace-reset check:
+Optional non-destructive reset-rejection check:
 
 ```sh
 python3 tools/serial-check.py --port /dev/ttyUSB0 --storage-phase reset --allow-config-changes
 ```
 
-When prompted, release PRG and hold it for three seconds within the arm window.
-This clears real configuration, checks default values, and leaves the device
-locked. It keeps any snapshot file for later restoration. Physical power-cut
+This verifies `E_CONFIRM_REQUIRED`/`E_BUSY`, unchanged state/storage status and
+unchanged public configuration. It never erases or alters a snapshot. Physical power-cut
 fault injection, corrupt-record/version recovery and unrelated-namespace
 preservation are manual acceptance checks, not claimed by this script.
 

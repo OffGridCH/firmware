@@ -1,7 +1,7 @@
 # Offgrid Firmware Architecture v1
 
 > **Status:** Draft v1, simplified implementation structure
-> **Hardware:** Heltec WiFi LoRa 32 V3 (ESP32-S3, SX1262, SSD1306), two external NeoPixel strips, PRG button
+> **Hardware:** Heltec WiFi LoRa 32 V3 (ESP32-S3, SX1262, SSD1306), optional external strips with unconfirmed wiring; no application button
 > **Execution:** C++17, one cooperative application loop on Arduino/ESP-IDF
 > **Companion specifications:** [Host interface](offgrid-link.md) and [over-the-air protocol](offgrid-protocol.md)
 
@@ -13,7 +13,7 @@
 ## 1. Design Rules
 
 Use a small number of cohesive modules rather than a class for every helper.
-The previous design had 36 header/source pairs; this design has 15. No host
+The previous design had 36 header/source pairs; this buttonless design has 14. No host
 commands, protocol features, security requirements, or UI features are removed.
 The companion specifications remain the source of truth for wire formats,
 command arguments, defaults, limits, errors, and events.
@@ -43,7 +43,7 @@ only signal work; SPI, I2C, JSON processing, and flash access happen outside ISR
 
 This is the target structure, not a claim that these files already exist.
 Create modules as they become functional; do not add empty scaffolding for all
-15 modules at once. Headers stay next to their implementation in `src/`.
+modules at once. Button support is cancelled. Headers stay next to their implementation in `src/`.
 
 ```text
 firmware/
@@ -61,8 +61,7 @@ firmware/
     |-- drivers/
     |   |-- RadioDriver.h / RadioDriver.cpp
     |   |-- LedDriver.h / LedDriver.cpp
-    |   |-- OledDriver.h / OledDriver.cpp
-    |   `-- Button.h / Button.cpp
+    |   `-- OledDriver.h / OledDriver.cpp
     |-- host/
     |   |-- SerialLink.h / SerialLink.cpp
     |   `-- Commands.h / Commands.cpp
@@ -79,7 +78,7 @@ firmware/
         `-- MeshEngine.h / MeshEngine.cpp
 ```
 
-There are 30 module files plus `main.cpp`, `BoardConfig.h`, and `Types.h`.
+There are 28 module files plus `main.cpp`, `BoardConfig.h`, and `Types.h`.
 The temporary `host/MockDevice.h` adapter is additional development-only code,
 not a new permanent domain module in this target structure.
 No separate `core/`, `ui/`, `radio/`, `handlers/`, or generic `utils/` directory
@@ -97,8 +96,8 @@ uses explicit, versioned encoding rather than raw C++ struct memory.
 
 Owns instances, initializes dependencies, samples uptime once per loop, and drives
 active modules. Lifecycle state lives in `Security`; `App` coordinates effects on
-mesh, radio, and UI. It also maps local button actions to page changes and reset
-confirmation, and routes typed notifications to serial output and UI.
+mesh, radio, and UI, and routes typed notifications to serial output and UI.
+Home is the default page; pairing and error overlays expire automatically.
 
 Use direct calls and a small set of fixed callbacks instead of a generic
 `EventBus`. Callbacks run in the application context and do not perform hidden
@@ -108,8 +107,8 @@ buffers. A small private wrap-safe timing helper replaces `SystemClock`.
 The current minimal App owns the mock backend instead of functional Security or
 MeshEngine modules. It feeds secret-free `UiSnapshot` values, typed events and
 copied LED settings/previews to independently initialized LED/OLED drivers.
-Those drivers are unavailable no-op stubs until their hardware implementations
-land. Driver failure never stops the other modules. UI ticks continue when
+OLED initialization and cooperative rendering are implemented; LED output is
+still a stub. Driver failure never stops the other modules. UI ticks continue when
 native USB is disconnected. `sys.status.result.ui` exposes readiness and page.
 
 ### RadioDriver
@@ -134,8 +133,8 @@ for operation deadlines, timing caveats and two-board device acceptance.
 
 Owns the onboard PWM LED and both external NeoPixel strips. Includes PWM/RMT
 setup, stable transfer buffers, brightness/gamma handling, built-in and custom
-patterns, state animations, event overrides, RF animations, preview, and reset
-hold progress. Applies `enabled`, `quiet`, and brightness to the appropriate
+patterns, state animations, event overrides, RF animations and preview.
+Applies `enabled`, `quiet`, and brightness to the appropriate
 outputs as specified. State and event timing remain separate internally.
 
 Keep PWM, pixel transfer, and animation helpers private. An in-flight RMT buffer
@@ -146,24 +145,20 @@ separate strip-driver or animator files are required for two fixed strips.
 
 Owns SSD1306 power/reset/init, framebuffer, dirty-region transfers, text/icons,
 and page rendering. Includes home/security status, RF telemetry, pairing expiry
-and fingerprint overlay, factory-reset prompt/progress, and the page selected by
-App on a short press. Receives a display snapshot and UI notifications, never
+and a timed fingerprint overlay. Receives a display snapshot and UI notifications, never
 private keys.
 
 Refresh presentation only when needed; send bounded chunks independently of the
 render rate. Measure actual I2C transfer time before choosing the chunk size.
 There is no separate renderer class.
 
-### Button
+### Buttonless hardware
 
-Owns PRG sampling, debounce, press duration, short-press detection, and hold
-progress. Reports actions to `App`; it cannot erase flash itself. A reset hold is
-accepted only under the agreed armed-window rules and must not be satisfied by
-a hold that predates arming. Page cycling and reset confirmation stay distinct.
-
-For now Button is a placeholder: the existing mock backend samples/debounces
-GPIO0 and confirms resets, and App consumes short-press page advances. Neither
-UI driver should add another button sampler or erase configuration.
+Never configure or poll GPIO0 for application input. No page cycling or physical
+reset confirmation exists. `sys.factory_reset` validates `confirm: "ERASE"` but
+returns `E_BUSY` without arming or erasing. Lost-phone/corrupt-vault recovery is
+blocked pending an owner-approved maintenance policy; serial is not an
+unauthenticated wipe mechanism.
 
 ### SerialLink
 
@@ -220,7 +215,7 @@ radio scheduling.
 
 Owns unprovisioned/locked/unlocked state, decrypted identity, display name and
 NodeID, ephemeral unlock sessions, token unwrapping, authentication backoff,
-security policy, host-activity timeout, and factory-reset arming. Coordinates
+security policy and host-activity timeout. Coordinates
 provisioning/unlock and token rotation with `VaultStore` and `ConfigStore`.
 
 Consumes handshake sessions according to the host specification and zeroizes
@@ -228,7 +223,8 @@ ephemeral secrets on every completion/failure path. Emits lifecycle requests or
 notifications to `App` so lock also cancels pairing, wipes contact RAM and queued
 plaintext, clears vault-key RAM, and changes radio mode. State becomes unlocked
 only after the complete required vault load succeeds; failed loads wipe partial
-results. Reset requires physical confirmation and erases both storage areas.
+results. Reset/recovery remains unavailable until an owner-approved buttonless
+maintenance policy is implemented; neither storage area is erased by serial.
 
 ### Contacts
 
@@ -261,7 +257,7 @@ remain private; a separate `NvsPartition` class is unnecessary.
 The current implementation persists radio/mesh/LED settings and timeout policy
 in one schema-1 `og_cfg/settings` blob. Vault salt/generation metadata remain
 future work. See the [storage module README](../src/storage/README.md) for current
-interfaces, corruption handling, and the physical-reset device check.
+interfaces, corruption handling, and the reset-rejection device check.
 
 ### VaultStore
 
@@ -317,7 +313,7 @@ flowchart TD
     App --> Security
     App --> Pairing
     App --> MeshEngine
-    App --> UI[LedDriver / OledDriver / Button]
+    App --> UI[LedDriver / OledDriver]
     SerialLink -->|parsed request| Commands
     Commands -->|validated operations| Domains[Security / Pairing / Contacts / MeshEngine / Drivers]
     Security --> VaultStore
@@ -342,8 +338,8 @@ Keep configuration persistence explicit at command/lifecycle boundaries.
 
 ## 5. Loop, Timing, and Failure Rules
 
-`App::tick()` samples uptime and services button input, serial RX/command work,
-security timeout/reset state, pairing expiry, radio completions, mesh scheduling,
+`App::tick()` samples uptime and services serial RX/command work,
+security timeout state, pairing expiry, radio completions, mesh scheduling,
 LED output, OLED chunks, and serial TX in a documented order. Recheck lifecycle
 state before scheduling own RF traffic. Configuration or vault jobs advance in
 bounded steps where supported; measure unavoidable library/flash stalls.
@@ -367,7 +363,7 @@ bounded steps where supported; measure unavoidable library/flash stalls.
 | Integration/host | `App`, `SerialLink`, `Commands`, shared headers | Upload, boot event, status/ping, strict framing, responsive loop |
 | Security/storage | `CryptoEngine`, `Security`, `Contacts`, `Pairing`, stores | On-device crypto vectors, persistent config, real provisioning/unlock/pairing |
 | Radio/mesh | `RadioDriver`, `PacketCodec`, `MeshEngine` | Two-board radio exchange, then encrypted direct messages, ACK/retry, mesh |
-| UI/hardware | `LedDriver`, `OledDriver`, `Button` | Display/status, all LED outputs, debounced input and reset progress |
+| UI/hardware | `LedDriver`, `OledDriver` | Display/status, confirmed LED outputs and automatic overlays |
 
 Freeze shared types, callback signatures, buffer lifetimes, and operation results
 before parallel implementation. Each contributor maintains private helpers in
@@ -407,7 +403,7 @@ and regulatory airtime controls remain a separate release-hardening gate.
 | `CommandDispatcher`, all six command handlers | `Commands` |
 | `StatusLedDriver`, `NeoPixelStripDriver`, `NeoPixelAnimator` | `LedDriver` |
 | `OledDriver`, `OledUiRenderer` | `OledDriver` |
-| `ButtonInput` | `Button` |
+| `ButtonInput` | Cancelled: no usable application button |
 
 Split a module later only when it has a genuinely independent responsibility,
 hardware variant, reusable component, or demonstrated maintenance problem. Fewer

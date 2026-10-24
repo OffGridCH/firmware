@@ -320,24 +320,10 @@ static void renderPairing(U8G2 &d, const UiSnapshot &s) {
         d.setFont(u8g2_font_profont12_tr);
         d.drawStr((128 - d.getStrWidth(s.fingerprint)) / 2, 42, s.fingerprint);
         d.setFont(u8g2_font_haxrcorp4089_tr);
-        d.drawStr(0, 60, "PRG: close");
+        d.drawStr(0, 60, "Returns home automatically");
     } else {
         d.drawStr(0, 30, s.state == DeviceState::Unlocked ? "Start pairing in the app" : "Unlock to pair");
     }
-}
-
-static void renderReset(U8G2 &d, const UiSnapshot &s) {
-    char buf[32];
-    d.setFont(u8g2_font_helvB08_tf);
-    d.drawStr(0, 8, "Factory reset");
-    snprintf(buf, sizeof buf, "%us", s.resetRemainingS);
-    d.drawStr(128 - d.getStrWidth(buf), 8, buf);
-    d.drawHLine(0, 11, 128);
-    d.setFont(u8g2_font_haxrcorp4089_tr);
-    d.drawStr(0, 26, "Hold PRG for 3 s to erase");
-    d.drawStr(0, 36, "all settings and contacts.");
-    d.drawFrame(0, 46, 128, 10);
-    d.drawBox(2, 48, 124 * s.resetHoldPermille / 1000, 6);
 }
 
 bool OledDriver::init() {
@@ -356,9 +342,12 @@ bool OledDriver::init() {
 
 void OledDriver::show(const UiSnapshot& snapshot) {
     if (snapshot.fingerprint[0] && strcmp(snapshot.fingerprint, snapshot_.fingerprint) != 0) {
-        fingerprintOverlay_ = true;
+        fingerprintUntil_ = snapshot.uptimeMs + 15000;
     }
-    if (snapshot.state != DeviceState::Unlocked) activity_ = UiEvent::Boot;
+    if (snapshot.state != DeviceState::Unlocked) {
+        activity_ = UiEvent::Boot;
+        fingerprintUntil_ = 0;
+    }
     snapshot_ = snapshot;
 }
 
@@ -368,15 +357,17 @@ void OledDriver::onEvent(UiEvent event, uint64_t nowMs) {
             bootAt_ = nowMs;
             booting_ = true;
             break;
-        case UiEvent::PageChanged:
+        case UiEvent::Pairing:
             booting_ = false;
-            fingerprintOverlay_ = false;
+            fingerprintUntil_ = 0;
             break;
         case UiEvent::Error:
-        case UiEvent::Pairing:
+            booting_ = false;
+            errorUntil_ = nowMs + 3000;
             break;
         default:
             activity_ = event;
+            activityUntil_ = nowMs + 5000;
     }
 }
 
@@ -405,17 +396,20 @@ void OledDriver::tick(uint64_t nowMs) {
 
 void OledDriver::render(uint64_t nowMs) {
     display_.clearBuffer();
-    if (snapshot_.resetArmed) {
-        renderReset(display_, snapshot_);
+    if (nowMs < errorUntil_) {
+        display_.setFont(u8g2_font_helvB08_tf);
+        display_.drawStr(0, 20, "Operation failed");
+        display_.setFont(u8g2_font_haxrcorp4089_tr);
+        display_.drawStr(0, 38, "See app for details");
     } else if (booting_) {
         booting_ = boot::drawFrame(display_, nowMs - bootAt_,
             static_cast<uint32_t>(snapshot_.frequencyMhz * 1000 + 0.5f));
-    } else if (snapshot_.pairingActive || (fingerprintOverlay_ && snapshot_.fingerprint[0]) ||
+    } else if (snapshot_.pairingActive || (nowMs < fingerprintUntil_ && snapshot_.fingerprint[0]) ||
                snapshot_.page == UiPage::Pairing) {
         renderPairing(display_, snapshot_);
     } else if (snapshot_.page == UiPage::Radio) {
         renderRadio(display_, snapshot_);
     } else {
-        renderHome(display_, snapshot_, activity_);
+        renderHome(display_, snapshot_, nowMs < activityUntil_ ? activity_ : UiEvent::Boot);
     }
 }

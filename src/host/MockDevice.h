@@ -79,15 +79,6 @@ public:
         if (snapshot.pairingActive) {
             snapshot.pairingRemainingS = (300000 - pairingElapsed + 999) / 1000;
         }
-        const uint64_t resetElapsed = nowMs - resetArmedAt_;
-        snapshot.resetArmed = resetArmed_ && resetElapsed < 10000;
-        if (snapshot.resetArmed) {
-            snapshot.resetRemainingS = (10000 - resetElapsed + 999) / 1000;
-            if (stableButton_ && holdAt_ != 0) {
-                const uint64_t held = nowMs - holdAt_;
-                snapshot.resetHoldPermille = held >= 3000 ? 1000 : held / 3;
-            }
-        }
         return snapshot;
     }
 
@@ -116,20 +107,11 @@ public:
         return true;
     }
 
-    bool takePageAdvance() {
-        const bool pending = pageAdvance_;
-        pageAdvance_ = false;
-        return pending;
-    }
-
     void init() {
         resetConfig();
     #if OFFGRID_RADIO_DIAGNOSTICS
         radioDriver.init(radioConfig(config_["radio"].as<JsonObjectConst>()));
     #endif
-    pinMode(0, INPUT_PULLUP);
-    rawButton_ = digitalRead(0) == LOW;
-    stableButton_ = rawButton_;
     makePublicKey(publicKey_);
     uint8_t digest[32];
     mbedtls_sha256_ret(publicKey_, sizeof(publicKey_), digest, 0);
@@ -174,56 +156,6 @@ public:
             pairing_ = false;
             mbedtls_platform_zeroize(pairingSalt_, sizeof(pairingSalt_));
         }
-        const bool pressed = digitalRead(0) == LOW;
-        if (pressed != rawButton_) {
-            rawButton_ = pressed;
-            buttonChangedAt_ = nowMs;
-        }
-        if (rawButton_ != stableButton_ && nowMs - buttonChangedAt_ >= 30) {
-            stableButton_ = rawButton_;
-            if (stableButton_) {
-                buttonPressedAt_ = nowMs;
-                resetPress_ = resetArmed_;
-            }
-            if (stableButton_ && resetArmed_ && resetSawRelease_) holdAt_ = nowMs;
-            if (!stableButton_) {
-                if (buttonPressedAt_ != 0 && nowMs - buttonPressedAt_ < 1000 &&
-                    !resetPress_ && !resetArmed_) pageAdvance_ = true;
-                buttonPressedAt_ = 0;
-                resetSawRelease_ = true;
-                holdAt_ = 0;
-            }
-        }
-        if (resetArmed_ && nowMs - resetArmedAt_ >= 10000) resetArmed_ = false;
-        if (resetArmed_ && stableButton_ && holdAt_ != 0 && nowMs - holdAt_ >= 3000) {
-            resetArmed_ = false;
-            holdAt_ = 0;
-            if (!configStore_.eraseAll()) {
-                storageNotice_ = "configuration erase failed; factory reset cancelled";
-            } else {
-            provisioned_ = false;
-            unlocked_ = false;
-            session_ = false;
-            configStore_.copyTo(config_, lockTimeoutS_);
-            ledConfigDirty_ = true;
-            ledPreviewPending_ = false;
-            lastFingerprint_[0] = '\0';
-            syncMesh();
-#if OFFGRID_RADIO_DIAGNOSTICS
-            radioDriver.standby();
-            radioDriver.init(radioConfig(config_["radio"].as<JsonObjectConst>()));
-#endif
-            for (Contact& contact : contacts_) contact = Contact{};
-            for (Message& message : messages_) message = Message{};
-            incomingPending_ = false;
-            contactEvent_ = -1;
-            tracePending_ = false;
-            traceEnabled_ = false;
-            snprintf(name_, sizeof(name_), "Offgrid-%s", nodeId_);
-            stateReason_ = "factory_reset";
-            rebootPending_ = true;
-            }
-        }
         if (unlocked_ && lockTimeoutS_ != 0 && nowMs - lastActivity_ >= lockTimeoutS_ * 1000ULL) {
             unlocked_ = false;
             stateReason_ = "heartbeat_timeout";
@@ -261,7 +193,6 @@ public:
         if (rebootPending_ && stateReason_ == nullptr && serialLink.availableTxSlots() > 0) {
             unlocked_ = false;
             session_ = false;
-            resetArmed_ = false;
             resetReason_ = "software";
             resetConfig();
 #if OFFGRID_RADIO_DIAGNOSTICS
@@ -297,9 +228,6 @@ private:
     bool ledPreviewPending_ = false;
     LedPattern ledPreview_;
     char lastFingerprint_[15] = {};
-    bool pageAdvance_ = false;
-    bool resetPress_ = false;
-    uint64_t buttonPressedAt_ = 0;
 
     void notifyUi(UiEvent event, uint64_t nowMs) {
         if (uiHandler_ != nullptr) uiHandler_(uiContext_, event, nowMs);
@@ -1682,13 +1610,8 @@ private:
                 Commands::fail(response, "E_CONFIRM_REQUIRED", "confirm must be ERASE", "confirm");
                 return;
             }
-            resetArmed_ = true;
-            resetArmedAt_ = nowMs;
-            resetSawRelease_ = !rawButton_ && !stableButton_;
-            holdAt_ = 0;
-            result["armed"] = true;
-            result["expires_s"] = 10;
-            result["action"] = "hold PRG button for 3 s";
+            Commands::fail(response, "E_BUSY",
+                "factory reset unavailable on buttonless hardware; approved maintenance recovery required");
         } else if (strcmp(command, "sys.set_log_level") == 0) {
             if (!Commands::stringArg(args, response, "level", 1, 5)) return;
             const char* level = args["level"];
@@ -1811,13 +1734,6 @@ private:
     uint64_t lastActivity_ = 0;
     const char* stateReason_ = nullptr;
     bool rebootPending_ = false;
-    bool resetArmed_ = false;
-    bool resetSawRelease_ = false;
-    bool rawButton_ = false;
-    bool stableButton_ = false;
-    uint64_t buttonChangedAt_ = 0;
-    uint64_t resetArmedAt_ = 0;
-    uint64_t holdAt_ = 0;
     const char* resetReason_ = "other";
 #if OFFGRID_RADIO_DIAGNOSTICS
     RadioDriver::Event radioEvent_;

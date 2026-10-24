@@ -10,7 +10,7 @@ boundary. The simulated device backend lives in `MockDevice.h`, owned by `App`, 
 |---|---|
 | `SerialLink` | LF/CRLF framing, 2048-byte wire limit, bounded RX/TX work, complete output lines, queued JSON serialization |
 | `Commands` | JSON envelope validation, exact integer IDs, argument-validation helpers, dispatch, response/error formatting |
-| `MockDevice` | Command-specific behavior, public identity, mock lifecycle, deferred events, physical reset confirmation and typed UI adapters |
+| `MockDevice` | Command-specific behavior, public identity, mock lifecycle, deferred events, buttonless reset rejection and typed UI adapters |
 | `App` | Instance ownership, initialization, cooperative loop and LED/OLED snapshot/event routing |
 
 Request views are valid only during dispatch. Copy any data retained for later
@@ -19,9 +19,9 @@ callback without changing the transport. `ConfigStore` now provides real NVS
 persistence; security and mesh remain mocked. The separate radio_diag profiles
 connect real RadioDriver hardware without changing the default Android mock.
 
-LED/OLED have wired interfaces but unavailable no-op hardware implementations.
+OLED has cooperative startup and rendering; LED is still an unavailable stub.
 `sys.status.result.ui` adds `led_ready`, `oled_ready` and numeric `page` (Home=0,
-Radio=1, Pairing=2). A short PRG press cycles pages without changing reset rules.
+Radio=1, Pairing=2). Home is the default, with automatic timed overlays.
 See the [App/UI handoff](../../docs/app-core-handoff.md) for driver integration.
 
 ## Radio Diagnostic Images
@@ -94,7 +94,7 @@ raw prints or retain borrowed JSON views between ticks.
 | `sys.status`, `sys.ping` | Public runtime snapshot and heartbeat; private counts appear only while unlocked |
 | `sys.set_log_level` | Validates/stores off/error/warn/info/debug; non-off selection emits a synthetic log event after the response |
 | `sys.reboot` | Response first, then simulated boot in locked state if provisioned |
-| `sys.factory_reset` | Requires `confirm: "ERASE"`; fresh PRG hold erases real og_cfg settings and clears mock state; unrelated namespaces are untouched |
+| `sys.factory_reset` | Missing confirmation returns E_CONFIRM_REQUIRED; ERASE returns E_BUSY on buttonless hardware; no state/storage changes |
 | `sec.provision`, `sec.unlock` | State/session checks, canonical Base64 of 32-byte public key and 60-byte wrapper; accepts the structurally valid envelope without authentication |
 | `sec.lock` | Locks and emits `sec.state` after the response |
 | `sec.rotate_token` | Requires unlocked state and fresh session; validates the envelope and returns simulated success |
@@ -126,7 +126,7 @@ pending pairing; errors leave it available until expiry/cancel/lock.
 List pages can contain fewer than `limit` contacts to fit 2048 bytes. Advance
 `offset` by the returned array length, not the requested limit. Contacts remain
 public mock data in RAM across simulated reboot/lock, but are inaccessible while
-locked and disappear on physical reset or confirmed factory reset. Replacing a
+locked and disappear on physical reset. Replacing a
 contact resets its mock counters and pending/active state.
 
 Check self-pair, duplicate/replace, invalid QR, expiry, empty/full slots, pagination,
@@ -186,9 +186,9 @@ Mock control commands are not part of the production host specification.
   Identity, tokens, contacts and messages are never stored by ConfigStore.
 - Heartbeat timeout locks without a response and emits `sec.state`. Poll/ping
   at least every five seconds. Timeout zero disables auto-lock in this mock.
-- Factory reset requires a new press after arming; holding PRG before arming is
-  insufficient. It clears real `og_cfg` configuration plus mock RAM state, not
-  the entire NVS partition. Failed erasure cancels the reset and emits an error.
+- Factory reset is unavailable on buttonless boards. A confirmed request returns
+  `E_BUSY`, without arming, erasing NVS or changing mock state. Recovery requires
+  an owner-approved maintenance policy.
 
 Hello reports `config_storage: "nvs"` and `config_schema: 1`; status adds
 `storage: {backend, config_status, writable, last_error}`. Invalid/unknown-version
@@ -229,7 +229,7 @@ events, validates atomic configuration, checks persistence across simulated
 reboot, then deletes its fixture contact and leaves the device locked. Existing
 mock Bob contacts/settings may change. It prints request/response transcripts.
 
-The script does not automate physical PRG holds, Android USB permissions, all
+The script does not automate Android USB permissions, all
 framing/overflow cases, queue exhaustion, reconnects, or long soak tests.
 The same script's `--storage-phase` modes provide a separate focused persistence
 check across physical reset, with a snapshot and restore phase. Use the
@@ -241,7 +241,8 @@ Physical reset clears mock provisioning, but no longer clears saved settings.
 The UART configuration image compiles. Physical NVS/Android checks still require
 the flashed board. Check hello keys/nonce lengths, version rejection, consumed
 sessions, wrong-state errors, response-before-state-event ordering, heartbeat,
-reboot, and reset expiry/hold on-device.
+reboot, and reset rejection on-device. `--ui-check` measures ping responsiveness
+during OLED startup and Home rendering; it is not visual-display validation.
 
 Parser nesting/capacity, full UTF-8 validation,
 and strict RFC 8259 compliance still need verification. Mock incoming counters

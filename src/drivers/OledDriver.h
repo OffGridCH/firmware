@@ -26,6 +26,8 @@ private:
     uint64_t renderedAt_ = 0;
     uint64_t bootAt_ = 0;
     bool booting_ = true;
-    bool fingerprintOverlay_ = false;
+    uint64_t fingerprintUntil_ = 0;
+    uint64_t errorUntil_ = 0;
+    uint64_t activityUntil_ = 0;
     UiEvent activity_ = UiEvent::Boot;  // Boot = no activity line
 };

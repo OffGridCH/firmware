@@ -47,7 +47,7 @@ specification conflict explicitly; do not silently weaken a security requirement
 | `MeshEngine` | Placeholder; delivery/retry/relay events are simulated | Real outbound queue, direct receive/delivery, ACKs, retries, replay decisions, relaying and congestion controls |
 | `OledDriver` | U8g2 startup animation and home renderer using `HomeView`, `begin`, `drawHome` | Adapt to App's `init/show/onEvent/tick`; bounded animation/transfers; state-driven overlays; independent failure handling |
 | `LedDriver` | App-compatible no-op interface, config/preview wiring | Implement actual confirmed outputs, animations, quiet/enabled/brightness behavior and nonblocking transfers |
-| `Button` | Empty module, but mock still samples GPIO0 and App consumes page advances | Cancel: remove runtime sampling, debounce/hold/reset logic and button-only UI behavior; do not implement the placeholder |
+| Buttonless core | GPIO0 sampling, page advance, hold/reset paths and placeholder removed | Reset stays unavailable pending approved maintenance policy |
 | Existing device exerciser | Serial API checks, settings persistence phases, raw two-board checks, crypto diagnostic command | Extend the existing tool incrementally for real unlock, pairing, encrypted delivery and relay acceptance; remove button-required reset expectations |
 
 Important distinctions: ConfigStore is not the vault. CryptoEngine is not a
@@ -393,6 +393,18 @@ host responsiveness, recovery, and the release gates separately with evidence.
   The checker responds during startup. Its repeated newline/probe race was
   reproduced on hardware and corrected. Physical visual inspection, measured
   transfer latency and native-USB hardware acceptance remain pending.
+- Stage 1: removed application button sampling and reset/page state. Confirmed
+  factory-reset requests now return `E_BUSY` without state/storage changes;
+  missing confirmation remains `E_CONFIRM_REQUIRED`. Home and automatic pairing,
+  fingerprint/error overlays replace button navigation. Updated affected specs.
+- UART, native-USB and radio-diagnostic builds pass. Connected-board checks pass:
+  135 pings across startup/Home (maximum RTT 15.0 ms, threshold 250 ms), reset
+  rejection in unprovisioned/unlocked/locked states, mock API flow, NVS
+  write/hardware-reset/verify and restoration of original saved settings.
+  Port opening resets this CP2102 board; this is hardware-reset evidence, not a
+  power-removal or power-cut-fault test. No RF transmission or erase was performed.
+- Branches are stacked from the merged main tip: `feature/oled-core-integration`,
+  then `feature/buttonless-core`; neither was merged into main by the agent.
 
-Next: remove all runtime button assumptions. Vault/security and packet-codec work
-can follow the dependencies above; neither vault nor meshing is implemented yet.
+Next: confirmed onboard LED output, vault/security and packet codec. External
+strip wiring/counts are unknown; neither vault nor meshing is implemented yet.

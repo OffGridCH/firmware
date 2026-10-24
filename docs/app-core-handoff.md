@@ -14,8 +14,8 @@ when enabled. Keep direct calls/typed callbacks, with no new tasks or event bus.
 
 | Owner | Primary files | Deliverable |
 |---|---|---|
-| LED agent | `src/drivers/LedDriver.h`, `src/drivers/LedDriver.cpp` | Onboard PWM LED, two strips, patterns, preview and reset progress |
-| OLED agent | `src/drivers/OledDriver.h`, `src/drivers/OledDriver.cpp` | SSD1306 initialization, pages, pairing and reset overlays |
+| LED agent | `src/drivers/LedDriver.h`, `src/drivers/LedDriver.cpp` | Onboard PWM LED, confirmed strips, patterns and preview |
+| OLED agent | `src/drivers/OledDriver.h`, `src/drivers/OledDriver.cpp` | SSD1306 initialization, Home, timed pairing and error overlays |
 
 Keep the public interfaces intact. Coordinate changes to `Types.h`, App,
 `BoardConfig.h` and `platformio.ini` rather than editing these independently.
@@ -54,21 +54,21 @@ synthetic mock counters/signal values. Battery telemetry is not available yet.
 
 State pattern indexes match `DeviceState`: unprovisioned, locked, unlocked.
 Event pattern indexes match the first seven `UiEvent` values: tx, rx,
-msg_received, delivered, failed, error, pairing. Boot and PageChanged have no
+msg_received, delivered, failed, error, pairing. Boot has no
 configured LED slot; never index `eventPatterns` with them. State patterns loop;
 event patterns honor repeat. Custom steps alternate on/off beginning with on.
 Enforce enabled/quiet/brightness according to the host specification.
 
-## Button and Events
+## Buttonless UI and Events
 
-Do not sample GPIO0 in either UI driver. The existing backend owns debounce and
-reset confirmation for now; `Button` remains a placeholder. A debounced release
-after a press shorter than one second advances Home -> Radio -> Pairing -> Home
-in App. Reset gestures cannot also change pages. Reset still requires a fresh
-three-second hold inside the ten-second armed window. Render snapshot countdown
-and `resetHoldPermille` (0..1000); drivers must never erase settings themselves.
+Do not configure or sample GPIO0 anywhere in application code. Button support
+and its placeholder are removed. Home stays the default page. Active pairing
+automatically overlays it; completed fingerprints remain for 15 seconds, errors
+for 3 seconds and RF/message activity for 5 seconds. No host paging command is
+introduced. `sys.factory_reset` returns `E_BUSY` with no arm window or erasure,
+pending an owner-approved maintenance/recovery policy.
 
-App fans out Boot, PageChanged, accepted pairing start and dispatched command
+App fans out Boot, accepted pairing start and dispatched command
 errors. The backend reports mock message TX/RX/delivery/failure and drained real
 radio TX/RX/error events. Mock message progress still follows serial backpressure;
 diagnostic serial backpressure can also delay draining later radio events.
@@ -87,11 +87,11 @@ python3 tools/serial-check.py --port /dev/ttyUSB0 --command led.test --args '{"p
 ```
 
 `sys.status.result.ui` reports led_ready, oled_ready and numeric page (0..2).
-Both readiness flags are false until hardware drivers are implemented. Check page
-cycling, idle updates with the host disconnected, and independent driver failure
-on hardware. Use synthetic pairing data; factory reset erases real configuration.
+OLED readiness is true on the connected board; LED remains a stub. Check timed
+overlays, idle updates with the host disconnected and independent driver failure
+on hardware. Use synthetic pairing data; factory reset must not erase configuration.
 Commit each driver in small buildable stages. No new test suite is needed.
 
 Core verification: diagnostic UART/mock native-USB builds passed. On-device status
 confirmed loaded NVS, radio standby and unavailable UI stubs, without RF TX.
-Physical rendering/button acceptance remains for the UI branches.
+Physical visual rendering acceptance remains pending; no button acceptance applies.

@@ -6,7 +6,7 @@
 enum class DeviceState : uint8_t { Unprovisioned, Locked, Unlocked };
 enum class UiPage : uint8_t { Home, Radio, Pairing, Count };
 enum class UiEvent : uint8_t {
-	Tx, Rx, MessageReceived, Delivered, Failed, Error, Pairing, Boot, PageChanged
+	Tx, Rx, MessageReceived, Delivered, Failed, Error, Pairing, Boot
 };
 
 struct UiSnapshot {
@@ -34,9 +34,6 @@ struct UiSnapshot {
 	bool pairingActive = false;
 	uint16_t pairingRemainingS = 0;
 	char fingerprint[15] = {};
-	bool resetArmed = false;
-	uint8_t resetRemainingS = 0;
-	uint16_t resetHoldPermille = 0;
 };
 
 enum class LedPatternKind : uint8_t {

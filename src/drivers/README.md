@@ -100,7 +100,7 @@ counts include PHY header errors. dbg.rf_trace optionally adds raw rf.rx/rf.tx
 aliases with action diagnostic. Those low-priority aliases can drop under serial
 load; the dedicated diagnostic event is retained and retried by the adapter.
 
-Mock lock/heartbeat timeout stops RF. Simulated reboot and confirmed reset
+Mock lock/heartbeat timeout stops RF. Simulated reboot
 reload settings and return to standby. Diagnostics can explicitly restart RF in
 any mock state; this is not a secure locked-relay implementation.
 

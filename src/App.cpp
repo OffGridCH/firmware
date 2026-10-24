@@ -84,7 +84,7 @@ void App::handleCommand(void* context, const char* command,
 		JsonObject ui = response["result"].createNestedObject("ui");
 		ui["led_ready"] = app.ledReady_;
 		ui["oled_ready"] = app.oledReady_;
-		ui["page"] = static_cast<uint8_t>(app.page_);
+		ui["page"] = static_cast<uint8_t>(UiPage::Home);
 	}
 }
 
@@ -95,13 +95,7 @@ void App::onUiEvent(void* context, UiEvent event, uint64_t nowMs) {
 }
 
 void App::updateUi(uint64_t nowMs) {
-	if (device_.takePageAdvance()) {
-		page_ = static_cast<UiPage>((static_cast<uint8_t>(page_) + 1) %
-			static_cast<uint8_t>(UiPage::Count));
-		onUiEvent(this, UiEvent::PageChanged, nowMs);
-	}
 	snapshot_ = device_.uiSnapshot(nowMs);
-	snapshot_.page = page_;
 	if (device_.takeLedConfig(ledConfig_) && ledReady_) ledDriver_.configure(ledConfig_);
 	LedPattern preview;
 	if (device_.takeLedPreview(preview) && ledReady_) ledDriver_.preview(preview, nowMs);

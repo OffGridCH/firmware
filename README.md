@@ -7,14 +7,14 @@ Firmware for the Heltec WiFi LoRa 32 V3. This branch currently builds a
 
 Serial mock Stage 5 implements bounded JSON Lines communication, system commands,
 hello/session envelopes, mock provisioning/unlock/lock, heartbeat, policy, simulated
-reboot, and physically confirmed mock reset. Status and boot events include
+reboot, and fail-closed reset rejection on buttonless hardware. Status and boot events include
 `mock: true` and `mock_stage: 5`. Firmware version is `0.1.0-config-store.1`.
 
 The mock validates wrapper shapes but **bypasses authentication**. Public identity,
 QR pairing, 32-slot contact CRUD, typed messages, pending/cancel, and simulated
 incoming/delivery/failure events are implemented. Radio/mesh/LED configuration,
 synthetic statistics/logs/traces, and real NVS configuration persistence are available.
-Default mock builds do not initialize radio, LEDs, strips, or OLED. Only configuration and timeout
+Default mock builds initialize OLED but not radio, LEDs or strips. Only configuration and timeout
 policy are stored in flash; identity, tokens, contacts and messages remain mocks.
 See the [host README](src/host/README.md) for API behavior and the
 [storage README](src/storage/README.md) for the record format and device checker.
@@ -35,7 +35,9 @@ OLED uses the merged U8g2 renderer with cooperative startup and dirty-row
 transfers; LED output remains a no-op stub. Readiness is reported through
 `sys.status.result.ui`. A failed peripheral never blocks the other modules.
 See the short [LED/OLED handoff](docs/app-core-handoff.md) for independent work
-boundaries, driver contracts, button ownership and device checks.
+boundaries, driver contracts, automatic overlays and device checks. GPIO0 is not
+an application input. Factory reset is unavailable (`E_BUSY`) until the owner
+approves a replacement maintenance/recovery policy.
 
 ## Radio Bring-Up
 
@@ -69,8 +71,9 @@ python3 tools/serial-check.py --port /dev/ttyUSB0 --storage-phase restore --allo
 ```
 
 Requires `pyserial`. Keep the generated snapshot until restore succeeds.
-The optional `--storage-phase reset` checks physically confirmed configuration
-erasure; see the storage README before running it.
+The optional `--storage-phase reset` checks reset rejection and unchanged
+configuration; it performs no erase. `--ui-check` measures serial responsiveness
+across startup and Home rendering without changing settings.
 
 ## Build and Upload
 
