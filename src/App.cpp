@@ -3,10 +3,7 @@
 #include <Arduino.h>
 #include <esp_timer.h>
 #include <string.h>
-
-#if !defined(OFFGRID_MOCK_DEVICE)
-#error "Select an explicit mock or secure firmware profile."
-#endif
+#include "security/CryptoEngine.h"
 
 namespace {
 #if OFFGRID_SERIAL_NATIVE_USB
@@ -16,18 +13,11 @@ auto& hostPort = Serial0;
 #endif
 }
 
-App::App() : serialLink_(hostPort),
-#if OFFGRID_MOCK_DEVICE
-#if OFFGRID_RADIO_DIAGNOSTICS
-	device_(serialLink_, radioDriver_),
-#else
-	device_(serialLink_),
-#endif
-#endif
-	commands_(serialLink_, handleCommand, this) {
+App::App() : serialLink_(hostPort), commands_(serialLink_, handleCommand, this) {
 }
 
 void App::init() {
+	CryptoEngine::init();
 #if !OFFGRID_SERIAL_NATIVE_USB
 	hostPort.setRxBufferSize(4096);
 	hostPort.setTxBufferSize(4096);
@@ -35,10 +25,6 @@ void App::init() {
 	hostPort.begin(BoardConfig::SerialBaud);
 	serialLink_.init();
 	commands_.init();
-#if OFFGRID_MOCK_DEVICE
-	device_.setUiHandler(onUiEvent, this);
-	device_.init();
-#else
 	configStore_.load();
 	bool resetPending = false;
 	const int32_t resetError = ConfigStore::resetPending(resetPending);
@@ -62,26 +48,18 @@ void App::init() {
 		serialLink_.sendError("E_RADIO", "locked relay receive failed", 0);
 	if (!configStore_.writable() || security_.error() == Security::Error::Storage)
 		serialLink_.sendError("E_INTERNAL", "storage unavailable; secure operations may be blocked", 0);
-#endif
 	ledReady_ = ledDriver_.init();
 	oledReady_ = oledDriver_.init();
 	const uint64_t nowMs = static_cast<uint64_t>(esp_timer_get_time()) / 1000;
 	updateUi(nowMs);
 	onUiEvent(this, UiEvent::Boot, nowMs);
 #if !OFFGRID_SERIAL_NATIVE_USB
-#if OFFGRID_MOCK_DEVICE
-	device_.emitBoot(nowMs);
-#else
 	commands_.emitSecureBoot(security_, nowMs);
-#endif
 #endif
 }
 
 void App::tick() {
 	const uint64_t nowMs = static_cast<uint64_t>(esp_timer_get_time()) / 1000;
-#if OFFGRID_MOCK_DEVICE
-	device_.tick(nowMs);
-#else
 	security_.tick(nowMs);
 	pairing_.tick(nowMs);
 	mesh_.tick(nowMs);
@@ -97,6 +75,7 @@ void App::tick() {
 			mesh_.receive(event.bytes, event.length, event.rssi, event.snr, nowMs);
 		} else if (event.type == RadioDriver::EventType::Transmitted)
 			mesh_.transmissionComplete(true, event.airtimeMs, nowMs);
+		commands_.traceRadio(event, security_.state() == DeviceState::Unlocked, mesh_.receiveAction());
 	}
 	if (mesh_.takeStorageFailure()) {
 		security_.lock("error", nowMs);
@@ -119,25 +98,22 @@ void App::tick() {
 	if (!security_.eventReason() && serialLink_.availableTxSlots() > 0) {
 		const MeshEngine::Event* event = mesh_.event();
 		if (event && commands_.emitMeshEvent(*event)) mesh_.consumeEvent();
-		const uint32_t drops = mesh_.stats().droppedEvents + mesh_.stats().droppedAcks + radioDriver_.stats().droppedEvents;
+		const uint32_t drops = mesh_.stats().droppedEvents + mesh_.stats().droppedAcks +
+			radioDriver_.stats().droppedEvents + commands_.traceDrops();
 		if (drops > reportedDrops_ &&
 			serialLink_.sendError("E_INTERNAL", "radio/mesh event or ACK loss; inspect radio.stats", nowMs))
 			reportedDrops_ = drops;
 		else if (drops < reportedDrops_) reportedDrops_ = drops;
+		commands_.emitNotices(nowMs);
 	}
 	serialLink_.setReceiveEnabled(security_.eventReason() == nullptr && action_ == Commands::Action::None);
-#endif
 #if OFFGRID_SERIAL_NATIVE_USB
 	if (!hostPort) {
 		wasConnected_ = false;
 	} else {
 		if (!wasConnected_) {
 			serialLink_.init();
-#if OFFGRID_MOCK_DEVICE
-			device_.emitBoot(nowMs);
-#else
 			commands_.emitSecureBoot(security_, nowMs);
-#endif
 			wasConnected_ = true;
 		}
 		serialLink_.tick(nowMs);
@@ -148,7 +124,6 @@ void App::tick() {
 	updateUi(nowMs);
 	if (ledReady_) ledDriver_.tick(nowMs);
 	if (oledReady_) oledDriver_.tick(nowMs);
-#if !OFFGRID_MOCK_DEVICE
 	const bool canLaunch = !mesh_.takeAbort();
 	if (!canLaunch && radioDriver_.ready()) {
 		if (!radioDriver_.standby() ||
@@ -170,7 +145,6 @@ void App::tick() {
 		if (action == Commands::Action::Reboot || finishReset()) ESP.restart();
 		else serialLink_.sendError("E_INTERNAL", "authorized reset incomplete; retry maintenance recovery", nowMs);
 	}
-#endif
 }
 
 const UiSnapshot& App::snapshot() const {
@@ -180,9 +154,6 @@ const UiSnapshot& App::snapshot() const {
 void App::handleCommand(void* context, const char* command,
 	JsonObjectConst arguments, JsonObject response, uint64_t nowMs) {
 	App& app = *static_cast<App*>(context);
-#if OFFGRID_MOCK_DEVICE
-	MockDevice::handle(&app.device_, command, arguments, response, nowMs);
-#else
 	app.action_ = app.commands_.handleSecure(command, arguments, response, nowMs,
 		app.security_, app.vaultStore_, app.configStore_, app.radioDriver_, app.contacts_, app.pairing_, app.mesh_);
 	if (app.mesh_.takeStorageFailure()) app.security_.lock("error", nowMs);
@@ -196,7 +167,6 @@ void App::handleCommand(void* context, const char* command,
 		response["result"]["radio"]["running"] = app.radioDriver_.state() == RadioDriver::State::Receiving;
 		response["result"]["radio"]["last_error"] = app.radioDriver_.lastError();
 	}
-#endif
 	if (!response["ok"].as<bool>()) {
 		onUiEvent(context, UiEvent::Error, nowMs);
 		return;
@@ -220,28 +190,21 @@ void App::onUiEvent(void* context, UiEvent event, uint64_t nowMs) {
 }
 
 void App::updateUi(uint64_t nowMs) {
-#if OFFGRID_MOCK_DEVICE
-	snapshot_ = device_.uiSnapshot(nowMs);
-	if (device_.takeLedConfig(ledConfig_) && ledReady_) ledDriver_.configure(ledConfig_);
-	LedPattern preview;
-	if (device_.takeLedPreview(preview) && ledReady_) ledDriver_.preview(preview, nowMs);
-#else
 	commands_.secureSnapshot(snapshot_, nowMs, security_, radioDriver_, contacts_, pairing_);
 	snapshot_.pendingMessages = mesh_.count();
 	snapshot_.relayOnly = mesh_.radioWanted() && security_.state() != DeviceState::Unlocked;
 	if (commands_.takeSecureLedConfig(ledConfig_) && ledReady_) ledDriver_.configure(ledConfig_);
 	LedPattern preview;
 	if (commands_.takeSecureLedPreview(preview) && ledReady_) ledDriver_.preview(preview, nowMs);
-#endif
 	if (ledReady_) ledDriver_.show(snapshot_);
 	if (oledReady_) oledDriver_.show(snapshot_);
 }
 
-#if !OFFGRID_MOCK_DEVICE
 void App::onLock(void* context) {
 	App& app = *static_cast<App*>(context);
 	app.mesh_.close(static_cast<uint64_t>(esp_timer_get_time()) / 1000);
 	app.mesh_.takeAbort();
+	app.commands_.clearDebug();
 	if (app.radioDriver_.ready()) app.radioDriver_.standby();
 	if (app.mesh_.radioWanted() && app.radioDriver_.ready() && !app.radioDriver_.startReceive())
 		app.serialLink_.sendError("E_RADIO", "locked relay receive failed", 0);
@@ -267,4 +230,3 @@ bool App::onLoad(void* context) {
 bool App::finishReset() {
 	return vaultStore_.erase() && configStore_.eraseAll();
 }
-#endif

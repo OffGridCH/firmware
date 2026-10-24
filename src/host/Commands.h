@@ -33,7 +33,6 @@ public:
 						 double minimum, double maximum, bool required = true);
 	static LedPattern ledPattern(JsonVariantConst value);
 
-#if !OFFGRID_MOCK_DEVICE
 	enum class Action { None, Reboot, Reset };
 	void initSecure(ConfigStore& store, Security& security);
 	Action handleSecure(const char* command, JsonObjectConst args, JsonObject response,
@@ -50,7 +49,10 @@ public:
 	bool cadEnabled() const { return live_["mesh"]["cad_enabled"].as<bool>(); }
 	uint8_t backoffSlots() const { return live_["mesh"]["backoff_slots"].as<uint8_t>(); }
 	bool emitMeshEvent(const MeshEngine::Event& event);
-#endif
+	void clearDebug();
+	bool emitNotices(uint64_t nowMs);
+	void traceRadio(const RadioDriver::Event& event, bool unlocked, const char* action);
+	uint32_t traceDrops() const { return traceDrops_; }
 
 private:
 	static void onLine(void* context, const char* line, size_t length, uint64_t nowMs);
@@ -61,7 +63,6 @@ private:
 	void* context_;
 	StaticJsonDocument<BoardConfig::RequestDocumentBytes> request_;
 	StaticJsonDocument<BoardConfig::ResponseDocumentBytes> response_;
-#if !OFFGRID_MOCK_DEVICE
 	void secureConfig(const char* command, JsonObjectConst args, JsonObject response,
 		ConfigStore& store, RadioDriver& radio);
 	static void securityFailure(JsonObject response, const Security& security);
@@ -77,5 +78,10 @@ private:
 	bool ledDirty_ = true;
 	bool previewPending_ = false;
 	LedPattern preview_;
+	const char* logLevel_ = "warn";
+	bool logPending_ = false;
+	uint32_t traceDrops_ = 0;
+#if OFFGRID_RADIO_DIAGNOSTICS
+	bool traceEnabled_ = false;
 #endif
 };

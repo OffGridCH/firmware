@@ -74,7 +74,6 @@ LedPattern Commands::ledPattern(JsonVariantConst value) {
 	return pattern;
 }
 
-#if !OFFGRID_MOCK_DEVICE
 namespace {
 const char* stateName(const Security& security) {
 	return security.state() == DeviceState::Unprovisioned ? "unprovisioned" :
@@ -168,7 +167,8 @@ void Commands::emitSecureBoot(const Security& security, uint64_t nowMs) {
 	event["evt"] = "sys.boot";
 	event["t"] = nowMs;
 	event["data"]["device_id"] = deviceId_;
-	event["data"]["fw"] = "0.2.0-secure-dev";
+	event["data"]["fw"] = BoardConfig::FirmwareVersion;
+	event["data"]["radio_diagnostics"] = bool(OFFGRID_RADIO_DIAGNOSTICS);
 	event["data"]["proto"] = "1.0";
 	event["data"]["state"] = stateName(security);
 	event["data"]["mock"] = false;
@@ -205,11 +205,12 @@ Commands::Action Commands::handleSecure(const char* command, JsonObjectConst arg
 		result["device"] = "heltec_wifi_lora_32_v3";
 		result["chip"] = "ESP32-S3";
 		result["device_id"] = deviceId_;
-		result["fw"]["version"] = "0.2.0-secure-dev";
+		result["fw"]["version"] = BoardConfig::FirmwareVersion;
 		result["fw"]["build"] = __DATE__;
 		result["proto"] = "1.0";
 		result["state"] = stateName(security);
 		result["mock"] = false;
+		result["radio_diagnostics"] = bool(OFFGRID_RADIO_DIAGNOSTICS);
 		result["authentication"] = "x25519-aes256gcm";
 		result["config_storage"] = "nvs";
 		JsonObject session = result.createNestedObject("session");
@@ -224,6 +225,30 @@ Commands::Action Commands::handleSecure(const char* command, JsonObjectConst arg
 		result["limits"]["pending_queue"] = 8;
 		result["recovery"]["master"] = "ECDSA-P256-SHA256";
 		result["recovery"]["app_wrap_label"] = "og-reset-wrap-v1";
+	} else if (strcmp(command, "sys.set_log_level") == 0) {
+		if (!stringArg(args, response, "level", 3, 5)) return Action::None;
+		const char* levels[] = {"off", "error", "warn", "info", "debug"};
+		const char* selected = nullptr;
+		for (const char* level : levels) if (strcmp(args["level"], level) == 0) selected = level;
+		if (!selected) { fail(response, "E_INVALID_ARG", "invalid log level", "level"); return Action::None; }
+		logLevel_ = selected; logPending_ = strcmp(selected, "off") != 0;
+		result["level"] = selected;
+#if OFFGRID_RADIO_DIAGNOSTICS
+	} else if (strcmp(command, "diag.codec.selftest") == 0 || strcmp(command, "diag.vault.selftest") == 0) {
+		if (!boolArg(args, response, "verify", false)) return Action::None;
+		const bool passed = strcmp(command, "diag.codec.selftest") == 0 ?
+			PacketCodec::selfTest() : VaultStore::selfTest(args["verify"] | false);
+		if (!passed) fail(response, "E_INTERNAL", "isolated diagnostic failed");
+		else result["passed"] = true;
+	} else if (strcmp(command, "diag.mesh.drop_next_ack") == 0) {
+		if (!unlocked) fail(response, "E_LOCKED", "unlock required");
+		else { mesh.dropNextAck(); result["armed"] = true; }
+	} else if (strcmp(command, "dbg.rf_trace") == 0) {
+		if (!unlocked) fail(response, "E_LOCKED", "unlock required");
+		else if (boolArg(args, response, "enabled")) {
+			traceEnabled_ = args["enabled"]; result["enabled"] = traceEnabled_;
+		}
+#endif
 	} else if (strcmp(command, "sys.ping") == 0) {
 		result["uptime_ms"] = nowMs;
 	} else if (strcmp(command, "sys.status") == 0) {
@@ -380,7 +405,11 @@ Commands::Action Commands::handleSecure(const char* command, JsonObjectConst arg
 				result["relayed"] = stats.relayed; result["relay_suppressed"] = stats.relaySuppressed;
 				result["relay_dropped"] = stats.relayDropped; result["rate_limit_drops"] = stats.rateDrops;
 				result["tx_duty_cycle_max_percent"] = 1;
-				if (args["reset"] | false) mesh.resetStats();
+				result["trace_dropped_events"] = traceDrops_;
+#if OFFGRID_RADIO_DIAGNOSTICS
+				result["injected_ack_drops"] = stats.injectedAckDrops;
+#endif
+				if (args["reset"] | false) { mesh.resetStats(); traceDrops_ = 0; }
 			}
 			mesh.configure(secureMeshConfig());
 		}
@@ -393,6 +422,45 @@ Commands::Action Commands::handleSecure(const char* command, JsonObjectConst arg
 		else secureMessages(command, args, response, nowMs, mesh, radio);
 	} else fail(response, "E_UNKNOWN_CMD", "unknown command");
 	return Action::None;
+}
+
+void Commands::clearDebug() {
+#if OFFGRID_RADIO_DIAGNOSTICS
+	traceEnabled_ = false;
+#endif
+}
+
+bool Commands::emitNotices(uint64_t nowMs) {
+	if (!logPending_) return true;
+	StaticJsonDocument<256> event;
+	event["evt"] = "log"; event["t"] = nowMs;
+	event["data"]["level"] = logLevel_;
+	event["data"]["msg"] = "log level updated";
+	if (!link_.sendJson(event)) return false;
+	logPending_ = false;
+	return true;
+}
+
+void Commands::traceRadio(const RadioDriver::Event& value, bool unlocked, const char* action) {
+#if OFFGRID_RADIO_DIAGNOSTICS
+	if (!traceEnabled_ || !unlocked ||
+		(value.type != RadioDriver::EventType::Received && value.type != RadioDriver::EventType::Transmitted)) return;
+	char hex[511];
+	static const char digits[] = "0123456789ABCDEF";
+	for (size_t index = 0; index < value.length; ++index) {
+		hex[index * 2] = digits[value.bytes[index] >> 4];
+		hex[index * 2 + 1] = digits[value.bytes[index] & 15];
+	}
+	hex[value.length * 2] = 0;
+	StaticJsonDocument<1024> event;
+	event["evt"] = value.type == RadioDriver::EventType::Received ? "rf.rx" : "rf.tx";
+	event["t"] = value.timeMs;
+	JsonObject data = event.createNestedObject("data");
+	data["len"] = value.length; data["hex"].set(hex);
+	if (value.type == RadioDriver::EventType::Transmitted) data["airtime_ms"] = value.airtimeMs;
+	else { data["rssi"] = value.rssi; data["snr"] = value.snr; data["action"] = action; }
+	if (!link_.sendJson(event)) ++traceDrops_;
+#endif
 }
 
 MeshEngine::Config Commands::secureMeshConfig() const {
@@ -536,6 +604,10 @@ void Commands::secureConfig(const char* command, JsonObjectConst args, JsonObjec
 		result["rx_packets"] = radio.stats().received;
 		result["rx_crc_errors"] = radio.stats().crcErrors;
 		result["radio_dropped_events"] = radio.stats().droppedEvents;
+		result["radio_failures"] = radio.stats().failures;
+		result["radio_timeouts"] = radio.stats().timeouts;
+		result["cad_scans"] = radio.stats().cadScans;
+		result["cad_busy"] = radio.stats().cadBusy;
 		result["tx_airtime_ms_total"] = radio.stats().txAirtimeMs;
 		result["last_rssi"] = radio.stats().lastRssi;
 		result["last_snr"] = radio.stats().lastSnr;
@@ -741,7 +813,6 @@ void Commands::secureContacts(const char* command, JsonObjectConst args, JsonObj
 			fail(response, "E_INTERNAL", "contact encoding failed");
 	}
 }
-#endif
 
 bool Commands::stringArg(JsonObjectConst args, JsonObject response, const char* field,
 						 size_t minimum, size_t maximum, bool required) {

@@ -14,6 +14,7 @@ public:
 	static constexpr size_t GcmNonceBytes = 12;
 	static constexpr size_t GcmTagBytes = 16;
 
+	static void init();
 	static bool randomBytes(uint8_t* output, size_t length);
 	static bool sha256(const uint8_t* input, size_t length,
 				   uint8_t output[Sha256Bytes]);

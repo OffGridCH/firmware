@@ -244,8 +244,7 @@ static void renderHome(U8G2 &d, const UiSnapshot &s, UiEvent activity, bool lock
     d.drawUTF8(12, 8, s.name[0] ? s.name : s.state == DeviceState::Locked ? "Locked" : "Not set up");
     d.setMaxClipWindow();
 
-    // ponytail: unlocked stands in for "app connected" (heartbeat timeout locks);
-    // add a snapshot field once the host session is tracked outside the mock.
+    // Authentication state represents the app session; heartbeat timeout locks it.
     d.drawXBMP(121, 0, 7, 10, unlocked ? image_phone_on_bits : image_phone_off_bits);
 
     d.setFont(u8g2_font_haxrcorp4089_tr);
@@ -265,7 +264,6 @@ static void renderHome(U8G2 &d, const UiSnapshot &s, UiEvent activity, bool lock
     snprintf(buf, sizeof buf, "SF%u BW%g", s.spreadingFactor, s.bandwidthKhz);
     d.drawStr(128 - d.getStrWidth(buf), 33, buf);
 
-    // Capacities match the mock backend's sys.status.
     d.setFont(u8g2_font_helvB08_tf);
     d.drawXBMP(1, 37, 7, 8, image_contacts_bits);
     if (unlocked) snprintf(buf, sizeof buf, "%u/32", s.contacts);
@@ -304,7 +302,7 @@ static void renderRadio(U8G2 &d, const UiSnapshot &s) {
     const char *state = s.radioError ? "error" : s.relayOnly ? "relay only" :
         s.radioRunning ? "running" : "standby";
     d.drawStr(128 - d.getStrWidth(state), 8, state);
-    d.drawStr(12, 18, s.radioDiagnostics ? "diagnostic" : "mock");
+    d.drawStr(12, 18, s.radioDiagnostics ? "diagnostic" : "secure");
     if (s.radioError) {
         snprintf(buf, sizeof buf, "err %ld", (long)s.radioError);
         d.drawStr(128 - d.getStrWidth(buf), 18, buf);

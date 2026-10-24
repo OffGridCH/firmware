@@ -79,9 +79,9 @@ fixed fixture keys compiled only into radio diagnostic profiles. It does not
 write `og_cfg`/`og_vault` or transmit RF:
 
 ```sh
-python3 tools/serial-check.py --port /dev/ttyUSB0 --command diag.vault.selftest --allow-mock-changes
+python3 tools/serial-check.py --port /dev/ttyUSB0 --command diag.vault.selftest --allow-secure-changes
 # Hardware reset/power cycle, then:
-python3 tools/serial-check.py --port /dev/ttyUSB0 --command diag.vault.selftest --args '{"verify":true}' --allow-mock-changes
+python3 tools/serial-check.py --port /dev/ttyUSB0 --command diag.vault.selftest --args '{"verify":true}' --allow-secure-changes
 ```
 
 Both phases passed on the connected board, across hardware reset: authenticated

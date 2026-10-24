@@ -1,196 +1,155 @@
-# Offgrid Firmware
+# OffGrid Firmware
 
-Firmware for the Heltec WiFi LoRa 32 V3. Explicit development profiles provide a
-**real persistent encrypted vault and direct-message core** or the older serial
-mock. Two-board delivery and relaying acceptance are pending; these are not
-production-ready modem images.
+Heltec WiFi LoRa 32 V3 firmware with real encrypted storage, authenticated
+provisioning/unlock/recovery, persistent QR pairing, encrypted direct messages,
+receipts/retries, replay protection and bounded keyless relaying.
 
-## Real Vault and Recovery
+**The mock backend and mock-only profiles/checks have been deleted.** All normal
+builds use the secure domains; no authentication or delivery-success bypass
+exists. Physical multi-hop and release-hardening gates below remain outstanding.
+
+## Build and upload
+
+PlatformIO Core 6.x; pinned ESP32, RadioLib, ArduinoJson, U8g2 and NeoPixel
+dependencies are in [platformio.ini](platformio.ini).
 
 ```sh
-pio run -e secure_dev -t upload --upload-port /dev/ttyUSB0
-python3 tools/serial-check.py --port /dev/ttyUSB0 --secure-check --allow-secure-changes
+pio run -e heltec_wifi_lora_32_V3
+pio run -e native_usb
+pio run -e heltec_wifi_lora_32_V3 -t upload --upload-port /dev/ttyUSB0
 ```
 
-`secure_dev_usb` is the native-USB counterpart. These profiles compile without
-MockDevice and never bypass authentication. They implement real X25519-wrapped
-token provisioning/unlock, encrypted identity persistence, key cleanup, timeout,
-failure backoff and two-generation token rotation. Contacts/pairing derive and
-persist real relationships. Real `msg.*` routes use bounded queues, authenticated
-CCM packets/ACKs and retries driven by hardware TX completion. Bounded keyless
-relay scheduling, keyed dedupe, source limits and locked relay policy are wired;
-physical multi-hop acceptance still needs three/four boards. No synthetic success
-is used in secure firmware.
+- Default `heltec_wifi_lora_32_V3`: secure UART through CP2102.
+- `native_usb`: secure native USB Serial/JTAG.
+- `secure_dev` / `secure_dev_usb`: compatibility aliases of those secure builds.
+- `radio_diag` / `radio_diag_usb`: real secure firmware plus isolated fixtures,
+  ciphertext trace and receipt-loss injection. Never install lab profiles for
+  normal use. Normal firmware compiles these commands and fixtures out.
 
-The isolated vault diagnostic also tests the direct-message domain without RF:
-eight-slot bounds, wrong ACK rejection, collision candidate verification,
-authenticated replay, fresh re-ACK counters, all three retries/no fourth retry,
-timeouts, cancellation, contact deletion, lock cleanup and bounded event loss.
-Two-board secure acceptance now also passed physical TEXT/REACTION/GEO and bound
-ACK exchange in both directions, fingerprint agreement and reboot persistence.
-Use `--mesh-peer SECOND_PORT --allow-secure-changes --allow-radio-transmit` with
-retained credentials on both boards; it restores settings and deletes its test
-relationships. Antennas and lawful local RF settings remain mandatory.
+Opening CP2102 on the tested boards resets the MCU. This is a hardware reset,
+not evidence of a power-cut test.
 
-While locked the OLED shows a large padlock. Unlock opens it, then shrinks/moves
-it to the Home corner over 1.4 seconds without blocking serial/radio progress.
+## Security and storage
 
-The checker retains a synthetic device token privately under `~/.config/offgrid/`
-(mode 0600). Back it up; never commit or share it. This host test credential is
-not an Android Keystore replacement. Normal firmware never stores the token.
-The original saved settings are backed up there and restored after acceptance.
+The registered app proves a token through a single-use X25519/HKDF/AES-GCM
+session. The token is never stored in firmware flash. Versioned AES-GCM vault
+records persist the private identity and contact keys. Wrong credentials fail
+closed, with backoff; lock/timeout clears identity/contact keys, pairing and own
+queued plaintext. Token rotation atomically activates a verified generation.
 
-Factory reset in secure profiles requires fresh app-token authentication using
-the action-specific `og-reset-wrap-v1` label, or an owner-signed 30-second
-single-use device challenge. The firmware contains only the fleet public trust
-key. The authorized owner private key was generated outside the repository at
-`~/.config/offgrid/master-reset.pem`, mode 0600. **Back up this private key
-securely**; anyone holding it can erase devices trusting its public key.
+Pairing uses out-of-band QR material, real X25519/directional HKDF keys, a
+role-independent fingerprint and stable encrypted contact slots. Fresh data and
+ACKs share reserved 24-bit counters; reboot skips the unused reservation rather
+than reusing a nonce. Counters never wrap. Authenticated replay acceptance is
+committed before delivery; endurance/power-cut acceptance is still a release gate.
+
+The ESP32 SAR-ADC entropy source is enabled before cryptographic operations
+because external LoRa does not supply internal Wi-Fi/BLE entropy. Future
+ADC/internal-radio/I2S integration must coordinate that entropy source rather
+than enabling conflicting peripherals.
+
+See [protocol](docs/offgrid-protocol.md), the complete
+[serial API](docs/offgrid-link.md) and [storage](src/storage/README.md).
+Static v1 keys do not provide forward secrecy; deleting NVS records is not a
+forensic erase guarantee.
+
+## OLED and LEDs
+
+Locked firmware displays a large closed padlock. A genuine unlock opens the
+shackle, then shrinks/moves the open lock to the Home corner over 1.4 seconds.
+Relocking cancels it and replaces pending frames. Rendering and I2C updates are
+cooperative; host/RF work never waits for the animation.
+
+GPIO35 PWM and two four-pixel GRB/800-kHz strips on GPIO45/46 share configurable
+monochrome patterns, brightness and quiet/disabled settings. Defaults: locked
+slow blink, unlocked off except activity. GPIO45/46 are strapping pins: external
+power/boot integrity and optical appearance still require physical inspection.
+No GPIO0 button workflow exists. See [drivers](src/drivers/README.md).
+
+## Real-device acceptance tools
+
+The checker requires `pyserial` and `cryptography`. It refuses real credentials
+on old simulator images and never silently erases an existing vault.
+
+```sh
+python3 tools/serial-check.py --port /dev/ttyUSB0 --secure-check --allow-secure-changes
+python3 tools/serial-check.py --port /dev/ttyUSB0 --contact-check --allow-secure-changes
+python3 tools/serial-check.py --port /dev/ttyUSB0 --led-check --allow-secure-changes
+python3 tools/serial-check.py --port /dev/ttyUSB0 --ui-check
+python3 tools/serial-check.py --port /dev/ttyUSB0 --framing-check
+python3 tools/serial-check.py --port /dev/ttyUSB0 --mesh-peer /dev/ttyUSB1 \
+    --allow-secure-changes --allow-radio-transmit
+```
+
+Secure acceptance retains each synthetic token privately in
+`~/.config/offgrid/device-<device_id>.json` (0600). Preserve it; never commit or
+share it. This host credential is not a replacement for the Android Keystore.
+Two-board checks use existing credentials, remove only their test relationships,
+restore temporary settings and lock both boards. They refuse replacing existing
+contacts. On lab images they additionally lose a real ACK and verify physical
+retry/re-ACK without redelivery, exact eight-slot host queue bounds, cancellation,
+lock and deletion cleanup, and actual ciphertext trace.
+
+RF acceptance requires antennas and lawful local settings. The supplied check
+uses 869.525 MHz/BW125/SF9/CR4/5, 0 dBm and CAD. Shared data/ACK/relay scheduling
+waits 99 times measured TX airtime after transmission, including interrupted/
+failed TX with known airtime. This conservative 1% per-boot pacing is not a
+durable rolling-hour ledger or regulatory certification across resets.
+
+For lab-only, production-namespace-independent diagnostics:
+
+```sh
+python3 tools/serial-check.py --port /dev/ttyUSB0 --command diag.codec.selftest --allow-secure-changes
+python3 tools/serial-check.py --port /dev/ttyUSB0 --command diag.vault.selftest --allow-secure-changes
+```
+
+## Authorized buttonless factory reset
+
+The registered app needs fresh action-specific token proof with reset label
+`og-reset-wrap-v1`; an ordinary unlock proof cannot erase a vault.
+
+Owner maintenance instead signs a fresh, device-bound, expiring single-use
+challenge with an operator-held P-256 private key:
 
 ```sh
 python3 tools/serial-check.py --port /dev/ttyUSB0 --master-reset --confirm-erase
 ```
 
-That maintenance command erases the device's vault and configuration and does
-not restore them. It works without the app token, including when vault loading
-fails, provided NVS and the trusted firmware still function. It does not burn
-eFuses or erase unrelated namespaces. `--secure-check --allow-secure-changes
---confirm-erase` instead tests both reset authorities with synthetic vault data,
-restores saved settings, then leaves a fresh real vault locked with its retained
-local credential. Do not use that acceptance mode on personal identities.
+This **erases that board's vault/settings**. The firmware embeds only the fleet
+public trust key; the private key is outside the repository under
+`~/.config/offgrid/master-reset.pem` (0600). Back it up securely: possession grants
+reset authority over devices trusting that key. No eFuses/download mode are
+changed, and no unrelated namespace/partition is erased. Reset authorization is
+journaled before response and resumed on reboot if interrupted.
 
-```sh
-python3 tools/serial-check.py --port /dev/ttyUSB0 --contact-check --allow-secure-changes
-```
+`--secure-check --allow-secure-changes --confirm-erase` tests app/master reset
+using synthetic data, restores backed-up settings and leaves a new locked vault.
+Use it only on an explicitly authorized disposable test identity.
 
-This uses the retained real credential, creates one random synthetic peer,
-checks self/duplicate/replacement handling, fingerprint and encrypted contact
-CRUD across MCU reboot, deletes only its fixture, and locks. It refuses a full
-table rather than deleting existing contacts. Two-board key agreement is pending.
+## Acceptance and release status
 
-UART/native-USB builds and connected-board lifecycle/reset checks pass. Tested
-invalid signature, consumed challenge, wrong action/token, session reuse, rate
-limit, rotation, heartbeat lock, MCU reboot identity persistence and settings
-restoration. Actual power-cut fault injection and multi-board acceptance remain.
+UART, native-USB and secure lab builds pass. Two physical boards passed real
+TEXT/REACTION/GEO and bound receipts in both directions, contact persistence,
+lost-receipt retry without duplicate delivery, queue/lock/delete cleanup, OLED
+scene/latency checks and real lifecycle/reset/LED software checks.
 
-## Current Stage
+Remaining external release gates: three/four-board forwarding/suppression,
+power-cut and flash/RF fault injection, prolonged host/traffic pressure and flash
+endurance, physical LED/OLED/power inspection, jurisdiction-specific RF
+certification, signing/update/recovery policy, and deliberate Secure Boot/flash
+encryption/debug-access choices. No irreversible fuse changes were made.
+These are external acceptance/production-hardening gates, not missing two-device
+messaging features. Multi-hop forwarding is implemented; its physical
+three/four-board acceptance is still outstanding.
 
-Serial mock Stage 5 implements bounded JSON Lines communication, system commands,
-hello/session envelopes, mock provisioning/unlock/lock, heartbeat, policy, simulated
-reboot, and fail-closed reset rejection on buttonless hardware. Status and boot events include
-`mock: true` and `mock_stage: 5`. Firmware version is `0.1.0-config-store.1`.
+## Documentation
 
-The mock validates wrapper shapes but **bypasses authentication**. Public identity,
-QR pairing, 32-slot contact CRUD, typed messages, pending/cancel, and simulated
-incoming/delivery/failure events are implemented. Radio/mesh/LED configuration,
-synthetic statistics/logs/traces, and real NVS configuration persistence are available.
-Default mock builds initialize OLED, onboard LED and two four-pixel strips but not radio. Only configuration and timeout
-policy are stored in flash; identity, tokens, contacts and messages remain mocks.
-See the [host README](src/host/README.md) for API behavior and the
-[storage README](src/storage/README.md) for the record format and device checker.
+- [Serial API](docs/offgrid-link.md): implemented commands, authentication,
+  events, errors, reset authorization and app integration.
+- [Radio protocol](docs/offgrid-protocol.md): encrypted wire format and vectors.
+- [Hardware drivers](src/drivers/README.md),
+  [host interface](src/host/README.md) and
+  [storage format](src/storage/README.md): maintained implementation references.
 
-Storage is implemented in separate module, integration and checker/documentation
-commits. The UART configuration image compiles; physical persistence checks
-must be run on your board with the single Python checker below.
-
-The [host specification](docs/offgrid-link.md)
-describes the complete target API, not the subset already implemented.
-
-## App Core and UI Work
-
-`App` now owns initialization and the cooperative loop; `main.cpp` only delegates.
-The temporary mock backend is in `src/host/MockDevice.h`. LED/OLED receive copied
-public snapshots and typed events, with LED settings/preview already connected.
-OLED uses the merged U8g2 renderer with cooperative startup and dirty-row
-transfers; LED output uses PWM and two GRB 800 kHz NeoPixel strips. Readiness is reported through
-`sys.status.result.ui`. A failed peripheral never blocks the other modules.
-See the short [LED/OLED handoff](docs/app-core-handoff.md) for independent work
-boundaries, driver contracts, automatic overlays and device checks. GPIO0 is not
-an application input. The legacy mock rejects reset (`E_BUSY`); secure profiles
-use the authenticated recovery policy above.
-
-## Radio Bring-Up
-
-`RadioDriver` now wraps pinned RadioLib 7.8.1 for real SX1262 initialization,
-asynchronous RX/TX, CAD/backoff, deadlines, configuration and recovery. Select
-the separate diagnostic image to use it; the Android mock remains available.
-
-```sh
-pio run -e radio_diag -t upload --upload-port /dev/ttyUSB0
-```
-
-Flash two boards, attach correct antennas and verify lawful RF settings. Then:
-
-```sh
-python3 tools/serial-check.py --port /dev/ttyUSB0 --radio-peer /dev/ttyUSB1 --allow-radio-transmit
-```
-
-The diagnostic image rejects mock chat sends and exposes raw diag.radio.*
-commands. It is not encrypted messaging and does not enforce duty cycle.
-See [radio setup and device checks](src/drivers/README.md) for commands,
-events, pins, timing limits, native-USB alternative and acceptance gates.
-Firmware builds pass; physical two-board verification remains pending.
-
-## Storage Device Check
-
-```sh
-python3 tools/serial-check.py --port /dev/ttyUSB0 --storage-phase write --allow-config-changes
-# Physically reset or power-cycle the board before the next command.
-python3 tools/serial-check.py --port /dev/ttyUSB0 --storage-phase verify --allow-config-changes
-python3 tools/serial-check.py --port /dev/ttyUSB0 --storage-phase restore --allow-config-changes
-```
-
-Requires `pyserial`. Keep the generated snapshot until restore succeeds.
-The optional `--storage-phase reset` checks reset rejection and unchanged
-configuration; it performs no erase. `--ui-check` measures serial responsiveness
-across startup and Home rendering without changing settings. `--led-check
---allow-mock-changes` verifies output levels and preview/quiet/enabled behavior
-using temporary settings, then restores them.
-
-## Build and Upload
-
-Use PlatformIO Core or the PlatformIO terminal in VS Code. Versions and C++17
-mode are configured in `platformio.ini`. Find the actual port with `pio device list`.
-
-For VS Code C++ IntelliSense, generate the local ESP32 compilation database with
-`pio run -e heltec_wifi_lora_32_V3 -t compiledb`. The checked-in editor configuration
-uses that database rather than generic Arduino/AVR include paths. U8g2 2.36.15,
-ArduinoJson and RadioLib are inherited by all four profiles.
-
-Default USB-UART bridge image, 115200 baud, 8N1, explicitly using `Serial0`:
-
-```sh
-pio run -e heltec_wifi_lora_32_V3
-pio run -e heltec_wifi_lora_32_V3 -t upload --upload-port /dev/ttyUSB0
-pio device monitor -e heltec_wifi_lora_32_V3 --port /dev/ttyUSB0
-```
-
-Alternative native ESP32-S3 USB Serial/JTAG CDC image, only if that interface is
-physically routed to your connector and supported by the Android USB driver:
-
-```sh
-pio run -e serial_mock_usb
-pio run -e serial_mock_usb -t upload --upload-port /dev/ttyACM0
-pio device monitor -e serial_mock_usb --port /dev/ttyACM0
-```
-
-Replace the example ports as needed. These two mock profiles set
-`OFFGRID_MOCK_DEVICE=1`; secure profiles explicitly set it to 0 exactly once.
-No profile is release-hardened. Do not assume a connector exposes both interfaces.
-
-Close the monitor before another host application connects. DTR/RTS are disabled
-in monitor configuration to reduce unintended resets. ROM boot text can still
-appear; clients ignore lines not starting with `{`.
-
-## Quick Check
-
-Send each request on its own line terminated by LF:
-
-```json
-{"id":1,"cmd":"sys.ping"}
-{"id":2,"cmd":"sys.status"}
-```
-
-Expect matching response IDs, increasing `uptime_ms`, `state: "unprovisioned"`,
-and `radio.running: false` before mock provisioning. Android developers can now
-exercise hello and mock lifecycle flows described in the host README.
+Obsolete implementation plans, mock/UI handoffs and target-architecture drafts
+have been removed; the references above describe the shipped implementation.

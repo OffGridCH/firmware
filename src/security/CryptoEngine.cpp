@@ -2,6 +2,8 @@
 
 #include <cstring>
 #include <esp_system.h>
+#include <bootloader_random.h>
+#include <mbedtls/entropy.h>
 #include <mbedtls/ccm.h>
 #include <mbedtls/ecdh.h>
 #include <mbedtls/ecdsa.h>
@@ -12,9 +14,10 @@
 #include <mbedtls/sha256.h>
 
 namespace {
+bool entropyReady = false;
+
 int espRandom(void*, unsigned char* output, size_t length) {
-	esp_fill_random(output, length);
-	return 0;
+	return CryptoEngine::randomBytes(output, length) ? 0 : MBEDTLS_ERR_ENTROPY_SOURCE_FAILED;
 }
 
 bool validBuffer(const uint8_t* buffer, size_t length) {
@@ -56,8 +59,18 @@ bool CryptoEngine::verifyP256(const uint8_t publicKey[65], const uint8_t* messag
 	return ok;
 }
 
+void CryptoEngine::init() {
+	// External SX1262 does not enable ESP32 Wi-Fi/BLE entropy. No ADC is used.
+	if (!entropyReady) bootloader_random_enable();
+	entropyReady = true;
+}
+
 bool CryptoEngine::randomBytes(uint8_t* output, size_t length) {
 	if (!validBuffer(output, length)) {
+		return false;
+	}
+	if (!entropyReady) {
+		zeroize(output, length);
 		return false;
 	}
 	if (length != 0) {

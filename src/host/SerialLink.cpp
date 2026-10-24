@@ -92,7 +92,7 @@ void SerialLink::drainTx() {
 }
 
 void SerialLink::receive(uint64_t nowMs) {
-	if (!receiveEnabled_ || handler_ == nullptr || txCount_ == BoardConfig::SerialTxSlots) {
+	if (!receiveEnabled_ || handler_ == nullptr || BoardConfig::SerialTxSlots - txCount_ < 2) {
 		return;
 	}
 

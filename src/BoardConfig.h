@@ -12,6 +12,7 @@
 #endif
 
 namespace BoardConfig {
+constexpr const char* FirmwareVersion = "0.3.0";
 constexpr uint32_t SerialBaud = 115200;
 constexpr size_t SerialMaxLineBytes = 2048;
 constexpr size_t SerialTxSlots = 6;

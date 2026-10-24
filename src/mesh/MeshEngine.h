@@ -51,6 +51,9 @@ public:
 		uint32_t relaySuppressed = 0;
 		uint32_t relayDropped = 0;
 		uint32_t rateDrops = 0;
+#if OFFGRID_RADIO_DIAGNOSTICS
+		uint32_t injectedAckDrops = 0;
+#endif
 	};
 	explicit MeshEngine(Contacts& contacts);
 	bool init(bool provisioned);
@@ -78,12 +81,14 @@ public:
 	const Event* event() const;
 	void consumeEvent();
 	const Stats& stats() const { return stats_; }
+	const char* receiveAction() const { return receiveAction_; }
 	void resetStats() { stats_ = {}; }
 	static const char* stateName(State state);
 	static const char* typeName(PacketCodec::Type type);
 	static const char* reasonName(Reason reason);
 #if OFFGRID_RADIO_DIAGNOSTICS
 	static bool selfTest(VaultStore& vault);
+	void dropNextAck() { dropNextAck_ = true; }
 #endif
 
 private:
@@ -153,6 +158,10 @@ private:
 	uint64_t nowMs_ = 0;
 	uint64_t nextTransmitAt_ = 0;
 	Stats stats_;
+	const char* receiveAction_ = "ignored";
 	EventHandler handler_ = nullptr;
 	void* context_ = nullptr;
+#if OFFGRID_RADIO_DIAGNOSTICS
+	bool dropNextAck_ = false;
+#endif
 };

@@ -29,7 +29,7 @@ struct UiSnapshot {
 	uint64_t uptimeMs = 0;
 	DeviceState state = DeviceState::Unprovisioned;
 	UiPage page = UiPage::Home;
-	bool mock = true;
+	bool mock = false;
 	bool radioDiagnostics = false;
 	char deviceId[13] = {};
 	char nodeId[5] = {};

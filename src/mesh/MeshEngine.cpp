@@ -51,12 +51,21 @@ bool MeshEngine::remember(uint32_t value) {
 }
 
 MeshEngine::Source* MeshEngine::source(uint16_t id, uint64_t nowMs) {
-	for (Source& source : sources_) {
+	bool known = false;
+	if (unlocked_)
+		for (uint8_t slot = 1; slot <= Contacts::Capacity; ++slot) {
+			const Contacts::View* peer = contacts_.view(slot);
+			if (peer && peer->nodeId == id) { known = true; break; }
+		}
+	const size_t first = known ? 0 : 32;
+	for (size_t index = first; index < first + 32; ++index) {
+		Source& source = sources_[index];
 		if (!source.used || source.id != id) continue;
 		if (nowMs - source.start >= 60000) { source.relays = source.failures = 0; source.start = nowMs; }
 		return &source;
 	}
-	for (Source& source : sources_) {
+	for (size_t index = first; index < first + 32; ++index) {
+		Source& source = sources_[index];
 		if (source.used && nowMs - source.start < 60000) continue;
 		source = {}; source.used = true; source.id = id; source.start = nowMs;
 		return &source;
@@ -101,6 +110,9 @@ void MeshEngine::open(uint16_t ownId) {
 
 void MeshEngine::close(uint64_t nowMs) {
 	nowMs_ = nowMs;
+#if OFFGRID_RADIO_DIAGNOSTICS
+	dropNextAck_ = false;
+#endif
 	CryptoEngine::zeroize(events_, sizeof(events_));
 	eventHead_ = eventCount_ = 0;
 	for (size_t index = 0; index < Capacity; ++index)
@@ -356,6 +368,9 @@ bool MeshEngine::takeCryptoFailure() {
 }
 
 void MeshEngine::ack(uint8_t contact, const PacketCodec::Header& original) {
+#if OFFGRID_RADIO_DIAGNOSTICS
+	if (dropNextAck_) { dropNextAck_ = false; ++stats_.injectedAckDrops; return; }
+#endif
 	size_t index = 0;
 	while (index < 4 && acks_[index].used) ++index;
 	if (index == 4) { ++stats_.droppedAcks; return; }
@@ -373,10 +388,11 @@ void MeshEngine::ack(uint8_t contact, const PacketCodec::Header& original) {
 
 void MeshEngine::receive(const uint8_t* bytes, size_t length, float rssi, float snr, uint64_t nowMs) {
 	nowMs_ = nowMs;
+	receiveAction_ = "ignored";
 	if (!radioWanted() || storageFailure_) return;
 	PacketCodec::Header header;
 	if (PacketCodec::inspect(bytes, length, header) != PacketCodec::Error::None) {
-		++stats_.malformed; return;
+		receiveAction_ = "dropped_malformed"; ++stats_.malformed; return;
 	}
 	Source* budget = source(header.source, nowMs);
 	const bool addressed = unlocked_ && header.destination == ownId_;
@@ -384,10 +400,11 @@ void MeshEngine::receive(const uint8_t* bytes, size_t length, float rssi, float 
 	if (addressed && budget && budget->failures < 20) {
 		authenticated = endpoint(bytes, length, header, rssi, snr, nowMs);
 		if (!authenticated) ++budget->failures;
-	} else if (addressed) ++stats_.rateDrops;
+	} else if (addressed) { receiveAction_ = "dropped_rate_limit"; ++stats_.rateDrops; }
 	uint32_t value = 0;
 	if (!hash(bytes, length, value)) return;
 	if (!remember(value)) {
+		if (!authenticated) receiveAction_ = "dropped_duplicate";
 		for (size_t index = 0; index < 8; ++index) {
 			if (!relays_[index].used || relays_[index].hash != value ||
 				(flightRelay_ && flight_ == int(index))) continue;
@@ -400,13 +417,14 @@ void MeshEngine::receive(const uint8_t* bytes, size_t length, float rssi, float 
 				status(index, State::Relayed, Reason::None, nowMs);
 		return;
 	}
-	if (authenticated || storageFailure_ || !config_.relayEnabled || !header.hopLeft) return;
+	if (authenticated || storageFailure_ || !config_.relayEnabled) return;
+	if (!header.hopLeft) { receiveAction_ = "dropped_hop_limit"; return; }
 	if (!budget || (config_.ratePerSource && budget->relays >= config_.ratePerSource)) {
-		++stats_.rateDrops; return;
+		receiveAction_ = "dropped_rate_limit"; ++stats_.rateDrops; return;
 	}
 	size_t index = 0;
 	while (index < 8 && relays_[index].used) ++index;
-	if (index == 8) { ++stats_.relayDropped; return; }
+	if (index == 8) { receiveAction_ = "dropped_queue_full"; ++stats_.relayDropped; return; }
 	uint32_t random = 0;
 	if (!CryptoEngine::randomBytes(reinterpret_cast<uint8_t*>(&random), sizeof(random))) {
 		cryptoReady_ = false; cryptoFailure_ = true; return;
@@ -419,6 +437,7 @@ void MeshEngine::receive(const uint8_t* bytes, size_t length, float rssi, float 
 	relay.due = nowMs + uint32_t((signal + 20) * 8) +
 		(config_.backoffSlots ? random % (uint32_t(config_.backoffSlots) * 25 + 1) : 0);
 	++budget->relays;
+	receiveAction_ = "relay_queued";
 }
 
 bool MeshEngine::endpoint(const uint8_t* bytes, size_t length, const PacketCodec::Header& header,
@@ -440,7 +459,9 @@ bool MeshEngine::endpoint(const uint8_t* bytes, size_t length, const PacketCodec
 			const PacketCodec::Error error = PacketCodec::decode(bytes, length,
 				contacts_.records_[contact - 1].incoming, payload);
 			if (error == PacketCodec::Error::Authentication) continue;
-			if (error != PacketCodec::Error::None) { ++stats_.malformed; return true; }
+			if (error != PacketCodec::Error::None) {
+				receiveAction_ = "dropped_malformed"; ++stats_.malformed; return true;
+			}
 		}
 		const bool wasActive = peer->active;
 		const Contacts::Replay replay = contacts_.accept(contact, header.counter, rssi, snr);
@@ -456,9 +477,11 @@ bool MeshEngine::endpoint(const uint8_t* bytes, size_t length, const PacketCodec
 				emit(event);
 			}
 			if (length == 16) {
+				receiveAction_ = "ack_matched";
 				++stats_.acksReceived;
 				finish(matching, State::Delivered, Reason::None, nowMs, header.hopStart - header.hopLeft);
 			} else {
+				receiveAction_ = "delivered";
 				Event event;
 				event.type = EventType::Received;
 				event.message.contact = contact; event.message.counter = header.counter; event.message.retry = header.retry;
@@ -469,6 +492,7 @@ bool MeshEngine::endpoint(const uint8_t* bytes, size_t length, const PacketCodec
 				if (payload.ack) ack(contact, header);
 			}
 		} else {
+			receiveAction_ = "dropped_duplicate";
 			++stats_.replayDrops;
 			if (replay == Contacts::Replay::Duplicate && length != 16 && payload.ack && header.retry > 0)
 				ack(contact, header);
@@ -477,6 +501,7 @@ bool MeshEngine::endpoint(const uint8_t* bytes, size_t length, const PacketCodec
 		return true;
 	}
 	++stats_.tagFailures;
+	receiveAction_ = "dropped_tag";
 	return false;
 }
 
@@ -694,6 +719,18 @@ bool MeshEngine::selfTest(VaultStore& vault) {
 	mesh.init(false);
 	config.relayWhenLocked = true; mesh.configure(config);
 	if (mesh.radioWanted()) return false;
+	if (!mesh.init(true) || !contacts.load() ||
+		!contacts.insert(1, publicKey, "Rate fixture", "0000 0000 0000", outgoing, incoming)) return false;
+	mesh.open(0xabcd);
+	for (uint16_t index = 0; index < 32; ++index) {
+		const uint16_t id = 0x4000 + index == peerId ? 0x5000 + index : 0x4000 + index;
+		if (!mesh.source(id, 1000000)) return false;
+	}
+	if (mesh.source(peerId == 0x6000 ? 0x6001 : 0x6000, 1000000) ||
+		!mesh.source(peerId, 1000000)) return false;
+	ok = contacts.remove(1);
+	contacts.close();
+	mesh.close(1000001);
 	return ok;
 }
 #endif

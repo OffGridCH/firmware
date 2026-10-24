@@ -1,1297 +1,813 @@
-# Offgrid Host Interface v1: Android ⇄ Heltec V3 Serial API
+# OffGrid Serial API
 
-> **Status:** Draft v1, for lab testing
-> **Purpose:** JSON interface between the Offgrid Android app and the Heltec WiFi LoRa 32 V3 firmware
-> **Transport:** USB serial, JSON Lines (one JSON object per line)
-> **Companion document:** [Offgrid Protocol v1](offgrid-protocol.md), the over-the-air protocol this interface drives
-> **Key idea:** The Heltec is a locked vault plus radio. All keys live on the Heltec, and it only works while the right phone has unlocked it.
+- **Firmware:** 0.3.0
+- **Host protocol:** 1.0
+- **Hardware:** Heltec WiFi LoRa 32 V3 / ESP32-S3
+- **Transport:** USB serial, UTF-8 JSON Lines
 
-> **Implementation note:** This is the complete target API. The serial development
-> mock behavior is documented in the [host README](../src/host/README.md).
-> Configuration/policy persistence is real NVS, as described in the
-> [storage README](../src/storage/README.md). Mock images are not
-> secure vault firmware; unsupported commands must not be assumed to work.
+This is the implemented serial interface, not a future API proposal. Normal
+firmware uses real authentication, encrypted persistent identities/contacts and
+encrypted LoRa messaging. The simulator has been removed.
 
----
+The phone/app owns the chat history, QR scanning/rendering and unlock credential.
+The device owns private identity/contact keys, packet encryption, counters,
+receipts, retries, replay protection and relaying. Message bodies are cleartext
+on the trusted USB cable and ciphertext over LoRa. Private identity/contact keys
+are never returned by this API.
 
-## Table of Contents
+Multi-hop relaying is implemented and its bounded scheduling, dedupe, collision
+fallback and limits have passed isolated device checks. Physical forwarding and
+suppression across three/four boards have **not** been verified. Two-board
+encrypted messaging, lost-receipt retry and duplicate rejection have been tested.
+See [README](../README.md) for build profiles and the remaining hardware limits;
+see [radio protocol](offgrid-protocol.md) for the on-air format.
 
-1. [Purpose and Architecture](#1-purpose-and-architecture)
-2. [Plain-Language Summary](#2-plain-language-summary-no-crypto-degree-required)
-3. [Transport and Framing](#3-transport-and-framing)
-4. [Message Envelope and Conventions](#4-message-envelope-and-conventions)
-5. [Device States and Access Control](#5-device-states-and-access-control)
-6. [Security: Keys, Lock and Unlock](#6-security-keys-lock-and-unlock)
-7. [Command Reference](#7-command-reference)
-8. [Event Reference](#8-event-reference)
-9. [Error Codes](#9-error-codes)
-10. [On-Device Storage](#10-on-device-storage)
-11. [Session Examples](#11-session-examples)
-12. [Limits and Constants](#12-limits-and-constants)
-13. [Limitations and Future Work](#13-limitations-and-future-work)
-14. [Appendix A: Android Token Derivation (Kotlin Sketch)](#appendix-a-android-token-derivation-kotlin-sketch)
-15. [Appendix B: Unlock Reference Code (Python)](#appendix-b-unlock-reference-code-python)
+## Contents
 
----
+1. [Connect and frame messages](#1-connect-and-frame-messages)
+2. [States and authentication](#2-states-and-authentication)
+3. [System commands](#3-system-commands)
+4. [Security and identity commands](#4-security-and-identity-commands)
+5. [Pairing and contacts](#5-pairing-and-contacts)
+6. [Messages](#6-messages)
+7. [Radio configuration and statistics](#7-radio-configuration-and-statistics)
+8. [Mesh configuration](#8-mesh-configuration)
+9. [LEDs and OLED](#9-leds-and-oled)
+10. [Events](#10-events)
+11. [Factory reset](#11-factory-reset)
+12. [Errors and limits](#12-errors-and-limits)
+13. [Lab-only commands](#13-lab-only-commands)
+14. [App integration checklist](#14-app-integration-checklist)
 
-## 1. Purpose and Architecture
+## 1. Connect and frame messages
 
-```
-┌──────────────────────────┐   USB serial, JSON Lines   ┌──────────────────────────────┐  LoRa  ┌────────────┐
-│ Android app              │ ◄────────────────────────► │ Heltec WiFi LoRa 32 V3       │ ◄────► │ other      │
-│  UI, chat history,       │      cleartext messages    │  keys, encryption, counters, │ cipher │ Offgrid    │
-│  Keystore unlock secret  │                            │  mesh, radio, LED            │  text  │ nodes      │
-└──────────────────────────┘                            └──────────────────────────────┘        └────────────┘
-```
+- UART/CP2102: **115200 baud, 8 data bits, no parity, 1 stop bit**, no hardware
+  flow control. Native USB uses the same message format.
+- Normal profiles: `heltec_wifi_lora_32_V3` and `native_usb`.
+  `secure_dev` / `secure_dev_usb` are compatibility aliases, not different APIs.
+- Opening CP2102 resets the tested boards even when DTR/RTS are held inactive.
+  Expect a fresh boot and locked vault. Do not assume a USB open preserves RAM work.
+- Read continuously. Discard startup/non-JSON lines and synchronize on newline.
+  One initial empty newline can terminate an incomplete old input line; it can
+  produce an uncorrelated `E_PARSE`. Do not repeatedly prefix requests with blanks.
+- Each request/response/event occupies one line ending in `\n`; incoming `\r\n`
+  is also accepted. Embedded newlines in strings must be JSON-escaped.
+- Maximum line: **2048 bytes including newline**. Oversize input is discarded
+  through its newline, followed by an `E_LINE_TOO_LONG` error event.
+- One in-flight request at a time is recommended. Events may arrive before,
+  between or after command responses; always dispatch them separately.
 
-**Cleartext on the cable, ciphertext on the air.** The app talks plain JSON to the Heltec. The Heltec encrypts everything before it leaves the antenna.
-
-### 1.1 Who owns what
-
-| Responsibility | Heltec (device) | Android app |
-|---|---|---|
-| Identity private key | ✅ generated and stored, **never leaves the device** | ❌ |
-| Contact keys (k_A→B, k_B→A) | ✅ derived and stored, never leave the device | ❌ |
-| Encryption, tags, nonces, counters | ✅ | ❌ |
-| Replay window, dedupe, relaying | ✅ | ❌ |
-| Retries and ACK matching | ✅ | ❌ (only shows status events) |
-| Radio, mesh and LED settings | ✅ stored in flash | sends changes |
-| Message history, chat UI | ❌ (nothing stored) | ✅ |
-| QR code rendering and scanning | ❌ (produces and parses the text) | ✅ |
-| **Unlock secret** | ❌ (**never stored**) | ✅ (derived inside the Android Keystore) |
-
-### 1.2 Design principles
-
-1. **The device is a secure modem and vault.** It holds secrets and does protocol work, the app holds UI and history.
-2. **Secrets never cross the cable.** The only secret that does is the unlock token, and it is wrapped (see [section 6.4](#64-unlock-handshake)).
-3. **Human-readable JSON.** Bytes are scarce on the air, not on the cable.
-4. **The device is useless while locked.** Without the phone's token the vault cannot be decrypted.
-5. **One request, one response.** Everything asynchronous arrives as an event.
-
----
-
-## 2. Plain-Language Summary (No Crypto Degree Required)
-
-If you only read one section, read this one.
-
-### The big picture
-
-Think of the Heltec as a **small safe with a radio on top**.
-
-- Inside the safe: your identity and the secret keys for every contact. They were created *inside* the safe and the safe never hands them out.
-- The safe has a lock. The only key to it lives **in your phone**, in a special protected area (the Android Keystore) that apps cannot copy from.
-- Every time the Heltec starts up, it is **locked** and cannot read its own keys. The phone has to "show its key" first. Only then can the safe open, switch on the radio and work.
-- If the cable is pulled and the phone stops talking for a while, the safe **locks itself again** and wipes the keys from memory.
-
-**Why the app can send cleartext JSON:** the cable is short and personal. The message only becomes unreadable gibberish once it passes through the safe and out the antenna.
-
-### What the app can tell the safe to do
-
-| You want to... | The app sends... |
-|---|---|
-| Set up a new Heltec | `sec.provision` (the safe makes its identity and locks itself to your phone) |
-| Open the safe after boot | `sec.unlock` |
-| Add a friend | `pair.begin` (show my QR), `pair.complete` (scan theirs) |
-| Send a message | `msg.send` |
-| Change the radio | `radio.set` |
-| Change the LED blinking | `led.set` |
-
-### What comes back
-
-- **Responses**: "OK, done" or "no, because...", always tied to your request by an `id`.
-- **Events**: things that just happen, like "a message arrived" or "your message was confirmed".
-
-### Cheat sheet
-
-| Concept | Everyday analogy | Technical name |
-|---|---|---|
-| Heltec | Safe with a radio | Device / vault |
-| Phone's Keystore secret | A key that can never be copied out of the phone | Non-exportable HMAC key |
-| Unlock token | The key's "fingerprint" for this one safe | `HMAC(K_phone, device_id)` |
-| Wrapped token | Handing the key over in a sealed envelope | X25519 + AES-GCM wrap |
-| Provisioning | Buying a new safe and setting its lock | `sec.provision` |
-| Auto-lock | Safe closes when you walk away | Heartbeat timeout |
-| Factory reset | Melting the safe down and starting over | `sys.factory_reset` |
-
----
-
-## 3. Transport and Framing
-
-### 3.1 Physical link
-
-| Parameter | Value |
-|---|---|
-| Link | USB serial (USB-OTG host on Android, for example with *usb-serial-for-android*) |
-| Baud rate | 115200 by default, fixed at build time (921600 is fine for the V3's USB-UART bridge) |
-| Format | 8N1, no flow control |
-| Alternative later | BLE UART with identical framing |
-
-### 3.2 Framing: JSON Lines
-
-- One JSON object per line, terminated by `\n` (LF). The device tolerates a trailing `\r` from the app.
-- UTF-8, standard JSON escaping (RFC 8259). No raw newlines inside strings, no pretty-printing.
-- **Max line length: 2048 bytes** including the newline, in both directions.
-- Lines that are too long are discarded up to the next newline, and the device emits an `error` event (`E_LINE_TOO_LONG`).
-- Invalid JSON gets `{"ok":false,"error":{"code":"E_PARSE",...}}` (without an `id`, because none could be read).
-
-### 3.3 Practical pitfalls (read these)
-
-| Pitfall | What happens | Handling |
-|---|---|---|
-| **DTR/RTS auto-reset** | Opening the port can toggle DTR/RTS and **reset the ESP32** | App sets DTR and RTS low immediately after opening. If a reboot happens anyway the app sees `sys.boot` |
-| **ROM boot output** | The ESP32 ROM prints boot text at 115200 baud before the firmware starts | App **ignores every line that does not start with `{`** |
-| **Stray debug prints** | `printf` or ESP-IDF logs would corrupt the stream | Firmware must route all logs through `log` events or disable them. No raw prints in production builds |
-| **Half-line on connect** | The app may attach mid-line | Device sends one empty `\n` at boot. App drops everything up to the first `\n` after connecting |
-| **Boot race** | Commands sent during boot are lost | App waits for `sys.boot` or retries `sys.hello` every 500 ms until answered |
-
----
-
-## 4. Message Envelope and Conventions
-
-Three kinds of lines exist.
-
-### 4.1 Request (app → device)
+Request:
 
 ```json
-{"id": 12, "cmd": "msg.send", "args": {"to": 1, "type": "text", "text": "Hello!"}}
+{"id":1,"cmd":"sys.ping","args":{}}
 ```
-
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `id` | integer | yes | Chosen by the app, unique among in-flight requests. Echoed in the response |
-| `cmd` | string | yes | `namespace.verb` |
-| `args` | object | no | Command arguments. May be omitted when a command takes none |
-
-### 4.2 Response (device → app)
 
 Success:
 
 ```json
-{"id": 12, "ok": true, "result": {"msg_ref": 1, "state": "queued"}}
+{"id":1,"ok":true,"result":{"uptime_ms":15320}}
 ```
 
 Failure:
 
 ```json
-{"id": 12, "ok": false, "error": {"code": "E_TOO_LONG", "message": "text is 91 bytes, max is 83", "field": "text"}}
+{"id":2,"ok":false,"error":{"code":"E_INVALID_ARG","message":"expected an integer within the allowed range","field":"to"}}
 ```
 
-| Field | Type | Description |
-|---|---|---|
-| `error.code` | string | Stable machine-readable code ([section 9](#9-error-codes)) |
-| `error.message` | string | Human-readable detail, for logs only, never parse it |
-| `error.field` | string | Offending argument, where applicable |
-
-### 4.3 Event (device → app)
+Event:
 
 ```json
-{"evt": "msg.received", "t": 152340, "data": {"from": 1, "type": "text", "text": "Hello!"}}
+{"evt":"sec.state","t":16000,"data":{"state":"locked","reason":"heartbeat_timeout"}}
 ```
 
-`t` is the device's monotonic uptime in milliseconds. The device has no wall clock, so the app timestamps messages itself.
+`id` is a signed 64-bit JSON integer, echoed in a valid request's response.
+Malformed JSON or an invalid/missing ID can produce a response without `id`.
+Use small increasing IDs to avoid JavaScript integer precision problems.
+`args` is optional; when present it must be an object. Unknown fields are
+ignored. Strings are strict UTF-8 without embedded NUL; lengths are **bytes**,
+not characters. Booleans, integers and numbers are not coerced from strings.
+Use canonical padded standard Base64, not Base64url, for binary fields.
+Treat `code` as the stable error discriminator; `message` is explanatory.
 
-### 4.4 Rules
+## 2. States and authentication
 
-| Rule | Detail |
+| State | Meaning |
 |---|---|
-| Ordering | The device executes commands **strictly in the order received** and sends exactly one response per request. Events can appear between any two lines |
-| In-flight limit | The app should keep at most 4 requests in flight |
-| Unknown fields | Ignored (forward compatibility) |
-| Missing or wrong-typed required fields | `E_INVALID_ARG` with `field` set. Types are strict, so `"5"` is not `5` |
-| Partial updates | All `*.set` commands accept any subset of fields, validate **all-or-nothing**, and return the complete new configuration |
-| Persistence | `*.set` commands accept `"persist": true` (default) to save to flash, `false` to apply until the next reboot only |
-| Timeouts | The app should wait 2 s for normal commands and 5 s for commands touching the vault (`sec.*`, `pair.complete`, `contact.delete`) |
-| Versioning | `sys.hello` reports `proto` as `"major.minor"`. Minor changes only add fields and commands. A major change breaks compatibility |
+| `unprovisioned` | No identity vault exists. RF is off. Provision once. |
+| `locked` | Vault exists, but private keys are not in RAM. Unlock to use it. |
+| `unlocked` | Authenticated identity/contacts are loaded and messaging is enabled. |
 
-### 4.5 Data types
+Corrupt/incomplete/unavailable vaults fail closed; they are not treated as fresh
+devices. Inspect `sys.status` and use authorized recovery rather than overwriting
+an existing identity.
 
-| Kind | JSON encoding | Example |
-|---|---|---|
-| Raw bytes (keys, tokens) | Base64, standard alphabet, with padding | `"QO2IFVAq..."` |
-| Node ID | 4 uppercase hex characters | `"E841"` |
-| Device ID | 12 uppercase hex characters (base MAC address) | `"7CDFA100ABCD"` |
-| Contact ID | Integer 1 to 32, local slot number | `1` |
-| Message reference (`msg_ref`) | Integer, local handle, unique since boot | `17` |
-| Counter (`ctr`) | Integer 0 to 16777215 | `1` |
-| Coordinates | Decimal degrees as numbers | `47.0517` |
-| Text | UTF-8 string | `"Hello!"` |
-| Emoji | The emoji character itself | `"👍"` |
-| Optional value that is absent | `null` | `"alt_m": null` |
-
----
-
-## 5. Device States and Access Control
-
-```mermaid
-stateDiagram-v2
-    [*] --> Boot
-    Boot --> Unprovisioned: no vault in flash
-    Boot --> Locked: vault found
-    Unprovisioned --> Unlocked: sec.provision
-    Locked --> Unlocked: sec.unlock with correct token
-    Unlocked --> Locked: sec.lock or heartbeat timeout
-    Unlocked --> Boot: reboot or power loss
-    Locked --> Boot: reboot or power loss
-```
-
-| State | Meaning | Radio |
-|---|---|---|
-| `unprovisioned` | Fresh device, no identity, no vault | Off |
-| `locked` | Vault exists but is encrypted, no key in RAM | Off (or relay-only if `mesh.relay_when_locked` is true) |
-| `unlocked` | Vault decrypted in RAM, device fully working | On |
-
-### 5.1 Which commands work in which state
-
-| Command | unprovisioned | locked | unlocked |
-|---|:-:|:-:|:-:|
-| `sys.hello`, `sys.status`, `sys.ping`, `sys.reboot`, `sys.factory_reset`, `sys.reset_challenge`, `sys.set_log_level` | ✅ | ✅ | ✅ |
-| `sec.provision` | ✅ | ❌ | ❌ |
-| `sec.unlock` | ❌ | ✅ | ❌ |
-| `sec.lock`, `sec.rotate_token`, `sec.get_policy`, `sec.set_policy` | ❌ | ❌ | ✅ |
-| `id.*`, `pair.*`, `contact.*`, `msg.*` | ❌ | ❌ | ✅ |
-| `radio.get`, `mesh.get`, `led.get` | ✅ | ✅ | ✅ |
-| `radio.set`, `radio.stats`, `mesh.set`, `led.set`, `led.test`, `dbg.rf_trace` | ❌ | ❌ | ✅ |
-
-A command in the wrong state gets `E_LOCKED` or `E_NOT_PROVISIONED` (or `E_ALREADY_PROVISIONED` and `E_ALREADY_UNLOCKED` for the opposite cases).
-
----
-
-## 6. Security: Keys, Lock and Unlock
-
-### 6.1 What "unusable without the right Android device" means
-
-| Protected | How |
+| Commands | Allowed state |
 |---|---|
-| Identity private key and contact keys at rest | Encrypted in flash under a key that exists **only** while the phone is connected |
-| Sending, receiving, reading contacts | Impossible while locked. There is no key to do crypto with |
-| Another phone | Cannot produce the token. The token comes from a key that never leaves the original phone's Keystore |
-| A cloned or flashed device | Flash contents are useless without the token |
-
-| **Not** protected | Note |
-|---|---|
-| The firmware code itself | Not a secret. Use Secure Boot to stop modified firmware ([section 6.8](#68-lab-vs-release-hardening)) |
-| An attacker who has the unlocked device **and** can read RAM | Keys are in RAM while unlocked |
-| Active man-in-the-middle on the cable during unlock | See [section 6.9](#69-limitations) |
-
-### 6.2 Key hierarchy
-
-```
- Android Keystore (hardware-backed, non-exportable)
-   K_phone ─────────────────────────────┐
-                                        ▼
-   unlock_token = HMAC-SHA256(K_phone, "og-unlock-v1" || device_id)     32 bytes, per device
-                                        │      sent to the device only inside a wrapped envelope
-                                        ▼
-   vault_key = HKDF-SHA256(token, salt = vault_salt, info = "og-vault-v1")   32 bytes, RAM only
-                                        │
-                                        ▼
-   AES-256-GCM encrypts every vault entry in flash:
-     identity private key · contact keys · counters · contact names
-```
-
-- `device_id` is the base MAC address of the ESP32-S3 (returned by `sys.hello`). Mixing it in means a token for one device is useless on another.
-- `vault_salt` is random, stored in plaintext next to the vault.
-- The device **never stores the token or vault_key**. After a reboot the vault is just encrypted data.
-
-### 6.3 Provisioning (first use)
-
-1. App calls `sys.hello`, which returns the device's ephemeral public key and nonce.
-2. App derives the token, wraps it ([6.5](#65-wrapping-format)) and calls `sec.provision`.
-3. The device generates its identity key pair with the hardware RNG, generates `vault_salt`, derives the `vault_key` and writes the encrypted vault plus a small **check blob** (a known string encrypted under the vault key, used later to verify unlock attempts).
-4. State becomes `unlocked`. The response carries the node ID and public key.
-
-The identity private key is created *inside* the device and never exported.
-
-### 6.4 Unlock handshake
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant K as Android Keystore
-    participant A as Android app
-    participant D as Heltec V3
-
-    Note over D: Boot, state = locked, radio off
-    D->>A: event sys.boot (state locked)
-    A->>D: sys.hello
-    Note over D: Creates a fresh one-time X25519 key pair and a random nonce
-    D->>A: device_id, device_eph_pub, nonce
-    A->>K: HMAC("og-unlock-v1" + device_id)
-    K->>A: token (32 bytes)
-    Note over A: Creates its own one-time X25519 key pair<br/>Shared secret = X25519(app_eph, device_eph_pub)<br/>Wrap key = HKDF(shared, nonce)<br/>Wrapped token = AES-GCM(wrap key, token)
-    A->>D: sec.unlock (app_eph_pub, wrapped_token)
-    Note over D: 1. Same shared secret and wrap key, unwrap token<br/>2. vault_key = HKDF(token, vault_salt)<br/>3. Decrypt check blob. Tag OK means token is correct<br/>4. Load identity and contacts into RAM<br/>5. Start radio
-    D->>A: ok, state unlocked
-    D->>A: event sec.state (unlocked)
-    loop every 5 s
-        A->>D: sys.ping (heartbeat)
-        D->>A: ok
-    end
-    Note over D: No valid line for lock_timeout_s means<br/>wipe keys from RAM, state = locked
-```
-
-Why the wrapping step exists: it stops someone who sniffs the USB cable from simply reading the token. The ephemeral keys are used **once** and discarded, so a recorded unlock exchange cannot be replayed.
-
-### 6.5 Wrapping format
-
-```
-shared       = X25519(app_eph_private, device_eph_public)
-wrap_key     = HKDF-SHA256(ikm = shared, salt = nonce, info = "og-unlock-wrap-v1" || device_id_bytes, L = 32)
-wrapped      = iv (12 B, random) || AES-256-GCM(wrap_key, iv, plaintext = token, aad = device_id_bytes)
-                                  └─ ciphertext (32 B) || tag (16 B)
-```
-
-`wrapped_token` in JSON is the Base64 of these **60 bytes**. `device_id_bytes` are the 6 raw bytes of the 12-hex-character device ID. A full worked vector is in [section 11.1](#111-first-time-setup-provisioning) and the reference code in [Appendix B](#appendix-b-unlock-reference-code-python).
-
-### 6.6 Lock triggers
-
-The device locks when **any** of these happens:
-
-| Trigger | Detail |
-|---|---|
-| `sec.lock` | Explicit |
-| **Heartbeat timeout** | No valid line from the app for `lock_timeout_s` (default 15 s, configurable, 0 disables). Any valid command counts as activity, `sys.ping` is the dedicated heartbeat |
-| Reboot or power loss | Always boots into `locked` |
-| `sys.factory_reset` | Authorized reset wipes vault and configuration, then reboots |
-
-On lock the device: zeroes the keys in RAM, fails all in-flight messages (`msg.status` with `failed`, reason `locked`), clears the queue and stops the radio. If `mesh.relay_when_locked` is true the radio keeps running as a **keyless relay** (see [Offgrid Protocol §11](offgrid-protocol.md): relays never need keys).
-
-### 6.7 Failed unlocks
-
-| Rule | Detail |
-|---|---|
-| Single use sessions | Every `sys.hello` creates a new session. A `sec.unlock` or `sec.provision` attempt, successful or not, **consumes** it. Retrying requires a new `sys.hello` |
-| No information leak | A wrong token, a wrong device or a corrupted envelope all return the same `E_UNLOCK_FAILED` |
-| Rate limiting | After 3 consecutive failures the device answers `E_RATE_LIMITED` for 2 s, doubling each time up to 60 s |
-| No wipe on failure | The token has 256 bits of entropy, so guessing is hopeless. A wipe-on-failure rule would only create a denial-of-service trap |
-
-### 6.8 Lab vs release hardening
-
-| Measure | Lab build | Release build |
-|---|---|---|
-| Vault encryption (AES-256-GCM, this document) | ✅ | ✅ |
-| **Secure Boot v2** (only signed firmware runs) | optional | ✅ so nobody can flash firmware that dumps secrets |
-| **Flash encryption** | optional | ✅ |
-| Disable JTAG, USB-JTAG and ROM download mode (eFuses) | no | ✅ |
-| Debug commands (`dbg.*`) | on | compile out |
-
-eFuse settings are **irreversible**, so enable them only on devices you are happy to sacrifice.
-
-### 6.9 Limitations
-
-- **Active man-in-the-middle on the cable.** The wrap uses an unauthenticated ephemeral exchange, so it defeats passive sniffing but not a device that sits in the middle and impersonates the Heltec. Optional hardening is a device attestation key pinned by the app at provisioning time.
-- **Lost or wiped phone.** If the Keystore key is gone, the token is gone. Buttonless maintenance recovery requires an owner-approved policy and is a release gate.
-- **Cleartext messages on the cable** are visible to anything that can tap the USB link.
-- **RAM while unlocked** holds the keys.
-
-### 6.10 Changing phones
-
-`sec.rotate_token` (device unlocked) replaces the token. The new phone cannot do this alone, because it cannot unlock the device in the first place. Moving a device to a new phone therefore needs the old phone's help or a factory reset.
-
-### 6.11 Factory reset
-
-The connected hardware has no usable application button. The owner approved
-two authenticated reset authorities; the old PRG-hold workflow is cancelled.
-Both require `"confirm": "ERASE"` (`E_CONFIRM_REQUIRED` otherwise):
-
-- **Registered app:** call `sys.hello`, wrap the existing token with the same
-  format as unlock, but HKDF info **`"og-reset-wrap-v1" || device_id_bytes`**.
-  Send `sys.factory_reset` with `method: "app"` (default), `app_eph_pub` and
-  `wrapped_token`. The token must authenticate the active vault. A normal unlock
-  envelope cannot authorize reset. This works locked or unlocked.
-- **Master maintenance tool:** `sys.reset_challenge` works in every state and
-  returns `{message, key_id, expires_s:30, algorithm:"ECDSA-P256-SHA256"}`.
-  `message` is Base64 of `"og-reset-v1" || device_id_bytes(6) || random_nonce(32)`,
-  exactly 49 bytes. `key_id` is Base64 SHA-256 of the trusted uncompressed P-256
-  public point (65 bytes). The owner signs the message using ECDSA with SHA-256
-  and submits `method:"master", signature:<canonical Base64 DER signature>`.
-  The challenge is single-use on any attempt, expires in 30 seconds, and is
-  replaced by a new challenge. It needs no working vault or app credential.
-
-The firmware contains only the owner fleet public key; the private master key
-stays with the operator. Only devices trusting that public key accept it. No
-universal secret is embedded. Losing both app credential and master key requires
-separately authorized operator recovery; development firmware does not disable
-ROM flashing or burn eFuses.
-
-Authorization is durably marked before returning `{pending:true}`. After the
-response drains, own work/keys are stopped, `og_vault` and `og_cfg` are erased
-and the device restarts unprovisioned. An interrupted authorized reset resumes
-at boot from its marker; unknown/unreadable markers fail closed. Errors never
-report a completed erase. No unrelated NVS namespaces are cleared.
-Legacy mock images still return `E_BUSY` without erasing; they cannot test reset
-authentication and will be removed after real domain replacement.
-
----
-
-## 7. Command Reference
-
-Conventions: **State** lists where the command works ([section 5.1](#51-which-commands-work-in-which-state)). Fields marked ✱ are required.
-
-### 7.1 System (`sys.*`)
-
-#### `sys.hello`
-Handshake. Starts a new session and returns device info. **Call this first after every connect or boot.**
-
-| Arg | Type | Description |
-|---|---|---|
-| `app` | string | App name, for logs |
-| `app_proto` | string | Protocol version the app speaks, for example `"1.0"` |
-
-Result:
-
-| Field | Description |
-|---|---|
-| `device`, `chip`, `device_id` | Board name, chip, base-MAC device ID |
-| `fw` | `{version, build}` |
-| `proto` | Protocol version of the firmware |
-| `state` | `unprovisioned`, `locked` or `unlocked` |
-| `session` | `{device_eph_pub, nonce}` for the next `sec.*` wrap. A new one on every call |
-| `limits` | `{max_line, max_contacts, max_text_bytes, pending_queue}` |
-
-```json
-→ {"id":1,"cmd":"sys.hello","args":{"app":"offgrid-android","app_proto":"1.0"}}
-← {"id":1,"ok":true,"result":{"device":"heltec_wifi_lora_32_v3","chip":"ESP32-S3","device_id":"7CDFA100ABCD","fw":{"version":"0.1.0","build":"2026-10-22"},"proto":"1.0","state":"locked","session":{"device_eph_pub":"3F3+lep6lCFDIkWOsKWMD23g3Q35wH80fqT/H8cS0n4=","nonce":"YGFiY2RlZmdoaWprbG1ubw=="},"limits":{"max_line":2048,"max_contacts":32,"max_text_bytes":83,"pending_queue":8}}}
-```
-
-Errors: `E_PROTO_MISMATCH` (major version differs).
-
-#### `sys.status`
-Runtime snapshot. Works in every state, with fewer fields when not unlocked.
-
-| Result field | Description |
-|---|---|
-| `state`, `uptime_ms`, `reset_reason` | |
-| `heap_free`, `battery_mv` | `battery_mv` is `null` if not measurable |
-| `radio` | `{running, relay_only}` |
-| `queue` | `{pending, capacity}` (unlocked only) |
-| `contacts` | `{used, capacity}` (unlocked only) |
-| `security` | `{secure_boot, flash_encryption}` |
-
-```json
-→ {"id":2,"cmd":"sys.status"}
-← {"id":2,"ok":true,"result":{"state":"unlocked","uptime_ms":482113,"reset_reason":"power_on","heap_free":172304,"battery_mv":4012,"radio":{"running":true,"relay_only":false},"queue":{"pending":0,"capacity":8},"contacts":{"used":1,"capacity":32},"security":{"secure_boot":false,"flash_encryption":false}}}
-```
-
-#### `sys.ping`
-Heartbeat and activity signal. Resets the auto-lock timer.
-
-```json
-→ {"id":3,"cmd":"sys.ping"}
-← {"id":3,"ok":true,"result":{"uptime_ms":487120}}
-```
-
-#### `sys.reboot`
-Sends the response, then restarts. The device comes back `locked`. A `sys.boot` event follows.
-
-#### `sys.factory_reset`
-Authenticated buttonless reset ([section 6.11](#611-factory-reset)).
-Without `"confirm": "ERASE"` it fails with `E_CONFIRM_REQUIRED`. Other failures:
-`E_NO_SESSION`, `E_UNLOCK_FAILED`, `E_RATE_LIMITED`, `E_INTERNAL`.
-
-```json
-→ {"id":4,"cmd":"sys.factory_reset","args":{"confirm":"ERASE","method":"master","signature":"<Base64 DER signature of the fresh challenge>"}}
-← {"id":4,"ok":true,"result":{"pending":true}}
-```
-
-#### `sys.set_log_level`
-| Arg | Description |
-|---|---|
-| `level` ✱ | `off`, `error`, `warn`, `info`, `debug` |
-
-Logs arrive as `log` events and **never contain keys or token material**.
-
----
-
-### 7.2 Security (`sec.*`)
-
-#### `sec.provision`
-**State: unprovisioned.** Sets up the device and locks it to this phone ([section 6.3](#63-provisioning-first-use)).
-
-| Arg | Type | Description |
-|---|---|---|
-| `app_eph_pub` ✱ | base64 | The app's one-time X25519 public key |
-| `wrapped_token` ✱ | base64 | 60-byte wrapped token ([6.5](#65-wrapping-format)) |
-| `name` | string | Display name, max 24 bytes UTF-8. Default `Offgrid-XXXX` |
-
-Result: `{node_id, public_key, name, state}`.
-Errors: `E_ALREADY_PROVISIONED`, `E_NO_SESSION`, `E_UNLOCK_FAILED`, `E_INVALID_ARG`.
-
-#### `sec.unlock`
-**State: locked.** Opens the vault ([section 6.4](#64-unlock-handshake)). Arguments as in `sec.provision`, without `name`.
-
-Result: `{state, node_id, name, contacts, radio: {running, relay_only}}`.
-Errors: `E_NOT_PROVISIONED`, `E_ALREADY_UNLOCKED`, `E_NO_SESSION`, `E_UNLOCK_FAILED`, `E_RATE_LIMITED`.
-
-#### `sec.lock`
-**State: unlocked.** Locks immediately ([section 6.6](#66-lock-triggers)). Result: `{"state": "locked"}`.
-
-#### `sec.rotate_token`
-**State: unlocked.** Replaces the unlock token. The app first calls `sys.hello` for a fresh session, then sends the **new** token wrapped. The device re-encrypts the whole vault under a new `vault_salt` using a safe two-generation write (power loss mid-rotation keeps the old vault valid). Arguments as in `sec.unlock`. Result: `{"rotated": true}`.
-
-#### `sec.get_policy` / `sec.set_policy`
-**State: unlocked.**
-
-| Field | Type | Range | Default | Description |
-|---|---|---|---|---|
-| `lock_timeout_s` | integer | 0 to 3600 | 15 | Auto-lock after this much silence. 0 disables (lab only) |
-
----
-
-### 7.3 Identity (`id.*`)
-
-**State: unlocked.**
-
-#### `id.get`
-Result: `{node_id, public_key, name}`. The private key is never returned.
-
-#### `id.set_name`
-| Arg | Description |
-|---|---|
-| `name` ✱ | Display name, 1 to 24 bytes UTF-8. Used in the next QR code you show |
-
----
-
-### 7.4 Pairing and Contacts (`pair.*`, `contact.*`)
-
-**State: unlocked.** Pairing is the QR key exchange from the protocol spec, done in person.
-
-#### Pairing flow
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant A as Alice's app
-    participant AD as Alice's Heltec
-    participant BD as Bob's Heltec
-    participant B as Bob's app
-
-    A->>AD: pair.begin
-    AD->>A: qr (my public key + fresh salt)
-    B->>BD: pair.begin
-    BD->>B: qr
-    Note over A,B: Alice shows her QR and Bob scans it, then the other way round
-    A->>AD: pair.complete (Bob's QR)
-    Note over AD: Derives shared secret and both direction keys<br/>Stores contact as pending
-    AD->>A: contact (state pending, fingerprint)
-    B->>BD: pair.complete (Alice's QR)
-    BD->>B: contact (state pending, fingerprint)
-    Note over A,B: Both compare the fingerprint on screen (optional)
-    AD-->>A: event contact.state (active) after the first valid packet
-```
-
-#### `pair.begin`
-Creates a fresh random pairing salt, stores it temporarily and returns your QR text.
-
-Result: `{qr, qr_bytes, expires_s}`.
-
-- `qr` is the Base64 of `"OG1" || public_key(32) || salt(16) || name`. **Render this string as the QR code text.**
-- Only one pairing can be pending. A new `pair.begin` replaces the old one.
-- Expires after 300 s.
-- **Do not refresh your QR between being scanned and scanning the other side.** The salt must match what the other device received.
-
-```json
-→ {"id":20,"cmd":"pair.begin"}
-← {"id":20,"ok":true,"result":{"qr":"T0cxLosog8J7ORNZ19DBXQCBWmaTKQo43Y66NBzAfdqo7U0QERITFBUWFxgZGhscHR4fQWxpY2U=","qr_bytes":56,"expires_s":300}}
-```
-
-#### `pair.cancel`
-Discards the pending pairing. Result: `{"cancelled": true}`.
-
-#### `pair.complete`
-Processes the QR text scanned from the other person.
-
-| Arg | Type | Description |
-|---|---|---|
-| `qr` ✱ | string | Scanned text from the peer |
-| `name` | string | Override for the contact name (default: name from the QR) |
-| `replace` | boolean | Re-pair an existing contact: resets counters and replaces keys. Default `false` |
-
-Result: `{contact, warnings}`.
-
-```json
-→ {"id":21,"cmd":"pair.complete","args":{"qr":"T0cxwLEmtaoTS4TmRiUla43olzeHYSsfODnSxgUm0hFOiG0gISIjJCUmJygpKissLS4vQm9i"}}
-← {"id":21,"ok":true,"result":{"contact":{"contact_id":1,"name":"Bob","node_id":"E841","public_key":"wLEmtaoTS4TmRiUla43olzeHYSsfODnSxgUm0hFOiG0=","state":"pending","fingerprint":"0501 3010 7790","tx_ctr":0,"rx_highest_ctr":null,"last_rssi":null,"last_snr":null},"warnings":[]}}
-```
-
-| Warning | Meaning |
-|---|---|
-| `node_id_collision` | Another contact has the same 16-bit node ID. Still works because the tag check disambiguates ([Protocol §11.1](offgrid-protocol.md)) |
-
-Errors: `E_NO_PAIRING`, `E_INVALID_QR`, `E_SELF_PAIR`, `E_CONTACT_EXISTS`, `E_STORAGE_FULL`.
-
-**Fingerprint:** `SHA256("og1-fp" || pub_low || pub_high)`, where the two public keys are sorted bytewise. The first 8 bytes are read as a big-endian number, taken modulo 10¹² and shown as three groups of four digits. Both phones show the same digits when pairing was not tampered with.
-
-#### Contact object
-
-| Field | Description |
-|---|---|
-| `contact_id` | Local slot 1 to 32, stable for the life of the contact |
-| `name`, `node_id`, `public_key` | |
-| `state` | `pending` until the first valid packet from the peer verifies, then `active` |
-| `fingerprint` | See above |
-| `tx_ctr` | Last allocated outgoing counter (informational); 0 before the first packet |
-| `rx_highest_ctr` | Highest verified counter received, `null` if none |
-| `last_rssi`, `last_snr` | From the last valid packet, `null` if none |
-
-Contact keys are **never** part of this object.
-
-#### `contact.list`
-| Arg | Default | Description |
-|---|---|---|
-| `offset` | 0 | |
-| `limit` | 10 | Max 10, so one response stays under the line limit |
-
-Result: `{total, offset, contacts: [...]}`.
-
-#### `contact.get`
-Arg `contact_id` ✱. Result: `{contact}`. Error: `E_NO_SUCH_CONTACT`.
-
-#### `contact.rename`
-Args `contact_id` ✱, `name` ✱ (max 24 bytes).
-
-#### `contact.delete`
-Args `contact_id` ✱, `confirm` ✱ (must be `true`). Securely erases the keys, counters and replay state. Pending messages to this contact fail with reason `contact_deleted`.
-
----
-
-### 7.5 Messages (`msg.*`)
-
-**State: unlocked.** Message types and on-air encoding are defined in [Offgrid Protocol §7 and §8](offgrid-protocol.md).
-
-#### `msg.send`
-
-Common arguments:
-
-| Arg | Type | Description |
-|---|---|---|
-| `to` ✱ | integer | `contact_id` |
-| `type` ✱ | string | `text`, `reaction` or `geo` |
-| `ack` | boolean | Request a receipt. Default from `mesh.ack_default` for this type |
-| `hops` | integer | 0 to 7. Default `mesh.hop_default` |
-
-**Type `text`**
-
-| Arg | Description |
-|---|---|
-| `text` ✱ | UTF-8, at most `limits.max_text_bytes` **bytes** (83 by default). Longer fails with `E_TOO_LONG`, and the app splits it |
-
-**Type `reaction`**
-
-| Arg | Description |
-|---|---|
-| `target` ✱ | `{author, ref}` |
-| `target.author` | `"me"` if the target is a message *I* wrote, `"peer"` if the contact wrote it |
-| `target.ref` | `ctr & 0xFFFF` of the target message (the app knows the full `ctr` from `msg.send` or `msg.received`) |
-| `emoji` ✱ | Emoji from the table in [Protocol Appendix B](offgrid-protocol.md), or `null` to **remove** my reaction |
-
-Mapping to the wire flag `TARGET_OWN` (target written by the *reacting* user): `author: "me"` sets it to 1, `author: "peer"` sets it to 0.
-
-**Type `geo`**
-
-| Arg | Description |
-|---|---|
-| `lat` ✱, `lon` ✱ | Decimal degrees. Encoded in 24 bits each |
-| `alt_m` | Optional altitude in metres |
-| `age_s` | Optional age of the fix in seconds (0 to 2550, rounded to 10 s) |
-
-Result:
-
-| Field | Description |
-|---|---|
-| `msg_ref` | Local handle for status events |
-| `ctr` | Counter assigned to this message (1 to 16777215; the message ID within this conversation) |
-| `ack_requested`, `hops` | Effective values |
-| `state` | Always `queued` here |
-| `bytes_on_air`, `est_airtime_ms` | Size and estimated airtime at the current radio settings |
-
-```json
-→ {"id":30,"cmd":"msg.send","args":{"to":1,"type":"text","text":"Hello!","ack":true}}
-← {"id":30,"ok":true,"result":{"msg_ref":1,"ctr":1,"ack_requested":true,"hops":3,"state":"queued","bytes_on_air":23,"est_airtime_ms":206}}
-```
-
-```json
-→ {"id":31,"cmd":"msg.send","args":{"to":1,"type":"reaction","target":{"author":"peer","ref":1},"emoji":"👍"}}
-→ {"id":32,"cmd":"msg.send","args":{"to":1,"type":"geo","lat":47.0517,"lon":8.3075}}
-```
-
-Errors: `E_NO_SUCH_CONTACT`, `E_TOO_LONG`, `E_QUEUE_FULL`, `E_INVALID_ARG`, `E_LOCKED`.
-
-The pending queue lives in RAM only, so after a reboot unfinished messages are gone. The app treats everything still pending at `sys.boot` as failed.
-
-The real firmware queues domain events independently of host output (32 events)
-and never delays RF/replay progress waiting for serial space. Prolonged host
-backpressure can lose events; `sys.status.queue.dropped_events` and
-`radio.stats.dropped_events` count this, with an explicit error after space
-returns. `dropped_acks` and `radio_dropped_events` expose ACK/radio event loss.
-This is not a persistent inbox or store-and-forward implementation.
-
-#### `msg.cancel`
-Arg `msg_ref` ✱. Stops sending and retrying. A packet that has already been transmitted cannot be unsent. Result: `{"state": "cancelled"}`, then a `msg.status` event.
-
-#### `msg.pending`
-Result: `{pending: [{msg_ref, to, type, ctr, state, retry}]}`.
-
-#### Message status values
-
-| `state` | Meaning | UI |
-|---|---|---|
-| `queued` | Waiting for channel access | ⏳ |
-| `sent` | Transmitted | ✓ |
-| `relayed` | A neighbour was heard repeating it (implicit first-hop confirmation) | ✓ |
-| `retrying` | No ACK yet, retransmitting (`retry` 1 to 3) | ✓ |
-| `delivered` | End-to-end ACK verified | ✓✓ |
-| `failed` | Gave up. `reason` is `timeout`, `locked`, `contact_deleted` or `radio_error` | ✗ |
-| `cancelled` | Cancelled by `msg.cancel` | |
-
----
-
-### 7.6 Radio (`radio.*`)
-
-#### Radio configuration
-
-| Field | Type | Range | Default | Description |
-|---|---|---|---|---|
-| `freq_mhz` | number | 150.0 to 960.0 | 869.525 | Carrier frequency. Match your board's antenna band |
-| `bw_khz` | number | 62.5, 125, 250, 500 | 125 | Bandwidth |
-| `sf` | integer | 5 to 12 | 9 | Spreading factor. Higher means longer range and much longer airtime |
-| `cr` | integer | 5 to 8 | 5 | Coding rate 4/5 to 4/8 |
-| `tx_power_dbm` | integer | -9 to 22 | 14 | Output power at the SX1262 |
-| `preamble` | integer | 6 to 64 | 8 | Preamble symbols |
-| `sync_word` | integer | 0 to 255 | 79 (`0x4F`) | Private network filter. Avoid 18 (`0x12`) and 52 (`0x34`) |
-| `preset` | string | see below | none | Set-only shortcut that fills the fields above |
-
-On the SX1262 the one-byte sync word is expanded to the chip's two-byte register by turning each nibble `n` into `(n << 4) | 0x4`, so `0x12` becomes `0x1424` and `0x4F` becomes `0x44F4`.
-
-All nodes in a mesh must share frequency, bandwidth, SF, CR, preamble and sync word.
-
-| Preset | Settings | Airtime for 23 B |
-|---|---|---|
-| `lab_default` | SF9, BW125, CR4/5, 14 dBm, 869.525 MHz | ca. 206 ms |
-| `fast` | SF7, BW250 | ca. 31 ms |
-| `long_range` | SF11, BW125 | ca. 823 ms |
-
-#### `radio.get`
-Works in every state. Result: the configuration above, plus `est_airtime_ms_23b` and `max_text_bytes`.
-
-#### `radio.set`
-**State: unlocked.** Accepts any subset of the configuration plus `persist`. Changes are applied after the current transmission finishes.
-
-Result: full configuration, `est_airtime_ms_23b`, `warnings`.
-
-| Warning | Meaning |
-|---|---|
-| `outside_eu868` | Frequency outside 863 to 870 MHz |
-| `above_eu868_power_limit` | `tx_power_dbm` above 14 |
-| `reserved_sync_word` | Sync word 0x12 or 0x34 collides with LoRaWAN |
-| `mesh_incompatible` | Reminder that other nodes must be changed to match |
-
-Warnings never block the change (this is a lab tool). Duty cycle is not enforced ([Protocol §4](offgrid-protocol.md)).
-
-```json
-→ {"id":40,"cmd":"radio.set","args":{"sf":10,"tx_power_dbm":17}}
-← {"id":40,"ok":true,"result":{"freq_mhz":869.525,"bw_khz":125,"sf":10,"cr":5,"tx_power_dbm":17,"preamble":8,"sync_word":79,"est_airtime_ms_23b":371,"max_text_bytes":83,"warnings":["above_eu868_power_limit","mesh_incompatible"]}}
-```
-
-#### `radio.stats`
-**State: unlocked.** Optional arg `reset` (boolean) clears the counters after reading.
-
-| Counter | Meaning |
-|---|---|
-| `tx_packets`, `rx_packets` | Packets sent and received at PHY level |
-| `rx_crc_errors` | PHY CRC failures |
-| `rx_tag_failures` | Packets addressed to me whose tag did not verify |
-| `rx_dedupe_drops` | Duplicates dropped |
-| `relayed`, `relay_suppressed` | Packets forwarded and forwards cancelled because a neighbour was faster |
-| `acks_sent`, `acks_received`, `retries` | |
-| `tx_airtime_ms_total` | Accumulated transmit time since boot or reset |
-| `last_rssi`, `last_snr` | |
-
----
-
-### 7.7 Mesh (`mesh.*`)
-
-Tunables of the relaying and retry behaviour from the protocol spec.
-
-| Field | Type | Range | Default | Description |
-|---|---|---|---|---|
-| `hop_default` | integer | 0 to 7 | 3 | `HOP_START` for my own packets |
-| `relay_enabled` | boolean | | true | Forward other nodes' packets |
-| `relay_when_locked` | boolean | | false | Keep relaying (keyless) while locked. Off means the radio is fully off when locked |
-| `cad_enabled` | boolean | | true | Listen before talk. Keep on, even in the lab |
-| `backoff_slots` | integer | 0 to 32 | 8 | Random backoff window before relaying |
-| `retries` | integer | 0 to 3 | 3 | Retransmissions of unacknowledged messages |
-| `retry_base_ms` | integer | 0 to 60000 | 0 | Base retry timeout. 0 means automatic from airtime and hop count |
-| `rate_limit_per_src` | integer | 0 to 255 | 20 | Max relayed packets per source per minute. 0 disables |
-| `ack_default` | object | | `{text:true, reaction:false, geo:false}` | Default `ack` per type |
-
-#### `mesh.get`
-Works in every state. Result: the table above.
-
-#### `mesh.set`
-**State: unlocked.** Any subset plus `persist`. Result: full configuration.
-
-```json
-→ {"id":50,"cmd":"mesh.set","args":{"hop_default":5,"ack_default":{"geo":true}}}
-```
-
----
-
-### 7.8 LED (`led.*`)
-
-The V3 has one user LED (GPIO35 on the V3, verify against your board revision), driven by PWM so brightness works. The display is not covered in v1.
-
-#### LED configuration
-
-| Field | Type | Default | Description |
-|---|---|---|---|
-| `enabled` | boolean | true | Master switch |
-| `quiet` | boolean | false | Stealth mode, the LED never lights |
-| `brightness` | integer 0 to 255 | 128 | PWM duty |
-| `state_patterns` | object | see below | Pattern that **loops** while the device is in a state |
-| `event_patterns` | object | see below | Pattern played **once** on top of the state pattern when an event happens |
-
-State keys: `unprovisioned`, `locked`, `unlocked`.
-Event keys: `tx`, `rx`, `msg_received`, `delivered`, `failed`, `error`, `pairing`.
-
-| Key | Default |
-|---|---|
-| `state_patterns.unprovisioned` | `"pulse"` |
-| `state_patterns.locked` | `"blink_slow"` |
-| `state_patterns.unlocked` | `"off"` |
-| `event_patterns.tx` | `"flash"` |
-| `event_patterns.rx` | `"flash"` |
-| `event_patterns.msg_received` | `"double"` |
-| `event_patterns.delivered` | `"off"` |
-| `event_patterns.failed` | `{"steps":[100,100],"repeat":3}` |
-| `event_patterns.error` | `"blink_fast"` |
-| `event_patterns.pairing` | `"heartbeat"` |
-
-#### Patterns
-
-A pattern is a **name** or a **custom object**.
-
-| Name | Steps (ms, alternating on, off) | Notes |
-|---|---|---|
-| `off` | none | |
-| `on` | none | Steady on |
-| `flash` | `[60]` | Single short pulse |
-| `blink_slow` | `[500, 500]` | |
-| `blink_fast` | `[100, 100]` | |
-| `double` | `[80, 80, 80, 760]` | Two short blinks |
-| `heartbeat` | `[100, 150, 100, 650]` | |
-| `pulse` | smooth fade, 1.5 s | PWM ramp up and down |
-
-On this hardware, the same monochrome level also drives two owner-confirmed
-four-pixel GRB 800 kHz NeoPixel strips on GPIO45 and GPIO46. `enabled`, `quiet`
-and brightness cover all outputs. For finite event/preview repetitions, `on`
-and `off` each occupy 1000 ms (owner-approved); state versions remain steady.
-
-Custom: `{"steps": [on_ms, off_ms, ...], "repeat": N}`. Up to 16 entries of 10 to 10000 ms each. `repeat` applies to event patterns (default 1). State patterns always loop.
-
-An event pattern temporarily overrides the state pattern, which then resumes.
-
-#### `led.get`
-Works in every state. Result: the configuration, plus `builtin_patterns`.
-
-#### `led.set`
-**State: unlocked.** Any subset plus `persist`. Nested objects merge, so setting one pattern leaves the others alone. Result: the full configuration.
-
-```json
-→ {"id":60,"cmd":"led.set","args":{"brightness":40,"state_patterns":{"locked":{"steps":[50,1950]}},"event_patterns":{"msg_received":{"steps":[200,100,200],"repeat":2}}}}
-```
-
-#### `led.test`
-**State: unlocked.** Plays a pattern once for preview, without changing the stored configuration.
-
-| Arg | Description |
-|---|---|
-| `pattern` ✱ | Name or custom object |
-| `repeat` | Number of plays, default 1 |
-
----
-
-### 7.9 Debug (`dbg.*`)
-
-Lab helper, compiled out of release builds.
-
-#### `dbg.rf_trace`
-**State: unlocked.** Arg `enabled` ✱ (boolean). When on, every packet at the radio produces an `rf.tx` or `rf.rx` event with the raw bytes (see [section 8](#8-event-reference)). Raw packets are ciphertext, so no secrets leak. This lets you compare on-air bytes with the worked example in the protocol spec.
-
----
-
-## 8. Event Reference
-
-Events are never answered. Every event carries `t`, the uptime in milliseconds.
-
-| Event | When | Needs state |
-|---|---|---|
-| `sys.boot` | After every start, and once on connect if the device is already running | any |
-| `sec.state` | The state changed | any |
-| `msg.received` | A message arrived and verified | unlocked |
-| `msg.status` | A pending message changed state | unlocked |
-| `contact.state` | A contact became `active` | unlocked |
-| `rf.tx`, `rf.rx` | Raw packet trace, only with `dbg.rf_trace` | unlocked |
-| `log` | Log line | any |
-| `error` | Unsolicited error (for example a line that was too long) | any |
-
-### `sys.boot`
-```json
-{"evt":"sys.boot","t":412,"data":{"device_id":"7CDFA100ABCD","fw":"0.1.0","proto":"1.0","state":"locked","reset_reason":"power_on"}}
-```
-
-### `sec.state`
-```json
-{"evt":"sec.state","t":3120,"data":{"state":"unlocked","reason":"unlock"}}
-{"evt":"sec.state","t":96120,"data":{"state":"locked","reason":"heartbeat_timeout"}}
-```
-`reason`: `unlock`, `provision`, `lock`, `heartbeat_timeout`, `factory_reset`.
-
-### `msg.received`
-
-Common fields: `from` (contact_id), `type`, `ctr`, `hops` (hops travelled), `retry`, `rssi`, `snr`. A duplicate caused by a retransmission is **not** delivered again, the device only re-sends the ACK.
-
-**Text**
-```json
-{"evt":"msg.received","t":152340,"data":{"from":1,"type":"text","ctr":1,"text":"Hello!","hops":1,"retry":0,"rssi":-92,"snr":7.5}}
-```
-
-**Reaction** (`target.author` is from *my* point of view)
-```json
-{"evt":"msg.received","t":160210,"data":{"from":1,"type":"reaction","ctr":2,"target":{"author":"me","ref":1},"emoji":"👍","hops":0,"retry":0,"rssi":-71,"snr":9.0}}
-```
-`emoji` is `null` when the contact removed their reaction.
-
-**Geo**
-```json
-{"evt":"msg.received","t":171800,"data":{"from":1,"type":"geo","ctr":2,"lat":47.05169,"lon":8.30751,"alt_m":null,"age_s":null,"hops":1,"retry":0,"rssi":-95,"snr":5.0}}
-```
-
-### `msg.status`
-```json
-{"evt":"msg.status","t":2210,"data":{"msg_ref":1,"to":1,"state":"sent","retry":0}}
-{"evt":"msg.status","t":2420,"data":{"msg_ref":1,"to":1,"state":"relayed","retry":0}}
-{"evt":"msg.status","t":3052,"data":{"msg_ref":1,"to":1,"state":"delivered","retry":0,"hops":1,"rtt_ms":842}}
-{"evt":"msg.status","t":40130,"data":{"msg_ref":2,"to":1,"state":"failed","retry":3,"reason":"timeout"}}
-```
-
-### `contact.state`
-```json
-{"evt":"contact.state","t":9120,"data":{"contact_id":1,"state":"active"}}
-```
-
-### `rf.tx` and `rf.rx`
-```json
-{"evt":"rf.tx","t":2210,"data":{"len":23,"hex":"6CE841E3F00000015D1D3FD92A3E04DA794024DB76ADBC","airtime_ms":206}}
-{"evt":"rf.rx","t":3052,"data":{"len":16,"hex":"48E3F0E8410000017F15646B08384B1D","rssi":-90,"snr":6.5,"action":"ack_matched"}}
-```
-`action` values: `delivered`, `ack_matched`, `relayed`, `dropped_duplicate`, `dropped_tag`, `dropped_hop_limit`, `dropped_rate_limit`.
-
-### `log` and `error`
-```json
-{"evt":"log","t":1200,"data":{"level":"info","msg":"radio started 869.525 MHz SF9"}}
-{"evt":"error","t":5000,"data":{"code":"E_LINE_TOO_LONG","message":"line exceeded 2048 bytes and was dropped"}}
-```
-
----
-
-## 9. Error Codes
-
-| Code | Meaning |
-|---|---|
-| `E_PARSE` | Line is not valid JSON |
-| `E_LINE_TOO_LONG` | Line exceeded 2048 bytes |
-| `E_UNKNOWN_CMD` | No such command |
-| `E_INVALID_ARG` | Missing, mistyped or out-of-range argument (`field` says which) |
-| `E_PROTO_MISMATCH` | Incompatible major protocol version |
-| `E_LOCKED` | Command needs the device unlocked |
-| `E_NOT_PROVISIONED` | Device has no vault yet |
-| `E_ALREADY_PROVISIONED` | Device already has a vault |
-| `E_ALREADY_UNLOCKED` | Already unlocked |
-| `E_NO_SESSION` | No unconsumed `sys.hello` session, call `sys.hello` again |
-| `E_UNLOCK_FAILED` | Wrong token, wrong device or corrupted envelope (deliberately indistinguishable) |
-| `E_RATE_LIMITED` | Too many failed unlocks, wait and retry |
-| `E_CONFIRM_REQUIRED` | Dangerous command missing its confirmation |
-| `E_NO_PAIRING` | `pair.complete` without an active `pair.begin` |
-| `E_INVALID_QR` | QR text has bad Base64, wrong magic or wrong length |
-| `E_SELF_PAIR` | The QR contains my own public key |
-| `E_CONTACT_EXISTS` | Public key already paired, use `replace: true` |
-| `E_NO_SUCH_CONTACT` | Unknown `contact_id` |
-| `E_STORAGE_FULL` | Contact slots or flash exhausted |
-| `E_TOO_LONG` | Text exceeds the maximum size |
-| `E_QUEUE_FULL` | Pending queue is full |
-| `E_BUSY` | Operation cannot run right now |
-| `E_RADIO` | Radio hardware error |
-| `E_INTERNAL` | Unexpected firmware error |
-
----
-
-## 10. On-Device Storage
-
-Two areas in flash (NVS):
-
-| Area | Content | Protection |
-|---|---|---|
-| `og_cfg` | Radio, mesh, LED configuration, policy, `vault_salt`, vault generation number | **Plaintext**, nothing secret. Radio settings stay readable so a locked relay-only node still works |
-| `og_vault` | Identity key, contact slots, counters, check blob | Every entry AES-256-GCM under `vault_key`, `aad = namespace \|\| key \|\| generation` |
-
-### Vault entries
-
-| Entry | Content |
-|---|---|
-| `identity` | X25519 private key (32 B), display name |
-| `contact/1` … `contact/32` | Public key, name, `k_out` (16 B), `k_in` (16 B), TX counter reservation, replay window state, state flag |
-| `check` | Known string, used to verify an unlock |
-
-Each contact is a separate entry, so frequent counter updates only rewrite a few bytes.
-
-### Counter persistence
-
-Matches the rules in [Offgrid Protocol §6 and §9.3](offgrid-protocol.md):
-
-| Counter | Write rule |
-|---|---|
-| TX counter | Reserve `ctr + 256` before use. On unlock, resume from the reserved value |
-| Replay `highest_ctr` | Persist about every 16 received messages |
-
-Writes happen only while unlocked, because only then is the `vault_key` in RAM.
-
----
-
-## 11. Session Examples
-
-`→` is app to device and `←` is device to app. Every JSON line below is valid JSON. Cryptographic values are real output of the reference code in [Appendix B](#appendix-b-unlock-reference-code-python) and are **test vectors only**.
-
-### 11.1 First-time setup (provisioning)
-
-Test inputs: `device_id` = `7CDFA100ABCD`, `K_phone` = `b16d81c53a827d203b069dc197f382b07fadfb4b93ca0123051a3201da825185`.
-
-```
-Derived on the phone:
-  token       = HMAC-SHA256(K_phone, "og-unlock-v1" || device_id bytes)
-              = 40ed8815502a8e2c1bf211f072b6b881857e1735f77107f9dc828ef9d451ebe0
-  app ephemeral public key       = eVqh8pkoQ2JZydkefYsuR1PE3/Qy12/DzPg2jWPBaSk=
-  wrapped_token (60 bytes)       = cHFyc3R1dnd4eXp73iix4tUwvI3SCLdQkDcf6Ipj4SeWMvHCxsuoTYQbFZG8FDO6Y7fb7GfNujVODYXb
-```
-
-```json
-← {"evt":"sys.boot","t":401,"data":{"device_id":"7CDFA100ABCD","fw":"0.1.0","proto":"1.0","state":"unprovisioned","reset_reason":"power_on"}}
-→ {"id":1,"cmd":"sys.hello","args":{"app":"offgrid-android","app_proto":"1.0"}}
-← {"id":1,"ok":true,"result":{"device":"heltec_wifi_lora_32_v3","chip":"ESP32-S3","device_id":"7CDFA100ABCD","fw":{"version":"0.1.0","build":"2026-10-22"},"proto":"1.0","state":"unprovisioned","session":{"device_eph_pub":"3F3+lep6lCFDIkWOsKWMD23g3Q35wH80fqT/H8cS0n4=","nonce":"YGFiY2RlZmdoaWprbG1ubw=="},"limits":{"max_line":2048,"max_contacts":32,"max_text_bytes":83,"pending_queue":8}}}
-→ {"id":2,"cmd":"sec.provision","args":{"app_eph_pub":"eVqh8pkoQ2JZydkefYsuR1PE3/Qy12/DzPg2jWPBaSk=","wrapped_token":"cHFyc3R1dnd4eXp73iix4tUwvI3SCLdQkDcf6Ipj4SeWMvHCxsuoTYQbFZG8FDO6Y7fb7GfNujVODYXb","name":"Alice"}}
-← {"id":2,"ok":true,"result":{"node_id":"E3F0","public_key":"Losog8J7ORNZ19DBXQCBWmaTKQo43Y66NBzAfdqo7U0=","name":"Alice","state":"unlocked"}}
-← {"evt":"sec.state","t":1630,"data":{"state":"unlocked","reason":"provision"}}
-```
-
-(The device normally generates a random identity key. `public_key` here is the fixed test key from the protocol spec's worked example.)
-
-### 11.2 Normal boot and unlock
-
-```json
-← {"evt":"sys.boot","t":398,"data":{"device_id":"7CDFA100ABCD","fw":"0.1.0","proto":"1.0","state":"locked","reset_reason":"power_on"}}
-→ {"id":1,"cmd":"sys.hello","args":{"app":"offgrid-android","app_proto":"1.0"}}
-← {"id":1,"ok":true,"result":{"device":"heltec_wifi_lora_32_v3","chip":"ESP32-S3","device_id":"7CDFA100ABCD","fw":{"version":"0.1.0","build":"2026-10-22"},"proto":"1.0","state":"locked","session":{"device_eph_pub":"3F3+lep6lCFDIkWOsKWMD23g3Q35wH80fqT/H8cS0n4=","nonce":"YGFiY2RlZmdoaWprbG1ubw=="},"limits":{"max_line":2048,"max_contacts":32,"max_text_bytes":83,"pending_queue":8}}}
-→ {"id":2,"cmd":"sec.unlock","args":{"app_eph_pub":"eVqh8pkoQ2JZydkefYsuR1PE3/Qy12/DzPg2jWPBaSk=","wrapped_token":"cHFyc3R1dnd4eXp73iix4tUwvI3SCLdQkDcf6Ipj4SeWMvHCxsuoTYQbFZG8FDO6Y7fb7GfNujVODYXb"}}
-← {"id":2,"ok":true,"result":{"state":"unlocked","node_id":"E3F0","name":"Alice","contacts":1,"radio":{"running":true,"relay_only":false}}}
-← {"evt":"sec.state","t":1415,"data":{"state":"unlocked","reason":"unlock"}}
-→ {"id":3,"cmd":"sys.ping"}
-← {"id":3,"ok":true,"result":{"uptime_ms":6420}}
-```
-
-A wrong token, for instance from another phone:
-
-```json
-→ {"id":2,"cmd":"sec.unlock","args":{"app_eph_pub":"eVqh8pkoQ2JZydkefYsuR1PE3/Qy12/DzPg2jWPBaSk=","wrapped_token":"cHFyc3R1dnd4eXp7AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}
-← {"id":2,"ok":false,"error":{"code":"E_UNLOCK_FAILED","message":"unlock failed"}}
-```
-
-### 11.3 Pairing and the first message
-
-Alice's side (contact `1` is Bob):
-
-```json
-→ {"id":10,"cmd":"pair.begin"}
-← {"id":10,"ok":true,"result":{"qr":"T0cxLosog8J7ORNZ19DBXQCBWmaTKQo43Y66NBzAfdqo7U0QERITFBUWFxgZGhscHR4fQWxpY2U=","qr_bytes":56,"expires_s":300}}
-→ {"id":11,"cmd":"pair.complete","args":{"qr":"T0cxwLEmtaoTS4TmRiUla43olzeHYSsfODnSxgUm0hFOiG0gISIjJCUmJygpKissLS4vQm9i"}}
-← {"id":11,"ok":true,"result":{"contact":{"contact_id":1,"name":"Bob","node_id":"E841","public_key":"wLEmtaoTS4TmRiUla43olzeHYSsfODnSxgUm0hFOiG0=","state":"pending","fingerprint":"0501 3010 7790","tx_ctr":0,"rx_highest_ctr":null,"last_rssi":null,"last_snr":null},"warnings":[]}}
-→ {"id":12,"cmd":"dbg.rf_trace","args":{"enabled":true}}
-← {"id":12,"ok":true,"result":{"enabled":true}}
-→ {"id":13,"cmd":"msg.send","args":{"to":1,"type":"text","text":"Hello!","ack":true}}
-← {"id":13,"ok":true,"result":{"msg_ref":1,"ctr":1,"ack_requested":true,"hops":3,"state":"queued","bytes_on_air":23,"est_airtime_ms":206}}
-← {"evt":"rf.tx","t":2210,"data":{"len":23,"hex":"6CE841E3F00000015D1D3FD92A3E04DA794024DB76ADBC","airtime_ms":206}}
-← {"evt":"msg.status","t":2210,"data":{"msg_ref":1,"to":1,"state":"sent","retry":0}}
-← {"evt":"msg.status","t":2420,"data":{"msg_ref":1,"to":1,"state":"relayed","retry":0}}
-← {"evt":"rf.rx","t":3052,"data":{"len":16,"hex":"48E3F0E8410000017F15646B08384B1D","rssi":-90,"snr":6.5,"action":"ack_matched"}}
-← {"evt":"msg.status","t":3052,"data":{"msg_ref":1,"to":1,"state":"delivered","retry":0,"hops":1,"rtt_ms":842}}
-```
-
-The `hex` strings are exactly the 23-byte text packet and 16-byte ACK from the [protocol spec's worked example (§15)](offgrid-protocol.md).
-
-### 11.4 Receiving a message (Bob's device)
-
-```json
-← {"evt":"rf.rx","t":152340,"data":{"len":23,"hex":"68E841E3F00000015D1D3FD92A3E04DA794024DB76ADBC","rssi":-92,"snr":7.5,"action":"delivered"}}
-← {"evt":"msg.received","t":152340,"data":{"from":1,"type":"text","ctr":1,"text":"Hello!","hops":1,"retry":0,"rssi":-92,"snr":7.5}}
-← {"evt":"contact.state","t":152341,"data":{"contact_id":1,"state":"active"}}
-← {"evt":"rf.tx","t":152560,"data":{"len":16,"hex":"48E3F0E8410000017F15646B08384B1D","airtime_ms":165}}
-```
-
-The first byte is `68` here because one relay already decremented `HOP_LEFT` from 3 to 2.
-
-### 11.5 Changing the radio and the LED
-
-```json
-→ {"id":40,"cmd":"radio.set","args":{"preset":"fast"}}
-→ {"id":41,"cmd":"mesh.set","args":{"relay_when_locked":true}}
-→ {"id":42,"cmd":"led.set","args":{"brightness":40,"event_patterns":{"msg_received":{"steps":[200,100,200],"repeat":2}}}}
-→ {"id":43,"cmd":"led.test","args":{"pattern":"heartbeat","repeat":3}}
-```
-
-### 11.6 Auto-lock
-
-```json
-← {"evt":"sec.state","t":96120,"data":{"state":"locked","reason":"heartbeat_timeout"}}
-← {"evt":"msg.status","t":96120,"data":{"msg_ref":5,"to":1,"state":"failed","retry":1,"reason":"locked"}}
-→ {"id":9,"cmd":"msg.send","args":{"to":1,"type":"text","text":"hi"}}
-← {"id":9,"ok":false,"error":{"code":"E_LOCKED","message":"device is locked, call sec.unlock"}}
-```
-
----
-
-## 12. Limits and Constants
-
-| Constant | Value |
-|---|---|
-| Protocol version | `1.0` |
-| Serial | 115200 baud default, 8N1 |
-| Max line length | 2048 bytes |
-| Max requests in flight | 4 |
-| Max contacts | 32 |
-| Pending message queue | 8 (RAM only) |
-| Max text size | 83 bytes at the default packet cap (100 bytes total) |
-| Name length | 24 bytes UTF-8 |
-| Contact list page size | 10 |
-| Heartbeat | App pings every 5 s |
-| Default `lock_timeout_s` | 15 s |
-| Pairing expiry | 300 s |
-| Factory reset | Fresh app-token proof or owner signature; master challenge expires in 30 s |
-| Unlock failure delay | 2 s, doubling, max 60 s, after 3 failures |
-| Unlock token | 32 bytes |
-| Wrapped token | 60 bytes (12 IV + 32 ciphertext + 16 tag) |
-| Vault cipher | AES-256-GCM |
-| Wrap HKDF label | `"og-unlock-wrap-v1"` |
-| Vault HKDF label | `"og-vault-v1"` |
-| Token HMAC label | `"og-unlock-v1"` |
-| Fingerprint label | `"og1-fp"` |
-
----
-
-## 13. Limitations and Future Work
-
-| Limitation | Note |
-|---|---|
-| Active man-in-the-middle on the cable at unlock | Add a device attestation key, pinned at provisioning |
-| No recovery if the phone's Keystore key is lost | Possible: encrypted recovery blob under a user passphrase or recovery words |
-| Pending queue lost on reboot | Could persist, at the cost of storing plaintext or re-encrypting |
-| One phone per device | Multi-phone support needs several wrapped tokens per vault |
-| Duty cycle not enforced | Add airtime accounting and an `E_DUTY_CYCLE` error before real deployment |
-| Display (OLED) not covered | Future `display.*` namespace |
-| USB only | The same framing works over BLE UART |
-| No firmware update over this link | Future `sys.ota_*` commands, signed images |
-| Group chats | Out of scope until the protocol supports them |
-
----
-
-## Appendix A: Android Token Derivation (Kotlin Sketch)
-
-A sketch for orientation, not compiled. The key point is that `K_phone` is generated **inside** the Keystore and the app can only ask the Keystore to compute an HMAC with it, never read it.
-
-```kotlin
-// One-time: create a non-exportable HMAC key inside the Android Keystore
-val kg = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_HMAC_SHA256, "AndroidKeyStore")
-kg.init(
-    KeyGenParameterSpec.Builder("offgrid_unlock", KeyProperties.PURPOSE_SIGN)
-        // optional hardening: require biometric or screen lock, StrongBox backing
-        .build()
-)
-kg.generateKey()
-
-// Every unlock: derive the per-device token
-fun unlockToken(deviceIdHex: String): ByteArray {
-    val ks = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
-    val key = ks.getKey("offgrid_unlock", null) as SecretKey
-    val mac = Mac.getInstance("HmacSHA256").apply { init(key) }
-    mac.update("og-unlock-v1".toByteArray(Charsets.US_ASCII))
-    mac.update(deviceIdHex.chunked(2).map { it.toInt(16).toByte() }.toByteArray())
-    return mac.doFinal()
-}
-```
-
-Then wrap the token as in [section 6.5](#65-wrapping-format). X25519 is available through the platform provider on newer Android versions or through a library such as libsodium or Tink on older ones.
-
-Requiring user authentication on the Keystore key means that **the phone must be unlocked (or the user must authenticate) before the Heltec can be unlocked**, which ties the radio to the person as well as the phone.
-
----
-
-## Appendix B: Unlock Reference Code (Python)
-
-Requires `pip install cryptography`. Reproduces the vectors in [section 11](#11-session-examples).
+| All `sys.*` commands | Any; factory reset additionally requires authorization |
+| `radio.get`, `mesh.get`, `led.get` | Any |
+| `sec.provision` | `unprovisioned` |
+| `sec.unlock` | `locked` |
+| `sec.lock`, `sec.rotate_token`, `sec.get_policy`, `sec.set_policy` | `unlocked` |
+| `id.*`, `pair.*`, `contact.*`, `msg.*` | `unlocked` |
+| `radio.set`, `radio.stats`, `mesh.set`, `led.set`, `led.test` | `unlocked` |
+
+### Token wrapping
+
+Keep a stable, secret **32-byte token T per device** available only to the
+registered app. Android should protect or derive it using Keystore-backed
+material. The firmware does not prescribe the phone's token derivation; it needs
+the same 32 bytes at provisioning and each later unlock.
+
+1. Call `sys.hello` and decode `session.device_eph_pub` (32 bytes) and
+   `session.nonce` (16 bytes).
+2. Generate a fresh app X25519 key pair. Compute the shared secret with the
+   device's ephemeral public key.
+3. Decode the 12-hex-digit `device_id` as **six bytes in the displayed order**.
+4. Derive `K = HKDF-SHA256(shared, salt=nonce,
+   info=ASCII("og-unlock-wrap-v1") || device_id_bytes, length=32)`.
+5. Generate a fresh 12-byte IV. AES-256-GCM encrypt T with K, that IV, and
+   `AAD=device_id_bytes`. Append the 16-byte GCM tag to the 32-byte ciphertext.
+6. Send Base64 of the app's raw 32-byte ephemeral public key as `app_eph_pub`;
+   send Base64 of `IV || ciphertext || tag` (60 bytes) as `wrapped_token`.
+
+Every `sys.hello` replaces the previous ephemeral session. Every authentication
+attempt consumes it, including malformed, failed, rate-limited or wrong-state
+attempts. Obtain a **fresh hello and app ephemeral pair before every attempt**.
+Do not log the token, derived keys or wrapped credential.
+
+Working Python wrapping example (`cryptography`), independent of serial I/O:
 
 ```python
-import hashlib, hmac, os
-from cryptography.hazmat.primitives import hashes
+import base64
+import os
+from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
-
-def unlock_token(k_phone: bytes, device_id: bytes) -> bytes:
-    """Phone side. In the real app this HMAC runs inside the Android Keystore."""
-    return hmac.new(k_phone, b"og-unlock-v1" + device_id, hashlib.sha256).digest()
-
-
-def vault_key(token: bytes, vault_salt: bytes) -> bytes:
-    """Device side. Key that encrypts every vault entry in flash."""
-    return HKDF(hashes.SHA256(), 32, vault_salt, b"og-vault-v1").derive(token)
-
-
-def wrap_key(shared: bytes, nonce: bytes, device_id: bytes) -> bytes:
-    return HKDF(hashes.SHA256(), 32, nonce, b"og-unlock-wrap-v1" + device_id).derive(shared)
-
-
-def wrap_token(app_eph_sk, dev_eph_pub: bytes, nonce: bytes, device_id: bytes, token: bytes, iv: bytes = None):
-    """Phone side. Returns iv(12) || ciphertext(32) || tag(16) = 60 bytes."""
-    iv = iv or os.urandom(12)
-    shared = app_eph_sk.exchange(X25519PublicKey.from_public_bytes(dev_eph_pub))
-    return iv + AESGCM(wrap_key(shared, nonce, device_id)).encrypt(iv, token, device_id)
-
-
-def unwrap_token(dev_eph_sk, app_eph_pub: bytes, nonce: bytes, device_id: bytes, wrapped: bytes) -> bytes:
-    """Device side. Raises InvalidTag if the token was wrapped for another session or device."""
-    shared = dev_eph_sk.exchange(X25519PublicKey.from_public_bytes(app_eph_pub))
-    return AESGCM(wrap_key(shared, nonce, device_id)).decrypt(wrapped[:12], wrapped[12:], device_id)
+def wrap_token(hello, token, *, reset=False):
+    if len(token) != 32 or hello.get("mock") is not False:
+        raise ValueError("expected a 32-byte token and real secure firmware")
+    private = X25519PrivateKey.generate()
+    public = private.public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    peer = X25519PublicKey.from_public_bytes(
+        base64.b64decode(hello["session"]["device_eph_pub"], validate=True))
+    nonce = base64.b64decode(hello["session"]["nonce"], validate=True)
+    device_id = bytes.fromhex(hello["device_id"])
+    label = b"og-reset-wrap-v1" if reset else b"og-unlock-wrap-v1"
+    key = HKDF(algorithm=hashes.SHA256(), length=32, salt=nonce,
+               info=label + device_id).derive(private.exchange(peer))
+    iv = os.urandom(12)
+    wrapped = iv + AESGCM(key).encrypt(iv, token, device_id)
+    return {"app_eph_pub": base64.b64encode(public).decode("ascii"),
+            "wrapped_token": base64.b64encode(wrapped).decode("ascii")}
 ```
 
-Usage sketch:
+This code does not store the token. Keep credentials outside the repository.
+The shipped checker uses private 0600 files for synthetic test identities; that
+is not an Android Keystore implementation.
 
-```python
-import hashlib, base64
-from og_host_ref import *
-from cryptography.hazmat.primitives import serialization
-RAW = dict(encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw)
+### Heartbeat and lock
 
-device_id = bytes.fromhex("7CDFA100ABCD")
-k_phone   = hashlib.sha256(b"android-keystore-demo-key").digest()
-token     = unlock_token(k_phone, device_id)
+Send `sys.ping` about once per second while the app is active, including while
+waiting for channel access, airtime cooldown or receipts. The default inactivity
+timeout is 15 seconds. Handled commands count as activity; radio traffic alone
+does not. Cable removal is detected by inactivity, not an immediate GPIO event.
 
-dev_sk = X25519PrivateKey.from_private_bytes(hashlib.sha256(b"device-eph").digest())
-app_sk = X25519PrivateKey.from_private_bytes(hashlib.sha256(b"app-eph").digest())
-nonce  = bytes(range(0x60, 0x70)); iv = bytes(range(0x70, 0x7C))
+Lock cancels pairing and own-message work and clears identity/contact keys and
+queued plaintext. It disables RF unless opt-in keyless locked relaying is enabled.
+Pending messages/history are not persisted. A new boot invalidates old `msg_ref`
+handles; the app must reconcile its own history.
 
-dev_pub = dev_sk.public_key().public_bytes(**RAW)
-app_pub = app_sk.public_key().public_bytes(**RAW)
+Three consecutive authentication failures start a two-second backoff. Further
+failures double it up to 60 seconds. Success clears it. `E_RATE_LIMITED` does
+not include a remaining-delay field; back off and start with a fresh hello.
 
-wrapped = wrap_token(app_sk, dev_pub, nonce, device_id, token, iv)
-print(base64.b64encode(wrapped).decode())              # cHFyc3R1dnd4eXp73iix4tUwvI3SCLdQkDcf6Ipj4SeWMvHCxsuoTYQbFZG8FDO6Y7fb7GfNujVODYXb
-assert unwrap_token(dev_sk, app_pub, nonce, device_id, wrapped) == token
+## 3. System commands
+
+### `sys.hello`
+
+Optional args: `app` (0..128 UTF-8 bytes), `app_proto` (`major.minor`, 3..24 bytes).
+Major 1 is supported, including minor versions such as `1.4`; another major
+returns `E_PROTO_MISMATCH`.
+
+```json
+{"id":1,"cmd":"sys.hello","args":{"app":"OffGrid Android","app_proto":"1.0"}}
 ```
+
+Result fields:
+
+| Field | Value/type |
+|---|---|
+| `device`, `chip` | `heltec_wifi_lora_32_v3`, `ESP32-S3` |
+| `device_id` | Stable 12-digit uppercase hex |
+| `fw` | `{version:"0.3.0", build:"<compiler build date>"}` |
+| `proto`, `state` | `"1.0"`, current state |
+| `mock` | Always `false`; reject old images reporting `true` |
+| `radio_diagnostics` | `false` normally; `true` only in explicit lab profiles |
+| `authentication`, `config_storage` | `x25519-aes256gcm`, `nvs` |
+| `session` | `{device_eph_pub:<Base64 32 bytes>, nonce:<Base64 16 bytes>}` |
+| `limits` | `{max_line:2048,max_contacts:32,max_text_bytes:83,pending_queue:8}` |
+| `recovery` | `{master:"ECDSA-P256-SHA256",app_wrap_label:"og-reset-wrap-v1"}` |
+
+### `sys.ping`
+
+No args. Result `{uptime_ms}`. Use as heartbeat and a transport-health check.
+
+### `sys.status`
+
+No args. Always returns:
+
+- `state`, `uptime_ms`, `heap_free`, `battery_mv` (currently `null`), `mock:false`.
+- `radio`: `running`, `relay_only`, `initialized`, `last_error` (RadioLib code).
+  Running means RF is active, not necessarily that a frame is being transmitted.
+- `storage`: `config_status`, `writable`, `vault_status`, `generation`.
+- `security`: actual `secure_boot` and `flash_encryption` enablement booleans.
+- `ui`: `led_ready`, `oled_ready`, `page` (base Home page = 0), `led_duty`
+  (0..255), `strip_pixels` (4), `oled_scene`.
+
+Unlocked results additionally include:
+
+- `contacts: {used,capacity:32}`.
+- `queue: {pending,capacity:8,dropped_events,dropped_acks}`.
+
+`config_status` is `defaults`, `loaded`, `invalid`, `unsupported_version` or
+`unavailable`. `vault_status` is `missing`, `ready`, `corrupt`,
+`unsupported_version`, `incomplete` or `unavailable`. `ready` describes the
+stored format, not an unlocked vault; check `state` separately. `writable`
+reports configuration-store writability, not successful authentication.
+
+`oled_scene` is the last rendered RAM scene, not an optical measurement:
+`starting`, `boot`, `locked`, `unlocking`, `home`, `pairing`, `error`, or `radio`.
+Tile transmission can still be in progress.
+
+### `sys.reboot`
+
+No args. Returns `{}`, drains the response, then actually reboots.
+Wait for `sys.boot` and perform a new hello/unlock. Never resend pending
+application messages automatically based only on an interrupted request.
+
+### `sys.set_log_level`
+
+Required `level`: `off`, `error`, `warn`, `info`, `debug`. Returns `{level}`.
+RAM-only, defaults to `warn`. Non-off changes emit a `log` notification.
+Error responses/events are never disabled by this setting. Keys and token
+material are not logged.
+
+For `sys.reset_challenge` / `sys.factory_reset`, see [factory reset](#11-factory-reset).
+
+## 4. Security and identity commands
+
+### `sec.provision`
+
+Only unprovisioned. Required wrapped-token fields; optional `name` (1..24 UTF-8
+bytes). The token becomes the vault credential and the device generates its
+private identity. Save the credential before sending the request: losing the
+response must not make the app lose the only credential.
+
+### `sec.unlock`
+
+Only locked. Required wrapped-token fields containing the existing token.
+The vault and all occupied contacts must authenticate/load before unlocked is
+published. Wrong token/envelope returns `E_UNLOCK_FAILED`, not simulated success.
+
+Both provisioning and unlocking return:
+
+```json
+{"state":"unlocked","node_id":"E3F0","name":"Offgrid-E3F0","public_key":"<Base64 32 bytes>","contacts":0,"radio":{"running":true,"relay_only":false,"last_error":0}}
+```
+
+They also emit `sec.state`. Radio initialization may fail independently of
+authentication: inspect `radio.running` / `last_error`; do not infer RF readiness
+only from `"state":"unlocked"`.
+
+### `sec.lock`
+
+No args. Unlocked only. Result `{state:"locked"}` and `sec.state`.
+Pending own work emits `msg.status` with `state:"failed",reason:"locked"`.
+
+### `sec.rotate_token`
+
+Unlocked only. Obtain a fresh hello and wrap the **new** 32-byte token with the
+normal unlock label. Result `{state,node_id,name,public_key}`; identity and
+contacts stay the same. No reboot or unlock event is required.
+
+Keep both old and new credentials until success is confirmed. If the connection
+fails during activation, preserve both and recover explicitly rather than
+guessing which token is active. After confirmed rotation, the old token fails.
+
+### `sec.get_policy` / `sec.set_policy`
+
+Unlocked only. Result `{lock_timeout_s}`.
+Set accepts optional integer `lock_timeout_s` (0..3600), optional boolean
+`persist` (default `true`). Default timeout is 15; zero disables automatic timeout.
+Prefer a nonzero timeout. `persist:false` lasts only until reboot.
+
+### `id.get` / `id.set_name`
+
+Unlocked only. Result `{node_id,name,public_key}`.
+`id.set_name` requires `name` (1..24 UTF-8 bytes), committed to the encrypted vault.
+NodeID is four uppercase hex digits: the first two bytes of SHA-256(public key).
+It is a routing hint, not a globally unique identity; use the full public key
+for identity comparisons.
+
+## 5. Pairing and contacts
+
+All commands here require unlocked state.
+
+### `pair.begin`
+
+No args. Starts/replaces the device's five-minute pairing session.
+Result `{qr,qr_bytes,expires_s:300}`. `qr` is Base64 of:
+
+```text
+"OG1" (3 bytes) || identity_public_key (32) || fresh_pairing_salt (16) || optional_UTF8_name (0..24)
+```
+
+The QR encoded by the device includes its current name. The parser also accepts
+an absent name. QR data is public, not a contact key.
+
+**Both devices must begin pairing and exchange the QR from that same session.**
+Show/scan these through the app; no pairing material is exchanged over LoRa.
+Do not restart one side's session between generating and scanning its QR.
+
+### `pair.complete`
+
+Required `qr` (canonical Base64, decoded 51..75 bytes).
+Optional `name` (local contact name, 1..24 bytes), `replace` (boolean, default false).
+
+Result `{contact:<contact object>,warnings:[]}`; warnings can contain
+`node_id_collision`. Both sides should complete, compare the displayed
+fingerprints, and keep the contact pending until authenticated traffic arrives.
+
+Self-pairing, invalid QR, duplicate public key without replacement, expired/missing
+session and full storage are rejected. Success ends that pairing session.
+`replace:true` replaces only a matching existing public-key relationship and
+preserves its local slot while resetting keys/counters/replay state. It cancels
+queued work for that contact. Re-pair **both** devices, not just one.
+
+### `pair.cancel`
+
+No args. Idempotent. Result `{cancelled:true}`. Wipes the temporary salt.
+Lock or five-minute expiry also cancels the session.
+
+### Contact object
+
+```json
+{"contact_id":1,"name":"Bob","node_id":"E841","public_key":"<Base64 32 bytes>","state":"pending","fingerprint":"1234 5678 9012","tx_ctr":0,"rx_highest_ctr":null,"last_rssi":null,"last_snr":null}
+```
+
+- `contact_id`: stable local slot 1..32, independent on each device.
+- `state`: `pending` or `active`. A first authenticated accepted packet activates it.
+- `fingerprint`: 12 decimal digits grouped 4/4/4, identical on both devices.
+- `tx_ctr`: highest consumed/reserved TX position; reboot/unlock can skip forward
+  because unused durable reservations are never reused.
+- `rx_highest_ctr`: highest authenticated accepted peer counter, or `null`.
+- Signal fields: last accepted packet RSSI/SNR, or `null`; RAM-only, cleared on load.
+
+No private key or symmetric key is included.
+
+### `contact.list`
+
+Optional `offset` (0..32, default 0), `limit` (1..10, default 10).
+Result `{contacts:[...],total,offset}`.
+
+Offset counts **occupied contacts**, not slot IDs. The actual page can contain
+fewer than `limit` contacts to keep the whole response under 2048 bytes.
+Advance by the returned array length until accumulated offset reaches `total`.
+There is no `next_offset` or `more` field.
+
+### `contact.get`
+
+Required `contact_id` (1..32). Result `{contact}`.
+
+### `contact.rename`
+
+Required `contact_id`, `name` (1..24 bytes). Result `{contact}`.
+Persists only the local name; it does not change keys or notify the peer.
+
+### `contact.delete`
+
+Required `contact_id`, `confirm:true`. Result `{deleted:true}`.
+Durably removes that relationship and cancels its own queued messages with
+`reason:"contact_deleted"`. It does not delete the peer's copy or chat history.
+
+## 6. Messages
+
+All `msg.*` commands require unlocked state. Counters are per contact/direction,
+shared by new data and fresh ACKs, start at 1 and never wrap past 16777215.
+Re-pair before exhaustion. A retry reuses its original counter with a new RETRY
+value/nonce; a manual resend is a new message with a new counter.
+
+### `msg.send`
+
+Common args:
+
+| Arg | Required | Meaning |
+|---|---|---|
+| `to` | Yes | Local contact slot 1..32 |
+| `type` | Yes | `text`, `reaction`, `geo` |
+| `ack` | No | Override the configured default for this type |
+| `hops` | No | 0..7, default `mesh.hop_default`; 0 disables forwarding |
+
+Type-specific args:
+
+| Type | Args |
+|---|---|
+| `text` | Required `text`, 0..83 UTF-8 bytes. No compression or fragmentation. |
+| `reaction` | Required `target:{author:"me" or "peer",ref:0..65535}` and `emoji` |
+| `geo` | Required finite `lat` (-90..90), `lon` (-180..180); optional nullable integer `alt_m` (-32768..32767), `age_s` (0..2550) |
+
+Reaction `ref` is the low 16 bits of the target message counter. `author` is
+relative to the app sending this command; incoming events invert it appropriately.
+One of these exact emoji strings is accepted: `👍`, `❤️`, `😂`, `😮`, `😢`, `🙏`.
+Use `"emoji":null` to remove a reaction. The heart includes U+FE0F.
+History lookup and orphan reaction handling belong to the app.
+
+GEO is quantized to 24 bits per coordinate (about 1.2 m latitude / 2.4 m longitude
+at the equator). Upper endpoints are clamped, not wrapped. Age is rounded to
+nearest 10 seconds and capped at 2550. Absent/null altitude and age stay `null`
+in received events.
+
+```json
+{"id":20,"cmd":"msg.send","args":{"to":1,"type":"text","text":"Hello!","ack":true}}
+{"id":20,"ok":true,"result":{"msg_ref":1,"ctr":1,"ack_requested":true,"hops":3,"state":"queued","bytes_on_air":23,"est_airtime_ms":206}}
+```
+
+`msg_ref` is a local uint32 handle valid for the current boot only.
+`est_airtime_ms` is an estimate at the currently applied PHY configuration;
+it is not a channel-access or delivery deadline. `queued` means accepted into
+one of eight RAM slots, **not sent or delivered**.
+
+ACKs are authenticated, bound to the pending original counter and matched only
+after real transmission. Actual TxDone starts the retry timeout. Default automatic
+base timeout is `(2*hops+2)*(measured_airtime_ms+750)`, multiplied by `2^retry`.
+`mesh.retry_base_ms` can override the base. Maximum is three retries after the
+initial transmission; retries and airtime cooldown can make delivery take much
+longer than a command response.
+
+### `msg.pending`
+
+No args. Result:
+
+```json
+{"pending":[{"msg_ref":1,"to":1,"type":"text","ctr":1,"state":"sent","retry":0}]}
+```
+
+Lists own RAM work only, not ACK/relay queues or message history. Terminal work
+is removed. Pending contents are lost on reboot/lock; they are not a persistent inbox.
+
+### `msg.cancel`
+
+Required `msg_ref` (1..4294967295). Result `{state:"cancelled"}`, followed by a
+`msg.status` event. Unknown/already-terminal handles return `E_INVALID_ARG`.
+In-progress radio work is stopped where possible; already transmitted data
+cannot be unsent.
+
+### Message status
+
+| State | Meaning |
+|---|---|
+| `queued` | Accepted; appears in the send response/pending view |
+| `sent` | Physical TxDone; terminal when no ACK was requested |
+| `relayed` | Matching neighbour repeat overheard; not end-to-end delivery |
+| `retrying` | A retry is queued for channel/airtime access |
+| `delivered` | A fresh authenticated bound ACK was accepted |
+| `failed` | Terminal; `reason` is `timeout`, `locked`, `contact_deleted`, `radio_error` |
+| `cancelled` | Terminal app cancellation |
+
+Only `delivered` proves an authenticated peer receipt. `rtt_ms` in that event is
+time from local enqueue to ACK acceptance, including waits/retries, not pure RF RTT.
+Duplicate authenticated data is not delivered twice; a retry can get a fresh ACK.
+Stale data outside the 64-counter replay window is dropped.
+
+## 7. Radio configuration and statistics
+
+### `radio.get` / `radio.set`
+
+Get works in every state; set requires unlocked.
+Set accepts any subset of the following plus `persist` (boolean, default true).
+It validates the whole candidate before changing live settings. A failed flash
+write leaves the live candidate unchanged. A hardware application failure can
+occur **after** settings were committed; inspect `radio.get` and `sys.status`
+instead of assuming `E_RADIO` rolled back the saved configuration.
+
+| Field | Range | Default |
+|---|---|---|
+| `freq_mhz` | Finite number, 150..960 | 869.525 |
+| `bw_khz` | 62.5, 125, 250, 500 | 125 |
+| `sf` | Integer 5..12 | 9 |
+| `cr` | Integer 5..8 (4/5..4/8) | 5 |
+| `tx_power_dbm` | Integer -9..22 | 14 |
+| `preamble` | Integer 6..64 symbols | 8 |
+| `sync_word` | Integer 0..255 | 79 (0x4F) |
+
+Set-only `preset` resets the full radio candidate before explicit fields:
+`lab_default` (SF9/BW125), `fast` (SF7/BW250), `long_range` (SF11/BW125).
+Each preset uses 869.525 MHz, CR5, 14 dBm, preamble8 and sync79.
+
+Result is the complete configuration plus `est_airtime_ms_23b`,
+`max_text_bytes:83`. Set also includes:
+
+- `warnings`: possible `outside_eu868`, `above_eu868_power_limit`,
+  `reserved_sync_word`, and `mesh_incompatible`.
+- `apply_pending`: true if waiting for current RF work to finish.
+
+Warnings do not authorize unlawful operation or guarantee antenna compatibility.
+Match radio settings on every participating node. Avoid reserved sync words
+0x12 and 0x34. SX1262 expands the configured byte using control bits 0x44.
+
+All `.set` settings default to persistence. `persist:false` changes RAM only.
+A later persisted change saves the **whole current category**, including earlier
+temporary changes in that category; unrelated categories are not persisted.
+
+### `radio.stats`
+
+Unlocked only. Optional `reset` boolean (default false) returns then clears the
+counters. It does not reset keys, replay windows, rate budgets or airtime cooldown.
+
+| Fields | Meaning |
+|---|---|
+| `tx_packets`, `rx_packets` | Completed PHY transmissions / received PHY packets |
+| `rx_crc_errors`, `rx_tag_failures`, `rx_malformed` | PHY/authentication/format failures |
+| `rx_dedupe_drops` | Endpoint replay duplicate/stale drops |
+| `relayed`, `relay_suppressed`, `relay_dropped`, `rate_limit_drops` | Relay completion, cancellation, bounded loss and rate-limit drops |
+| `acks_sent`, `acks_received`, `retries` | ACK completions/acceptances and retries scheduled |
+| `tx_airtime_ms_total` | Measured airtime, including known interrupted/failed TX |
+| `cad_scans`, `cad_busy` | Channel scans and busy results |
+| `radio_failures`, `radio_timeouts` | Physical driver failures/timeouts |
+| `dropped_events`, `dropped_acks`, `radio_dropped_events`, `trace_dropped_events` | Bounded queue/trace losses |
+| `last_rssi`, `last_snr` | Latest PHY signal values; initially zero |
+| `tx_duty_cycle_max_percent` | 1: conservative shared per-boot pacing |
+
+Lab builds additionally return `injected_ack_drops`.
+
+## 8. Mesh configuration
+
+`mesh.get`: any state. `mesh.set`: unlocked, partial update plus `persist`.
+Both return the complete object:
+
+| Field | Range/type | Default |
+|---|---|---|
+| `hop_default` | Integer 0..7 | 3 |
+| `relay_enabled` | Boolean | true |
+| `relay_when_locked` | Boolean | false |
+| `cad_enabled` | Boolean | true |
+| `backoff_slots` | Integer 0..32 | 8 |
+| `retries` | Integer 0..3 | 3 |
+| `retry_base_ms` | Integer 0..60000; 0 = automatic | 0 |
+| `rate_limit_per_src` | Integer 0..255/minute; 0 disables relay count limit | 20 |
+| `ack_default` | Partial object with boolean `text`, `reaction`, `geo` | `{text:true,reaction:false,geo:false}` |
+
+ACKs/own messages have priority over transit traffic. Relays cannot decrypt
+unknown contacts. Relaying uses eight transit slots, a 256-entry normalized keyed
+cache, randomized/SNR-weighted delay and overhear cancellation. Authentication
+and replay handling precede relay dedupe; short-ID collisions do not swallow
+transit packets. A separate fixed tag-failure budget remains even when relay
+rate limiting is disabled.
+
+Locked relaying needs **both** relay booleans true and a provisioned device.
+It is keyless: it does not unlock contacts or deliver private messages.
+Unprovisioned firmware never enables RF, regardless of saved policy.
+
+Own data, ACKs and relays share a cooldown of 99 times measured TX airtime after
+each transmission, including known interrupted/failed airtime. CAD, higher
+priority work and cooldown can delay sends substantially. Keep heartbeat active.
+This is a conservative 1% safeguard during a continuous boot, **not** a durable
+rolling-hour ledger across resets or certification of lawful frequency/power use.
+
+## 9. LEDs and OLED
+
+### `led.get` / `led.set`
+
+Get: any state. Set: unlocked, partial update plus `persist`.
+
+| Field | Type/default |
+|---|---|
+| `enabled` | Boolean, true |
+| `quiet` | Boolean, false |
+| `brightness` | Integer 0..255, 128 |
+| `state_patterns` | Partial object: `unprovisioned`, `locked`, `unlocked` |
+| `event_patterns` | Partial object: `tx`, `rx`, `msg_received`, `delivered`, `failed`, `error`, `pairing` |
+
+Result includes full configuration and `builtin_patterns`.
+
+Patterns are a name or custom object:
+
+```json
+{"steps":[100,100,100,700],"repeat":2}
+```
+
+Names: `off`, `on`, `flash`, `blink_slow`, `blink_fast`, `double`, `heartbeat`,
+`pulse`. Custom steps: 1..16 integer durations, each 10..10000 ms, alternating
+on/off from on. `repeat` is optional, 1..255, default 1. State patterns always
+loop; event/preview patterns finish. Finite on/off cycles last 1000 ms each;
+pulse lasts 1500 ms.
+
+Default states: unprovisioned pulse, locked slow blink (500 ms on/off), unlocked
+off. Events: TX/RX flash, new message double, delivered off, failure
+`{steps:[100,100],repeat:3}`, error fast blink, pairing heartbeat.
+
+The onboard LED and both four-pixel GRB strips share the same monochrome
+intensity/pattern. `enabled:false` or `quiet:true` forces all outputs off.
+Neither setting disables the OLED.
+
+### `led.test`
+
+Unlocked. Required `pattern`, optional outer `repeat` (1..255, default 1).
+Outer repeat wins over a custom pattern's repeat.
+Result `{preview:true,repeat}`. Does not persist configuration.
+
+### OLED behavior
+
+No display-control command is required. Locked state shows a large closed
+padlock. A genuine unlock opens it and shrinks/moves it into the Home corner
+over 1400 ms. Relock interrupts that transition. Pairing/fingerprint/error/
+activity overlays are automatic. There is no button or page-advance workflow.
+Use `sys.status.ui` for readiness and last rendered scene.
+
+## 10. Events
+
+Every event has `{evt,t,data}`; `t` is device uptime in milliseconds, not wall
+clock time. Do not reply to events.
+
+| Event | Data |
+|---|---|
+| `sys.boot` | `device_id`, `fw` (version string), `proto`, `state`, `mock:false`, `radio_diagnostics`, `reset_reason` (`software` or `power_on`) |
+| `sec.state` | `state`, `reason`: `provision`, `unlock`, `lock`, `heartbeat_timeout`, `factory_reset`, or `error` |
+| `contact.state` | `contact_id`, `state:"active"` |
+| `msg.status` | `msg_ref`, `to`, `state`, `retry`; optional `reason`; delivered also has `hops`,`rtt_ms` |
+| `msg.received` | `from`, `ctr`, `retry`, `hops`, `rssi`, `snr`, plus typed payload |
+| `log` | `level`, `msg` (no keys/tokens) |
+| `error` | `code`, `message`; unsolicited transport/storage/RF/loss notice |
+
+Received payload examples:
+
+```json
+{"evt":"msg.received","t":7000,"data":{"from":1,"type":"text","ctr":1,"text":"Hello!","hops":0,"retry":0,"rssi":-72,"snr":9.0}}
+{"evt":"msg.received","t":9000,"data":{"from":1,"type":"reaction","ctr":2,"target":{"author":"me","ref":1},"emoji":"👍","hops":0,"retry":0,"rssi":-72,"snr":9.0}}
+{"evt":"msg.received","t":11000,"data":{"from":1,"type":"geo","ctr":3,"lat":47.0517,"lon":8.30751,"alt_m":null,"age_s":null,"hops":0,"retry":0,"rssi":-72,"snr":9.0}}
+```
+
+There is no incoming-message ACK command: the device handles authenticated
+radio receipts automatically. Store received content/history in the app.
+
+### Backpressure and reconnect
+
+The transport has six output slots, and the domain has 32 event slots. RF,
+replay commits and UI progress never wait for the app to read. Extended host
+backpressure can therefore lose notifications/content; loss counters and a
+subsequent error report it. ACK receipt does not guarantee the app has saved
+the message. There is no persistent inbox or event replay API.
+
+Continuously drain serial even while requests are pending. On boot/reconnect,
+perform hello, unlock, reload contacts and inspect pending work/loss counters.
+Terminal events lost under backpressure cannot be reconstructed from
+`msg.pending`; keep uncertain app states explicit instead of fabricating delivery.
+
+## 11. Factory reset
+
+Reset erases the identity, all contact keys and device settings, then reboots
+unprovisioned. It is not a normal way to recover a lost message. Authorization is
+durably journaled before the successful response; an interrupted authorized reset
+is resumed on reboot. There is no button/hold reset and no unauthenticated erase.
+
+Both methods require `"confirm":"ERASE"` exactly. Result `{pending:true}` is
+returned before the reboot; wait for `sys.boot` with `state:"unprovisioned"`.
+
+### Registered-app authorization
+
+Works locked or unlocked if the existing vault can be authenticated.
+Call a fresh `sys.hello`, wrap the **current** token using
+`info=ASCII("og-reset-wrap-v1") || device_id_bytes`, then send:
+
+```json
+{"id":40,"cmd":"sys.factory_reset","args":{"confirm":"ERASE","method":"app","app_eph_pub":"<Base64 32 bytes>","wrapped_token":"<Base64 60 bytes>"}}
+```
+
+`method` defaults to `app`. An ordinary unlock/rotation proof cannot authorize
+reset because its HKDF label differs.
+
+### Owner-signed maintenance authorization
+
+1. Call `sys.reset_challenge` (no args).
+2. Decode `message` and verify that it is exactly 49 bytes:
+   `ASCII("og-reset-v1") || device_id_bytes || random_nonce32`.
+3. Verify that `key_id` identifies the owner's expected trust key:
+   Base64 of SHA-256(the raw 65-byte uncompressed P-256 public point).
+4. Sign the message using the owner-held P-256 private key and ECDSA/SHA-256.
+   Encode the ASN.1 DER signature (at most 72 decoded bytes) as canonical Base64.
+5. Submit within `expires_s:30`:
+
+```json
+{"id":41,"cmd":"sys.factory_reset","args":{"confirm":"ERASE","method":"master","signature":"<Base64 DER signature>"}}
+```
+
+Challenge result is `{message,key_id,expires_s:30,algorithm:"ECDSA-P256-SHA256"}`.
+A new challenge replaces the old one; every verification attempt consumes it,
+including invalid signatures. It is device-bound and cannot be replayed.
+
+Only the public trust key is embedded in firmware. Never place the owner's
+private signing key on a phone/client that should not have fleet reset authority.
+Maintenance reset grants erasure, not disclosure of another user's vault.
+No irreversible eFuses/download-mode settings are modified by this API.
+
+## 12. Errors and limits
+
+| Code | Meaning/action |
+|---|---|
+| `E_PARSE` | Malformed/trailing JSON; recover at the next newline |
+| `E_LINE_TOO_LONG` | Oversize line dropped; event, not a normal correlated response |
+| `E_INVALID_ARG` | Missing/wrong-typed/out-of-range value or invalid pending handle |
+| `E_UNKNOWN_CMD` | Unsupported command; includes lab-only commands on normal firmware |
+| `E_PROTO_MISMATCH` | Unsupported host protocol major |
+| `E_NOT_PROVISIONED` | A protected operation needs an existing identity |
+| `E_LOCKED` | Unlock required; some protected groups also use this when unprovisioned |
+| `E_ALREADY_PROVISIONED` | Provisioning cannot overwrite an existing vault |
+| `E_ALREADY_UNLOCKED` | Unlock called while already unlocked |
+| `E_NO_SESSION` | Obtain a fresh hello before authentication |
+| `E_UNLOCK_FAILED` | Credential/envelope/reset authorization rejected |
+| `E_RATE_LIMITED` | Authentication backoff; retry later with a fresh session |
+| `E_CONFIRM_REQUIRED` | Missing exact erase/delete confirmation |
+| `E_NO_PAIRING` | Pairing session missing, completed, cancelled or expired |
+| `E_INVALID_QR` | Unsupported/invalid QR or unusable peer key |
+| `E_SELF_PAIR` | Own identity scanned |
+| `E_CONTACT_EXISTS` | Existing public-key relationship; explicit replacement required |
+| `E_NO_SUCH_CONTACT` | Empty contact slot |
+| `E_STORAGE_FULL` | All 32 contact slots occupied |
+| `E_TOO_LONG` | Text exceeds 83 bytes or response cannot fit |
+| `E_QUEUE_FULL` | Eight own message slots already occupied |
+| `E_BUSY` | Counter exhausted; re-pair rather than wrapping |
+| `E_RADIO` | Radio unavailable/configuration failed; inspect status |
+| `E_INTERNAL` | Crypto/storage/capacity failure; inspect status/error events, do not assume success |
+
+Wrong authorization can deliberately be reported uniformly. Do not use error
+text to probe token validity. Storage failures in contact/counter/replay work
+can lock the device; handle the subsequent `sec.state`.
+
+| Limit | Value |
+|---|---|
+| Request/response line | 2048 bytes including newline |
+| JSON nesting | 8 |
+| Names | 1..24 UTF-8 bytes |
+| Contacts | 32 |
+| Contact page requested size | 1..10; actual result can be smaller |
+| Own message slots | 8 |
+| Text body | 0..83 UTF-8 bytes |
+| Complete mesh packet | 100 bytes |
+| Counter | 1..16777215; zero reserved, no wrapping |
+| Replay window | 64 counters; accepted highest committed before delivery |
+| Pairing expiry | 300 seconds |
+| Maintenance challenge expiry | 30 seconds |
+
+## 13. Lab-only commands
+
+Only `radio_diag` / `radio_diag_usb` include these. They use the same real secure
+backend, not an authentication bypass. Normal profiles return `E_UNKNOWN_CMD`.
+
+| Command | State / result |
+|---|---|
+| `diag.codec.selftest` | Any state; `{passed:true}` or `E_INTERNAL`; published vectors/bounds |
+| `diag.vault.selftest` | Any state; optional `verify` boolean; `{passed:true}` or `E_INTERNAL` |
+| `diag.mesh.drop_next_ack` | Unlocked; `{armed:true}`; deliberately lose exactly one requested receipt |
+| `dbg.rf_trace` | Unlocked; required `enabled` boolean; result `{enabled}` |
+
+Vault diagnostics modify only the separate `og_vtest` namespace and do not
+transmit. They cover storage, reservations/replay, message queues, relay rules,
+source-budget isolation and airtime bounds. They do not erase the real vault.
+Receipt-loss injection and trace are cleared on lock.
+
+Trace events contain actual PHY ciphertext, never private keys:
+
+```json
+{"evt":"rf.tx","t":10000,"data":{"len":23,"hex":"6CE841E3F00000015D1D3FD92A3E04DA794024DB76ADBC","airtime_ms":206}}
+{"evt":"rf.rx","t":10200,"data":{"len":16,"hex":"48E3F0E8410000017F15646B08384B1D","rssi":-90,"snr":6.5,"action":"ack_matched"}}
+```
+
+RX `action`: `delivered`, `ack_matched`, `relay_queued`, `dropped_duplicate`,
+`dropped_tag`, `dropped_hop_limit`, `dropped_rate_limit`, `dropped_malformed`,
+`dropped_queue_full`, `ignored`. Scheduling a relay is not a completed forward;
+a later `rf.tx` records actual transmission. Trace loss is counted, never
+allowed to stall RF progress.
+
+## 14. App integration checklist
+
+1. Open serial, synchronize on newline, continuously dispatch events/responses.
+2. Call hello; require `proto` major 1 and `mock:false`. Identify the board by
+   `device_id`, not a USB port name.
+3. Obtain the right per-device token. Provision only when explicitly
+   unprovisioned; otherwise unlock. Never auto-reset an unknown/corrupt vault.
+4. Start one-second heartbeats and keep them running during all asynchronous work.
+5. Load identity and paginated contacts. Render/scan both pairing-session QRs and
+   compare fingerprints when adding a peer.
+6. Store chat history in the app. Track queued messages by boot-local `msg_ref`;
+   distinguish physical `sent` from authenticated `delivered`.
+7. Keep reading during cooldown/retries. Surface RF/storage/loss errors and
+   uncertain outcomes instead of reporting fabricated success.
+8. On boot/lock, discard stale RAM handles and sensitive client views. Re-unlock
+   explicitly; do not automatically erase/re-pair or resend ambiguous messages.
+9. Use `persist:false` for temporary settings and restore them deliberately.
+10. Before closing, stop heartbeats and optionally send `sec.lock`; inactivity
+    will lock later unless the configured timeout is zero.
