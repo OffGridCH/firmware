@@ -607,8 +607,8 @@ Smooth named patterns:
 | Name | RGB animation / one cycle |
 |---|---|
 | `glow` | Blue breathing flow, 5000 ms |
-| `send` | White travelling wave from pixel 0 to 3, 1600 ms |
-| `receive` | Broader white wave from pixel 3 to 0, 1600 ms |
+| `send` | White travelling wave from pixel 3 to 0, 1600 ms |
+| `receive` | Broader white wave from pixel 0 to 3, 1600 ms |
 | `pairing` | Purple breathing flow, 3600 ms |
 | `startup` | Blue growing/ripple/fill intro, 6600 ms |
 | `reset` | Red bloom/fade, 1800 ms |

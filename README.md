@@ -66,7 +66,7 @@ GPIO35 PWM and two four-pixel GRB/800-kHz strips on GPIO45/46 share brightness
 and quiet/disabled settings. The strips show smooth, gamma-shaped animations:
 
 - Locked/unprovisioned: slow blue breathing glow.
-- Sent: a white outward travelling wave; received authenticated message: a
+- Sent: a white travelling wave from pixel 3 to 0; received authenticated message: a
   broader white wave in the opposite direction.
 - Pairing: purple breathing flow for the active pairing session.
 - Authorized factory reset: red bloom/fade for 1.8 seconds before erase/reboot;
