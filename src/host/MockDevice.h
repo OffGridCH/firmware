@@ -19,6 +19,7 @@
 #include "SerialLink.h"
 #include "../security/CryptoEngine.h"
 #include "../storage/ConfigStore.h"
+#include "../storage/VaultStore.h"
 #include "../drivers/RadioDriver.h"
 
 class MockDevice {
@@ -1503,6 +1504,17 @@ private:
         JsonObject result = response["result"].as<JsonObject>();
         lastActivity_ = nowMs;
 #if OFFGRID_RADIO_DIAGNOSTICS
+        if (strcmp(command, "diag.vault.selftest") == 0) {
+            if (!Commands::boolArg(args, response, "verify", false)) return;
+            const bool passed = VaultStore::selfTest(args["verify"] | false);
+            if (!passed) {
+                Commands::fail(response, "E_INTERNAL", "vault diagnostic failed");
+                return;
+            }
+            result["passed"] = true;
+            result["fixture_namespace"] = "og_vtest";
+            return;
+        }
         if (strncmp(command, "diag.radio.", 11) == 0) {
             handleRadioDiagnostics(command, args, response, nowMs);
             return;

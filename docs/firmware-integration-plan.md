@@ -39,7 +39,7 @@ specification conflict explicitly; do not silently weaken a security requirement
 | `ConfigStore` | Real versioned NVS settings: radio, mesh, LED, timeout; corruption/write-failure handling | Add vault salt/generation metadata with deliberate compatibility and crash-recovery rules; retain commit-before-live behavior |
 | `CryptoEngine` | Randomness, hashes, HMAC/HKDF, X25519, AES-GCM/CCM and zeroization; previous device checks passed | Reuse vetted primitives; add a vetted SipHash implementation when relay dedupe needs it; preserve known-answer diagnostics |
 | `RadioDriver` | Actual SX1262 RX/TX, CAD, backoff, completion events, timeouts, recovery, stats | Connect to MeshEngine; preserve hardware completion semantics; finish fault/load acceptance; airtime regulation remains missing |
-| `VaultStore` | Placeholder | Encrypted identity/contact records, integrity checks, loading, safe creation/rotation/recovery and erasure |
+| `VaultStore` | Authenticated versioned records, two banks, durable activation, explicit statuses and wipe-on-close | Real lifecycle/contact integration; power-cut acceptance |
 | `Security` | Placeholder; current state changes are mock behavior | Real identity, provisioning, protected token unwrap, unlock verification, failure backoff, key cleanup, timeout and token rotation |
 | `Contacts` | Placeholder; mock has 32 public RAM slots | Decrypted contact keys, persistence, counters/reservations, replay windows, deletion/replacement cleanup |
 | `Pairing` | Placeholder; mock parses QR and calculates fingerprints | Real shared-key derivation, persistent contact insertion, expiry/cancel cleanup, collision handling |
@@ -421,5 +421,16 @@ host responsiveness, recovery, and the release gates separately with evidence.
   eFuse changes, partition-wide erase or fallback to mock authentication.
   Until that real authorization path is implemented, `E_BUSY` remains correct.
 
-Next: vault/security, authenticated recovery and packet codec. Neither vault nor
-meshing is implemented yet; full multi-board acceptance needs additional boards.
+- Stage 3: implemented AES-256-GCM records, separately versioned plaintext
+  metadata via ConfigStore (settings schema unchanged), complete-load checks,
+  contact index, two-bank creation/rotation and explicit incomplete/corrupt/
+  unsupported/unavailable outcomes. UART/radio diagnostic builds pass.
+  `og_vtest` device write/reset/verify phases passed, including wrong key/AAD,
+  tampered tag, zeroed failure outputs, incomplete-generation rejection, contact
+  slot 32, deletion, rotation and old-key rejection. No actual power-cut claim.
+  Detailed formats and recovery ordering are in the storage README.
+- Generated the owner-approved maintenance private key outside the repository,
+  under `~/.config/offgrid/`, mode 0600. Only its public trust key may enter
+  firmware. Back up the private key securely before relying on master recovery.
+
+Next: secure lifecycle and signed maintenance recovery. Mesh remains absent.

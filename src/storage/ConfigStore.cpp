@@ -5,6 +5,36 @@
 #include <nvs_flash.h>
 #include <string.h>
 
+int32_t ConfigStore::readVaultMetadata(uint8_t* output, size_t& length, const char* space) {
+	nvs_handle_t handle;
+	esp_err_t error = nvs_open(space, NVS_READONLY, &handle);
+	if (error != ESP_OK) return error;
+	error = nvs_get_blob(handle, "vault", output, &length);
+	nvs_close(handle);
+	return error;
+}
+
+int32_t ConfigStore::writeVaultMetadata(const uint8_t* input, size_t length, const char* space) {
+	nvs_handle_t handle;
+	esp_err_t error = nvs_open(space, NVS_READWRITE, &handle);
+	if (error != ESP_OK) return error;
+	error = nvs_set_blob(handle, "vault", input, length);
+	if (error == ESP_OK) error = nvs_commit(handle);
+	nvs_close(handle);
+	return error;
+}
+
+int32_t ConfigStore::eraseVaultMetadata(const char* space) {
+	nvs_handle_t handle;
+	esp_err_t error = nvs_open(space, NVS_READWRITE, &handle);
+	if (error != ESP_OK) return error;
+	error = nvs_erase_key(handle, "vault");
+	if (error == ESP_ERR_NVS_NOT_FOUND) error = ESP_OK;
+	if (error == ESP_OK) error = nvs_commit(handle);
+	nvs_close(handle);
+	return error;
+}
+
 void ConfigStore::defaults() {
 	deserializeJson(saved_, R"json({
 	  "schema":1,

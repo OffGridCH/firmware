@@ -18,6 +18,9 @@ public:
 	bool writable() const;
 	int32_t lastError() const;
 	static bool validPattern(JsonVariantConst pattern);
+	static int32_t readVaultMetadata(uint8_t* output, size_t& length, const char* space = "og_cfg");
+	static int32_t writeVaultMetadata(const uint8_t* input, size_t length, const char* space = "og_cfg");
+	static int32_t eraseVaultMetadata(const char* space = "og_cfg");
 
 private:
 	static constexpr uint32_t SchemaVersion = 1;

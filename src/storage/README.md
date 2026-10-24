@@ -14,9 +14,66 @@ security-policy configuration as JSON. It stores no raw C++ struct memory.
 - LED: enabled/quiet/brightness and built-in/custom state/event patterns.
 - Security policy: `lock_timeout_s` only.
 
-No tokens, identity/private keys, contacts, messages, vault salt, or vault generation
-are stored by this implementation. Vault metadata and encrypted storage remain
-separate future work. Do not confuse plaintext configuration with the vault.
+Settings contain no tokens or private material. `ConfigStore` also provides
+separate `vault` metadata blob IO without rewriting schema-1 `settings`.
+`VaultStore` now implements encrypted generations; it is not yet wired to a real
+host lifecycle in the mock profiles. Do not confuse configuration with the vault.
+
+## Encrypted vault format (schema 1)
+
+`og_cfg/vault` is an atomic 26-byte metadata blob:
+`"OGVM" | version:u8=1 | bank:u8 (0/1) | generation:u32be | salt:16`.
+Generation zero is invalid. Unknown/corrupt metadata never becomes a fresh vault.
+Settings schema 1 remains unchanged, including read-only handling of damaged
+settings. Metadata is updated independently; it never overwrites saved settings.
+
+`og_vault` contains physical keys `a_check`, `a_identity`, `a_index`, `a_c01`
+through `a_c32`, with matching `b_` keys for the other generation. Each blob is:
+`"OGVR" | version:u8=1 | plaintext_length:u16be | random_iv:12 | ciphertext | tag:16`.
+AES-256-GCM AAD is `namespace ASCII | NUL | physical key ASCII | NUL |
+generation:u32be`, binding namespace, logical slot/bank and generation.
+Plaintext is bounded at 256 bytes. Every encryption obtains a fresh random IV.
+Keys are RAM-only, explicitly zeroized on close; failed reads clear the entire
+caller output and return length zero.
+
+The check plaintext is `"offgrid-vault-v1"` including its final NUL. Identity is
+`private_key:32 | name_length:u8 | name:1..24`, never raw struct memory.
+`index` is a four-byte big-endian contact-occupancy bitmap; contact plaintext
+encoding belongs to Contacts. Open verifies check, identity, index and every
+occupied contact before making a vault key available to internal operations.
+Missing occupied records fail rather than silently dropping contacts.
+
+Creation writes/commits all required records, authenticates readback, then
+switches metadata. Abandoned initial records without metadata boot `incomplete`,
+not `missing`, and require authorized recovery. Rotation first clears only the
+inactive bank, copies/re-encrypts every occupied record, verifies it, and finally
+atomically commits metadata. Failure before activation leaves the old bank
+selected. An ambiguous metadata commit failure closes the vault; recovery must
+reload the durable selector rather than guessing. No automatic older-generation
+fallback is allowed after successful rotation.
+
+Contact insertion commits its record before adding it to the authenticated
+index. Deletion durably removes its index bit; obsolete ciphertext is excluded
+from reads/rotation and later overwritten/cleared. NVS does not promise physical
+forensic erasure of old flash pages. Counter/contact callers must fail closed on
+ambiguous active-record write failures.
+
+Diagnostic-only `diag.vault.selftest` uses the separate `og_vtest` namespace and
+fixed fixture keys compiled only into radio diagnostic profiles. It does not
+write `og_cfg`/`og_vault` or transmit RF:
+
+```sh
+python3 tools/serial-check.py --port /dev/ttyUSB0 --command diag.vault.selftest --allow-mock-changes
+# Hardware reset/power cycle, then:
+python3 tools/serial-check.py --port /dev/ttyUSB0 --command diag.vault.selftest --args '{"verify":true}' --allow-mock-changes
+```
+
+Both phases passed on the connected board, across hardware reset: authenticated
+round trip, wrong key/generation and modified-tag rejection, cleared failed
+plaintext, refusal to activate an incomplete bank, contact slot 32/deletion and
+two generation switches with old-key rejection. This is not power-cut injection
+or physical power-removal evidence. Real secure lifecycle and authorized reset
+integration are the next stage; no mock authentication opens a real vault.
 
 ## Interface
 
