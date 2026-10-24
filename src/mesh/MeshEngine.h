@@ -19,6 +19,14 @@ public:
 		State state = State::Queued;
 		uint8_t retry = 0;
 	};
+	// Final outcome of a message, kept in a small ring so a host that missed msg.status (link lost,
+	// backpressure, phone away) can settle it from msg.pending. No content, only the reference.
+	struct Recent {
+		uint32_t reference = 0;
+		State state = State::Failed;
+		Reason reason = Reason::None;
+	};
+	static constexpr size_t RecentCapacity = 16;
 	struct Event {
 		EventType type = EventType::Status;
 		Pending message;
@@ -68,6 +76,8 @@ public:
 		uint64_t nowMs, Pending& accepted, size_t& bytes);
 	bool cancel(uint32_t reference, uint64_t nowMs);
 	const Pending* pending(size_t index) const;
+	// Newest first; nullptr past the end. Since boot, kept across lock.
+	const Recent* recent(size_t index) const;
 	size_t count() const;
 	void tick(uint64_t nowMs);
 	bool prepareTransmission(PacketCodec::Packet& packet, uint64_t nowMs);
@@ -134,6 +144,9 @@ private:
 	Contacts& contacts_;
 	Config config_;
 	Slot slots_[Capacity];
+	Recent recent_[RecentCapacity];
+	size_t recentHead_ = 0;
+	size_t recentCount_ = 0;
 	Ack acks_[4];
 	Relay relays_[8];
 	uint32_t cache_[256] = {};
