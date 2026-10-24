@@ -31,7 +31,8 @@ describes the complete target API, not the subset already implemented.
 `App` now owns initialization and the cooperative loop; `main.cpp` only delegates.
 The temporary mock backend is in `src/host/MockDevice.h`. LED/OLED receive copied
 public snapshots and typed events, with LED settings/preview already connected.
-Their hardware implementations remain no-op stubs and report unavailable through
+OLED uses the merged U8g2 renderer with cooperative startup and dirty-row
+transfers; LED output remains a no-op stub. Readiness is reported through
 `sys.status.result.ui`. A failed peripheral never blocks the other modules.
 See the short [LED/OLED handoff](docs/app-core-handoff.md) for independent work
 boundaries, driver contracts, button ownership and device checks.
@@ -78,7 +79,8 @@ mode are configured in `platformio.ini`. Find the actual port with `pio device l
 
 For VS Code C++ IntelliSense, generate the local ESP32 compilation database with
 `pio run -e heltec_wifi_lora_32_V3 -t compiledb`. The checked-in editor configuration
-uses that database rather than generic Arduino/AVR include paths.
+uses that database rather than generic Arduino/AVR include paths. U8g2 2.36.15,
+ArduinoJson and RadioLib are inherited by all four profiles.
 
 Default USB-UART bridge image, 115200 baud, 8N1, explicitly using `Serial0`:
 

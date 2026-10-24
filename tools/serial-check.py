@@ -21,6 +21,7 @@ class Device:
     def connect(self, timeout=10):
         deadline = time.monotonic() + timeout
         next_probe = time.monotonic() + 0.5
+        self.connection.write(b"\n")
         while time.monotonic() < deadline:
             if time.monotonic() >= next_probe:
                 self.reference += 1
@@ -29,7 +30,7 @@ class Device:
                            "args": {"app": "serial-check", "app_proto": "1.0"}}
                 wire = json.dumps(request, separators=(",", ":")).encode() + b"\n"
                 print(">", wire.decode().strip())
-                self.connection.write(b"\n" + wire)
+                self.connection.write(wire)
                 next_probe = time.monotonic() + 0.5
             try:
                 response = self.read(min(deadline, next_probe))
@@ -37,8 +38,6 @@ class Device:
                 continue
             if "evt" in response:
                 self.events.append(response)
-                if response["evt"] == "sys.boot":
-                    next_probe = time.monotonic()
                 continue
             if response.get("error", {}).get("code") == "E_PARSE" and "id" not in response:
                 continue

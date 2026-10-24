@@ -344,7 +344,9 @@ bool OledDriver::init() {
     pinMode(BoardConfig::VextControl, OUTPUT);
     digitalWrite(BoardConfig::VextControl, LOW);
     delay(100);
+    display_.setBusClock(400000);
     display_.begin();
+    Wire.setTimeOut(20);
     Wire.beginTransmission(0x3C);
     if (Wire.endTransmission() != 0) return false;
     display_.setFontMode(1);

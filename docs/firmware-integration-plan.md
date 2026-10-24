@@ -381,6 +381,18 @@ messages with correct receipts/retries/replay handling, and multi-board relaying
 works without decrypting transit traffic. Confirm available LED/OLED behavior,
 host responsiveness, recovery, and the release gates separately with evidence.
 
-Current next action: coordinate the OLED compatibility stage, then remove all
-runtime button assumptions. Vault/security and packet-codec work can follow the
-dependencies above; neither vault nor meshing is implemented at this baseline.
+### Execution progress (2026-10-24)
+
+- Stage 0: the merged tip already supplies the App-compatible OLED API and
+  cooperative startup/dirty-row rendering. Fixed the missing default/native-USB
+  U8g2 dependency, pinned it to 2.36.15 and retained inherited ArduinoJson/RadioLib
+  dependencies in diagnostic profiles. Configured 400 kHz I2C with a 20 ms
+  transaction timeout. Startup initialization still includes library waits.
+- UART and native-USB builds pass. Uploaded the UART image to the connected
+  CP2102 board; status reports `oled_ready: true`, Home, NVS loaded and RF off.
+  The checker responds during startup. Its repeated newline/probe race was
+  reproduced on hardware and corrected. Physical visual inspection, measured
+  transfer latency and native-USB hardware acceptance remain pending.
+
+Next: remove all runtime button assumptions. Vault/security and packet-codec work
+can follow the dependencies above; neither vault nor meshing is implemented yet.
