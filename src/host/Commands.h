@@ -3,6 +3,10 @@
 #include <ArduinoJson.h>
 
 #include "SerialLink.h"
+#include "../Types.h"
+#include "../security/Security.h"
+#include "../storage/ConfigStore.h"
+#include "../drivers/RadioDriver.h"
 
 class Commands {
 public:
@@ -24,6 +28,20 @@ public:
 						  size_t decodedBytes);
 	static bool numberArg(JsonObjectConst args, JsonObject response, const char* field,
 						 double minimum, double maximum, bool required = true);
+	static LedPattern ledPattern(JsonVariantConst value);
+
+#if !OFFGRID_MOCK_DEVICE
+	enum class Action { None, Reboot, Reset };
+	void initSecure(ConfigStore& store, Security& security);
+	Action handleSecure(const char* command, JsonObjectConst args, JsonObject response,
+		uint64_t nowMs, Security& security, VaultStore& vault, ConfigStore& store, RadioDriver& radio);
+	void secureSnapshot(UiSnapshot& snapshot, uint64_t nowMs, const Security& security, const RadioDriver& radio);
+	bool takeSecureLedConfig(LedConfig& config);
+	bool takeSecureLedPreview(LedPattern& pattern);
+	void emitSecureBoot(const Security& security, uint64_t nowMs);
+	RadioDriver::Config secureRadioConfig() const;
+	bool lockedRelay() const { return live_["mesh"]["relay_when_locked"].as<bool>(); }
+#endif
 
 private:
 	static void onLine(void* context, const char* line, size_t length, uint64_t nowMs);
@@ -34,4 +52,16 @@ private:
 	void* context_;
 	StaticJsonDocument<BoardConfig::RequestDocumentBytes> request_;
 	StaticJsonDocument<BoardConfig::ResponseDocumentBytes> response_;
+#if !OFFGRID_MOCK_DEVICE
+	void secureConfig(const char* command, JsonObjectConst args, JsonObject response,
+		ConfigStore& store, RadioDriver& radio);
+	static void securityFailure(JsonObject response, const Security& security);
+	static bool identity(JsonObject output, const Security& security);
+	StaticJsonDocument<16384> live_;
+	StaticJsonDocument<8192> candidate_;
+	char deviceId_[13] = {};
+	bool ledDirty_ = true;
+	bool previewPending_ = false;
+	LedPattern preview_;
+#endif
 };

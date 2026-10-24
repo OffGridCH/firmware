@@ -50,4 +50,6 @@ public:
 							 const uint8_t* ciphertext, size_t ciphertextLength,
 							 const uint8_t tag[GcmTagBytes], uint8_t* plaintext);
 	static void zeroize(void* data, size_t length);
+	static bool verifyP256(const uint8_t publicKey[65], const uint8_t* message,
+		size_t length, const uint8_t* signature, size_t signatureLength);
 };

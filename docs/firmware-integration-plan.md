@@ -40,7 +40,7 @@ specification conflict explicitly; do not silently weaken a security requirement
 | `CryptoEngine` | Randomness, hashes, HMAC/HKDF, X25519, AES-GCM/CCM and zeroization; previous device checks passed | Reuse vetted primitives; add a vetted SipHash implementation when relay dedupe needs it; preserve known-answer diagnostics |
 | `RadioDriver` | Actual SX1262 RX/TX, CAD, backoff, completion events, timeouts, recovery, stats | Connect to MeshEngine; preserve hardware completion semantics; finish fault/load acceptance; airtime regulation remains missing |
 | `VaultStore` | Authenticated versioned records, two banks, durable activation, explicit statuses and wipe-on-close | Real lifecycle/contact integration; power-cut acceptance |
-| `Security` | Placeholder; current state changes are mock behavior | Real identity, provisioning, protected token unwrap, unlock verification, failure backoff, key cleanup, timeout and token rotation |
+| `Security` | Real wrapped-token sessions, persistent identity, backoff, cleanup, timeout, rotation and app/master reset authorization in secure profiles | Contact load/lock wiring; power-cut/fault acceptance and hardening |
 | `Contacts` | Placeholder; mock has 32 public RAM slots | Decrypted contact keys, persistence, counters/reservations, replay windows, deletion/replacement cleanup |
 | `Pairing` | Placeholder; mock parses QR and calculates fingerprints | Real shared-key derivation, persistent contact insertion, expiry/cancel cleanup, collision handling |
 | `PacketCodec` | Placeholder | Encode/decode TEXT, REACTION, GEO and ACK; construct authenticated headers/nonces; encrypt and verify packets |
@@ -109,14 +109,15 @@ or message-delivery decision path.
   Retain legacy fields only if required for compatibility, always inactive; do
   not let them suggest a reset is armed or physical input exists.
 - `sys.factory_reset` must not report armed/success when it cannot be confirmed.
-  Until an owner-approved replacement exists, return existing `E_BUSY` with an
-  explicit buttonless-reset-unavailable explanation and perform no erase.
+  **Owner-approved update during execution:** secure profiles now use fresh
+  action-bound registered-app token proof or an owner-signed 30-second, single-use
+  device-bound challenge. Only the public fleet key is embedded. Legacy mocks
+  retain `E_BUSY`; no unauthenticated serial erase or physical arm window exists.
 - Do not turn locked-device factory reset into an unauthenticated serial wipe.
   Normal authenticated unlock/token rotation can proceed independently.
-- Lost-phone/corrupt-vault recovery needs an explicit maintenance or approved
-  replacement reset policy. This is a release decision gate, not permission for
-  the agent to choose a weaker policy. Do not make recovery depend on the missing
-  button. Keep erase operations explicit and operator-authorized.
+- Lost-phone/corrupt-vault recovery uses that approved master authority without
+  decrypting the vault. Keep erase operations explicit and operator-authorized,
+  protect/back up the private operator key, and validate power-cut recovery.
 
 ## 5. Branches and Commit Stages
 
@@ -287,7 +288,7 @@ available UI hardware. Missing physical hardware is an explicit acceptance gap.
    controls, fixed-key fixtures and secret-bearing debug paths from normal builds.
 3. `docs(release): record acceptance evidence and remaining hardening gates`.
 
-Release remains blocked on an approved buttonless recovery/reset policy, lawful
+Release remains blocked on power-cut/fault acceptance of buttonless recovery, lawful
 airtime/duty-cycle controls, signing/update/recovery strategy, and deliberate
 Secure Boot/flash-encryption/debug-access configuration. Never burn irreversible
 eFuses or erase a user's vault autonomously. Those require owner authorization.
@@ -433,4 +434,28 @@ host responsiveness, recovery, and the release gates separately with evidence.
   under `~/.config/offgrid/`, mode 0600. Only its public trust key may enter
   firmware. Back up the private key securely before relying on master recovery.
 
-Next: secure lifecycle and signed maintenance recovery. Mesh remains absent.
+- Stage 4: `secure_dev`/`secure_dev_usb` explicitly compile with mock disabled.
+  App owns the real stores/Security/radio. Implemented one-use X25519 sessions,
+  device-bound AES-GCM token unwrap, persistent identity, failure backoff,
+  heartbeat/explicit lock cleanup and durable token rotation. Real contact and
+  message integration is still unavailable and fails explicitly.
+- Implemented the approved reset policy: distinct `og-reset-wrap-v1` proof for
+  app reset, P-256/SHA-256 owner signature over a fresh 49-byte device-bound
+  challenge for master recovery, and a durable reset authorization marker.
+  No private master key or device token enters source/flash/logs. Added explicit
+  `--master-reset --confirm-erase` and secure lifecycle acceptance modes to the
+  existing tool. Credentials and original-settings backups stay private outside
+  the repository; interrupted rotation preserves both candidate tokens.
+- Four affected profiles build; touched C++/Python editor diagnostics are clean.
+  On-device secure checks pass: correct/wrong token, consumed sessions, 2-second
+  backoff, MCU reboot identity persistence, rotation/old-token rejection, timeout,
+  wrong-action reset proof, app reset, invalid master signature, consumed master
+  challenge and valid master reset. Original settings restored and a fresh real
+  vault left locked. 135 startup/Home pings: maximum RTT 15.0 ms.
+  No actual power-cut injection, corrupt production-vault injection or second
+  board evidence is claimed.
+- Owner requests deletion of MockDevice after real domain replacement, including
+  its mock profiles/check paths. Keep the real transport/configuration and isolate
+  lab diagnostics. This cleanup follows real contacts/messaging, not a mock rename.
+
+Next: contacts/pairing and packet codec, then real messaging/relay wiring.

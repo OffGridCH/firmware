@@ -5,7 +5,13 @@
 #include "drivers/LedDriver.h"
 #include "drivers/OledDriver.h"
 #include "host/Commands.h"
+#if OFFGRID_MOCK_DEVICE
 #include "host/MockDevice.h"
+#else
+#include "security/Security.h"
+#include "storage/ConfigStore.h"
+#include "storage/VaultStore.h"
+#endif
 #include "host/SerialLink.h"
 
 class App {
@@ -22,12 +28,23 @@ private:
 		JsonObjectConst arguments, JsonObject response, uint64_t nowMs);
 	static void onUiEvent(void* context, UiEvent event, uint64_t nowMs);
 	void updateUi(uint64_t nowMs);
+#if !OFFGRID_MOCK_DEVICE
+	static void onLock(void* context);
+	bool finishReset();
+#endif
 
 	SerialLink serialLink_;
-#if OFFGRID_RADIO_DIAGNOSTICS
+#if OFFGRID_RADIO_DIAGNOSTICS || !OFFGRID_MOCK_DEVICE
 	RadioDriver radioDriver_;
 #endif
+#if OFFGRID_MOCK_DEVICE
 	MockDevice device_;
+#else
+	ConfigStore configStore_;
+	VaultStore vaultStore_;
+	Security security_{vaultStore_};
+	Commands::Action action_ = Commands::Action::None;
+#endif
 	Commands commands_;
 	LedDriver ledDriver_;
 	OledDriver oledDriver_;

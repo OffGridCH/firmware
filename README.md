@@ -1,7 +1,50 @@
 # Offgrid Firmware
 
-Firmware for the Heltec WiFi LoRa 32 V3. This branch currently builds a
-**serial development mock**, not a secure modem. Use synthetic data only.
+Firmware for the Heltec WiFi LoRa 32 V3. Explicit development profiles provide a
+**real persistent encrypted vault** or the older serial mock. Encrypted RF
+messaging is not wired yet; these are not production-ready modem images.
+
+## Real Vault and Recovery
+
+```sh
+pio run -e secure_dev -t upload --upload-port /dev/ttyUSB0
+python3 tools/serial-check.py --port /dev/ttyUSB0 --secure-check --allow-secure-changes
+```
+
+`secure_dev_usb` is the native-USB counterpart. These profiles compile without
+MockDevice and never bypass authentication. They implement real X25519-wrapped
+token provisioning/unlock, encrypted identity persistence, key cleanup, timeout,
+failure backoff and two-generation token rotation. Contact/message commands
+currently fail explicitly pending their real integrations.
+
+The checker retains a synthetic device token privately under `~/.config/offgrid/`
+(mode 0600). Back it up; never commit or share it. This host test credential is
+not an Android Keystore replacement. Normal firmware never stores the token.
+The original saved settings are backed up there and restored after acceptance.
+
+Factory reset in secure profiles requires fresh app-token authentication using
+the action-specific `og-reset-wrap-v1` label, or an owner-signed 30-second
+single-use device challenge. The firmware contains only the fleet public trust
+key. The authorized owner private key was generated outside the repository at
+`~/.config/offgrid/master-reset.pem`, mode 0600. **Back up this private key
+securely**; anyone holding it can erase devices trusting its public key.
+
+```sh
+python3 tools/serial-check.py --port /dev/ttyUSB0 --master-reset --confirm-erase
+```
+
+That maintenance command erases the device's vault and configuration and does
+not restore them. It works without the app token, including when vault loading
+fails, provided NVS and the trusted firmware still function. It does not burn
+eFuses or erase unrelated namespaces. `--secure-check --allow-secure-changes
+--confirm-erase` instead tests both reset authorities with synthetic vault data,
+restores saved settings, then leaves a fresh real vault locked with its retained
+local credential. Do not use that acceptance mode on personal identities.
+
+UART/native-USB builds and connected-board lifecycle/reset checks pass. Tested
+invalid signature, consumed challenge, wrong action/token, session reuse, rate
+limit, rotation, heartbeat lock, MCU reboot identity persistence and settings
+restoration. Actual power-cut fault injection and multi-board acceptance remain.
 
 ## Current Stage
 
@@ -36,8 +79,8 @@ transfers; LED output uses PWM and two GRB 800 kHz NeoPixel strips. Readiness is
 `sys.status.result.ui`. A failed peripheral never blocks the other modules.
 See the short [LED/OLED handoff](docs/app-core-handoff.md) for independent work
 boundaries, driver contracts, automatic overlays and device checks. GPIO0 is not
-an application input. Factory reset is unavailable (`E_BUSY`) until the owner
-approves a replacement maintenance/recovery policy.
+an application input. The legacy mock rejects reset (`E_BUSY`); secure profiles
+use the authenticated recovery policy above.
 
 ## Radio Bring-Up
 
@@ -104,9 +147,9 @@ pio run -e serial_mock_usb -t upload --upload-port /dev/ttyACM0
 pio device monitor -e serial_mock_usb --port /dev/ttyACM0
 ```
 
-Replace the example ports as needed. Both profiles set `OFFGRID_MOCK_DEVICE=1`;
-the mock entry point deliberately refuses to compile without it. Neither is a
-production build. Do not assume a connector exposes both USB interfaces.
+Replace the example ports as needed. These two mock profiles set
+`OFFGRID_MOCK_DEVICE=1`; secure profiles explicitly set it to 0 exactly once.
+No profile is release-hardened. Do not assume a connector exposes both interfaces.
 
 Close the monitor before another host application connects. DTR/RTS are disabled
 in monitor configuration to reduce unintended resets. ROM boot text can still

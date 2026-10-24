@@ -6,7 +6,10 @@ import base64
 import copy
 from collections import deque
 import json
+import os
 from pathlib import Path
+import stat
+import tempfile
 import time
 
 
@@ -66,6 +69,8 @@ class Device:
         raise TimeoutError("device response timed out")
 
     def call(self, command, arguments=None, error=None):
+        if command in ("sys.reboot", "sys.factory_reset"):
+            self.events = deque((event for event in self.events if event["evt"] != "sys.boot"), maxlen=128)
         self.reference += 1
         request = {"id": self.reference, "cmd": command}
         if arguments is not None:
@@ -73,7 +78,10 @@ class Device:
         wire = json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode() + b"\n"
         if len(wire) > 2048:
             raise ValueError("request exceeds serial wire limit")
-        print(">", wire.decode().strip())
+        if arguments and "wrapped_token" in arguments:
+            print(">", json.dumps({"id": self.reference, "cmd": command, "args": "[wrapped credential redacted]"}))
+        else:
+            print(">", wire.decode().strip())
         self.connection.write(wire)
         deadline = time.monotonic() + 6
         while True:
@@ -249,6 +257,196 @@ def exercise_led(device):
     print("PASS: onboard/strip driver levels, quiet/enabled, brightness and finite preview; visual acceptance pending.")
 
 
+def write_credentials(path, values, create=False):
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=".offgrid-", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            json.dump(values, output)
+            output.flush()
+            os.fsync(output.fileno())
+        if create:
+            os.link(temporary, path)
+            os.unlink(temporary)
+        else:
+            os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def read_credentials(path):
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(descriptor, encoding="utf-8") as source:
+        if stat.S_IMODE(os.fstat(source.fileno()).st_mode) & 0o077:
+            raise RuntimeError("credential file must be private (mode 0600)")
+        return json.load(source)
+
+
+def wrapped_arguments(hello, token, reset=False):
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+    private = X25519PrivateKey.generate()
+    public = private.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    device_id = bytes.fromhex(hello["device_id"])
+    shared = private.exchange(X25519PublicKey.from_public_bytes(base64.b64decode(hello["session"]["device_eph_pub"])))
+    label = b"og-reset-wrap-v1" if reset else b"og-unlock-wrap-v1"
+    key = HKDF(hashes.SHA256(), 32, base64.b64decode(hello["session"]["nonce"]), label + device_id).derive(shared)
+    iv = os.urandom(12)
+    wrapped = iv + AESGCM(key).encrypt(iv, token, device_id)
+    return {"app_eph_pub": base64.b64encode(public).decode(),
+            "wrapped_token": base64.b64encode(wrapped).decode()}
+
+
+def secure_unlock(device, token, hello=None):
+    hello = hello or device.call("sys.hello")
+    if hello.get("mock") is not False:
+        raise RuntimeError("refusing real credentials on mock/unknown firmware")
+    if hello["state"] == "unlocked":
+        return device.call("id.get")
+    operation = "sec.provision" if hello["state"] == "unprovisioned" else "sec.unlock"
+    result = device.call(operation, wrapped_arguments(hello, token))
+    device.event("sec.state", lambda data: data["state"] == "unlocked")
+    return result
+
+
+def master_reset(device, hello, key_path, test_invalid=False):
+    import hashlib
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    if hello.get("mock") is not False:
+        raise RuntimeError("master reset requires explicit secure firmware")
+    descriptor = os.open(key_path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(descriptor, "rb") as source:
+        if stat.S_IMODE(os.fstat(source.fileno()).st_mode) & 0o077:
+            raise RuntimeError("master private key must be private (mode 0600)")
+        key = serialization.load_pem_private_key(source.read(), password=None)
+    if not isinstance(key, ec.EllipticCurvePrivateKey) or not isinstance(key.curve, ec.SECP256R1):
+        raise RuntimeError("master key must be P-256")
+    challenge = device.call("sys.reset_challenge")
+    message = base64.b64decode(challenge["message"], validate=True)
+    if len(message) != 49 or message[:17] != b"og-reset-v1" + bytes.fromhex(hello["device_id"]):
+        raise RuntimeError("reset challenge has wrong action/device binding")
+    public = key.public_key().public_bytes(serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint)
+    require_equal(base64.b64decode(challenge["key_id"], validate=True), hashlib.sha256(public).digest(),
+                  "firmware trusts this master key")
+    signature = key.sign(message, ec.ECDSA(hashes.SHA256()))
+    if test_invalid:
+        changed = bytearray(signature)
+        changed[-1] ^= 1
+        device.call("sys.factory_reset", {"confirm": "ERASE", "method": "master",
+                                        "signature": base64.b64encode(changed).decode()},
+                    error="E_UNLOCK_FAILED")
+        device.call("sys.factory_reset", {"confirm": "ERASE", "method": "master",
+                                        "signature": base64.b64encode(signature).decode()},
+                    error="E_UNLOCK_FAILED")
+        challenge = device.call("sys.reset_challenge")
+        message = base64.b64decode(challenge["message"], validate=True)
+        if len(message) != 49 or message[:17] != b"og-reset-v1" + bytes.fromhex(hello["device_id"]):
+            raise RuntimeError("replacement challenge has wrong action/device binding")
+        signature = key.sign(message, ec.ECDSA(hashes.SHA256()))
+    device.call("sys.factory_reset", {"confirm": "ERASE", "method": "master",
+                                    "signature": base64.b64encode(signature).decode()})
+    device.event("sys.boot", lambda data: data["state"] == "unprovisioned", timeout=15)
+    print("PASS: owner-signed maintenance reset completed.")
+
+
+def exercise_secure(device, credential_path, master_key, erase):
+    hello = device.connect()
+    if hello.get("mock") is not False:
+        raise RuntimeError("flash secure_dev first; never test real authentication against a mock")
+    credential_path = credential_path or Path.home() / ".config/offgrid" / f"device-{hello['device_id']}.json"
+    if credential_path.exists():
+        credentials = read_credentials(credential_path)
+        require_equal(credentials["device_id"], hello["device_id"], "credential board ID")
+    else:
+        if hello["state"] != "unprovisioned":
+            raise RuntimeError("existing vault requires its original credential; refusing overwrite")
+        credentials = {"device_id": hello["device_id"], "token": base64.b64encode(os.urandom(32)).decode()}
+        write_credentials(credential_path, credentials, create=True)
+    token = base64.b64decode(credentials["token"], validate=True)
+    if len(token) != 32:
+        raise RuntimeError("credential token has invalid length")
+    if "pending_token" in credentials:
+        raise RuntimeError("interrupted rotation: preserve both credentials and explicitly recover before testing")
+    identity = secure_unlock(device, token, hello)
+    if "public_key" in credentials and not credentials.get("reset_in_progress"):
+        require_equal(identity["public_key"], credentials["public_key"], "persisted identity")
+    credentials["public_key"] = identity["public_key"]
+    if "original" not in credentials:
+        credentials["original"] = read_configuration(device)
+    write_credentials(credential_path, credentials)
+    device.call("sec.set_policy", {"lock_timeout_s": 120, "persist": False})
+    device.call("sys.hello", {"app_proto": "1.4"})
+    device.call("sys.hello", {"app_proto": "2.0"}, error="E_PROTO_MISMATCH")
+    device.call("sys.factory_reset", error="E_CONFIRM_REQUIRED")
+    device.call("sec.lock")
+    device.event("sec.state", lambda data: data["state"] == "locked")
+    for _ in range(3):
+        invalid = wrapped_arguments(device.call("sys.hello"), os.urandom(32))
+        device.call("sec.unlock", invalid, error="E_UNLOCK_FAILED")
+        device.call("sec.unlock", invalid, error="E_NO_SESSION")
+    limited = wrapped_arguments(device.call("sys.hello"), token)
+    device.call("sec.unlock", limited, error="E_RATE_LIMITED")
+    time.sleep(2.1)
+    secure_unlock(device, token)
+    device.call("sec.set_policy", {"lock_timeout_s": 120, "persist": False})
+    wrong_action = wrapped_arguments(device.call("sys.hello"), token)
+    device.call("sys.factory_reset", dict(wrong_action, confirm="ERASE"), error="E_UNLOCK_FAILED")
+    device.call("sys.reboot")
+    device.event("sys.boot", lambda data: data["state"] == "locked", timeout=15)
+    require_equal(secure_unlock(device, token)["public_key"], credentials["public_key"], "identity after MCU reboot")
+    replacement = os.urandom(32)
+    credentials["pending_token"] = base64.b64encode(replacement).decode()
+    write_credentials(credential_path, credentials)
+    device.call("sec.rotate_token", wrapped_arguments(device.call("sys.hello"), replacement))
+    credentials["token"] = credentials.pop("pending_token")
+    write_credentials(credential_path, credentials)
+    old = token
+    token = replacement
+    device.call("sec.lock")
+    device.event("sec.state", lambda data: data["state"] == "locked")
+    device.call("sec.unlock", wrapped_arguments(device.call("sys.hello"), old), error="E_UNLOCK_FAILED")
+    secure_unlock(device, token)
+    device.call("sec.set_policy", {"lock_timeout_s": 1, "persist": False})
+    device.event("sec.state", lambda data: data["reason"] == "heartbeat_timeout", timeout=4)
+    secure_unlock(device, token)
+    device.call("sec.set_policy", {"lock_timeout_s": 120, "persist": False})
+    if erase:
+        credentials["reset_in_progress"] = True
+        write_credentials(credential_path, credentials)
+        device.call("sys.factory_reset",
+                    dict(wrapped_arguments(device.call("sys.hello"), token, reset=True), confirm="ERASE"))
+        device.event("sys.boot", lambda data: data["state"] == "unprovisioned", timeout=15)
+        secure_unlock(device, token)
+        device.call("sec.lock")
+        device.event("sec.state", lambda data: data["state"] == "locked")
+        master_reset(device, device.call("sys.hello"), master_key, test_invalid=True)
+        credentials.pop("public_key", None)
+        write_credentials(credential_path, credentials)
+        credentials["public_key"] = secure_unlock(device, token)["public_key"]
+        write_credentials(credential_path, credentials)
+    save_configuration(device, credentials["original"])
+    device.call("sys.reboot")
+    device.event("sys.boot", lambda data: data["state"] == "locked", timeout=15)
+    require_equal(secure_unlock(device, token)["public_key"], credentials["public_key"], "final persistent identity")
+    require_equal(read_configuration(device), credentials["original"], "original settings restored")
+    credentials.pop("reset_in_progress", None)
+    write_credentials(credential_path, credentials)
+    device.call("sec.lock")
+    device.event("sec.state", lambda data: data["state"] == "locked")
+    print(f"PASS: real provisioning, reboot/unlock, wrong token, sessions/backoff, rotation and timeout. Credential retained privately: {credential_path}")
+
+
 def unlock_mock(device, hello=None):
     if hello is None:
         hello = device.call("sys.hello")
@@ -370,6 +568,15 @@ def main():
                         help="measure ping RTT across OLED startup/Home without changing settings")
     parser.add_argument("--led-check", action="store_true",
                         help="check LED output levels using temporary settings and restore them")
+    parser.add_argument("--secure-check", action="store_true",
+                        help="test real vault lifecycle; creates a private local credential, never uses mock unlock")
+    parser.add_argument("--allow-secure-changes", action="store_true")
+    parser.add_argument("--credentials", type=Path, help="private per-device credential file")
+    parser.add_argument("--master-reset", action="store_true",
+                        help="authorize reset using the owner-held master private key")
+    parser.add_argument("--master-key", type=Path, default=Path.home() / ".config/offgrid/master-reset.pem")
+    parser.add_argument("--confirm-erase", action="store_true",
+                        help="explicitly authorize vault/settings erasure; secure-check restores saved settings")
     parser.add_argument("--state", type=Path, default=Path("config-check-state.json"),
                         help="local original/expected settings snapshot for storage checks")
     parser.add_argument("--allow-config-changes", action="store_true",
@@ -389,7 +596,8 @@ def main():
         parser.error(f"--args is not valid JSON: {error}")
     if not isinstance(command_args, dict):
         parser.error("--args must be a JSON object")
-    if sum(bool(mode) for mode in (args.command, args.radio_peer, args.storage_phase, args.ui_check, args.led_check)) > 1:
+    if sum(bool(mode) for mode in (args.command, args.radio_peer, args.storage_phase, args.ui_check,
+                                  args.led_check, args.secure_check, args.master_reset)) > 1:
         parser.error("choose only one command/checker mode")
     read_only = {"sys.hello", "sys.status", "sys.ping", "radio.get", "mesh.get", "led.get",
                  "diag.radio.status", "mock.crypto.selftest"}
@@ -405,7 +613,14 @@ def main():
         parser.error("--allow-config-changes is required; storage checks modify real NVS settings")
     if args.led_check and not args.allow_mock_changes:
         parser.error("--led-check requires --allow-mock-changes")
-    if not args.command and not args.storage_phase and not args.radio_peer and not args.ui_check and not args.allow_mock_changes:
+    if args.secure_check and not args.allow_secure_changes:
+        parser.error("--secure-check requires --allow-secure-changes")
+    if args.master_reset and not args.confirm_erase:
+        parser.error("--master-reset requires --confirm-erase")
+    if args.confirm_erase and not (args.master_reset or args.secure_check):
+        parser.error("--confirm-erase applies only to --master-reset or --secure-check")
+    if not any((args.command, args.storage_phase, args.radio_peer, args.ui_check, args.secure_check,
+                args.master_reset)) and not args.allow_mock_changes:
         parser.error("--allow-mock-changes is required; this modifies a flashed mock")
     import serial
 
@@ -422,6 +637,11 @@ def main():
             exercise_ui(Device(connection))
         elif args.led_check:
             exercise_led(Device(connection))
+        elif args.secure_check:
+            exercise_secure(Device(connection), args.credentials, args.master_key, args.confirm_erase)
+        elif args.master_reset:
+            device = Device(connection)
+            master_reset(device, device.connect(), args.master_key)
         elif args.radio_peer:
             peer = serial.Serial(port=None, baudrate=args.baud, timeout=0.2, write_timeout=3)
             peer.dtr = False

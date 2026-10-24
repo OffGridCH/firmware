@@ -244,7 +244,7 @@ stateDiagram-v2
 
 | Command | unprovisioned | locked | unlocked |
 |---|:-:|:-:|:-:|
-| `sys.hello`, `sys.status`, `sys.ping`, `sys.reboot`, `sys.factory_reset`, `sys.set_log_level` | ✅ | ✅ | ✅ |
+| `sys.hello`, `sys.status`, `sys.ping`, `sys.reboot`, `sys.factory_reset`, `sys.reset_challenge`, `sys.set_log_level` | ✅ | ✅ | ✅ |
 | `sec.provision` | ✅ | ❌ | ❌ |
 | `sec.unlock` | ❌ | ✅ | ❌ |
 | `sec.lock`, `sec.rotate_token`, `sec.get_policy`, `sec.set_policy` | ❌ | ❌ | ✅ |
@@ -352,7 +352,7 @@ The device locks when **any** of these happens:
 | `sec.lock` | Explicit |
 | **Heartbeat timeout** | No valid line from the app for `lock_timeout_s` (default 15 s, configurable, 0 disables). Any valid command counts as activity, `sys.ping` is the dedicated heartbeat |
 | Reboot or power loss | Always boots into `locked` |
-| `sys.factory_reset` | Unavailable on buttonless hardware; no lifecycle change |
+| `sys.factory_reset` | Authorized reset wipes vault and configuration, then reboots |
 
 On lock the device: zeroes the keys in RAM, fails all in-flight messages (`msg.status` with `failed`, reason `locked`), clears the queue and stops the radio. If `mesh.relay_when_locked` is true the radio keeps running as a **keyless relay** (see [Offgrid Protocol §11](offgrid-protocol.md): relays never need keys).
 
@@ -390,12 +390,37 @@ eFuse settings are **irreversible**, so enable them only on devices you are happ
 
 ### 6.11 Factory reset
 
-The connected hardware has no usable application button. The old PRG-hold
-workflow is cancelled. `sys.factory_reset` without `"confirm": "ERASE"` returns
-`E_CONFIRM_REQUIRED`; with it, returns `E_BUSY` explaining buttonless reset is
-unavailable. It never arms, erases or changes state. An owner-approved maintenance
-or recovery policy is required before reset can be enabled. Do not substitute an
-unauthenticated serial wipe.
+The connected hardware has no usable application button. The owner approved
+two authenticated reset authorities; the old PRG-hold workflow is cancelled.
+Both require `"confirm": "ERASE"` (`E_CONFIRM_REQUIRED` otherwise):
+
+- **Registered app:** call `sys.hello`, wrap the existing token with the same
+  format as unlock, but HKDF info **`"og-reset-wrap-v1" || device_id_bytes`**.
+  Send `sys.factory_reset` with `method: "app"` (default), `app_eph_pub` and
+  `wrapped_token`. The token must authenticate the active vault. A normal unlock
+  envelope cannot authorize reset. This works locked or unlocked.
+- **Master maintenance tool:** `sys.reset_challenge` works in every state and
+  returns `{message, key_id, expires_s:30, algorithm:"ECDSA-P256-SHA256"}`.
+  `message` is Base64 of `"og-reset-v1" || device_id_bytes(6) || random_nonce(32)`,
+  exactly 49 bytes. `key_id` is Base64 SHA-256 of the trusted uncompressed P-256
+  public point (65 bytes). The owner signs the message using ECDSA with SHA-256
+  and submits `method:"master", signature:<canonical Base64 DER signature>`.
+  The challenge is single-use on any attempt, expires in 30 seconds, and is
+  replaced by a new challenge. It needs no working vault or app credential.
+
+The firmware contains only the owner fleet public key; the private master key
+stays with the operator. Only devices trusting that public key accept it. No
+universal secret is embedded. Losing both app credential and master key requires
+separately authorized operator recovery; development firmware does not disable
+ROM flashing or burn eFuses.
+
+Authorization is durably marked before returning `{pending:true}`. After the
+response drains, own work/keys are stopped, `og_vault` and `og_cfg` are erased
+and the device restarts unprovisioned. An interrupted authorized reset resumes
+at boot from its marker; unknown/unreadable markers fail closed. Errors never
+report a completed erase. No unrelated NVS namespaces are cleared.
+Legacy mock images still return `E_BUSY` without erasing; they cannot test reset
+authentication and will be removed after real domain replacement.
 
 ---
 
@@ -460,12 +485,13 @@ Heartbeat and activity signal. Resets the auto-lock timer.
 Sends the response, then restarts. The device comes back `locked`. A `sys.boot` event follows.
 
 #### `sys.factory_reset`
-Unavailable on buttonless boards ([section 6.11](#611-factory-reset)).
-Without `"confirm": "ERASE"` it fails with `E_CONFIRM_REQUIRED`; otherwise `E_BUSY`.
+Authenticated buttonless reset ([section 6.11](#611-factory-reset)).
+Without `"confirm": "ERASE"` it fails with `E_CONFIRM_REQUIRED`. Other failures:
+`E_NO_SESSION`, `E_UNLOCK_FAILED`, `E_RATE_LIMITED`, `E_INTERNAL`.
 
 ```json
-→ {"id":4,"cmd":"sys.factory_reset","args":{"confirm":"ERASE"}}
-← {"id":4,"ok":false,"error":{"code":"E_BUSY","message":"factory reset unavailable on buttonless hardware; approved maintenance recovery required"}}
+→ {"id":4,"cmd":"sys.factory_reset","args":{"confirm":"ERASE","method":"master","signature":"<Base64 DER signature of the fresh challenge>"}}
+← {"id":4,"ok":true,"result":{"pending":true}}
 ```
 
 #### `sys.set_log_level`
@@ -1141,7 +1167,7 @@ The first byte is `68` here because one relay already decremented `HOP_LEFT` fro
 | Heartbeat | App pings every 5 s |
 | Default `lock_timeout_s` | 15 s |
 | Pairing expiry | 300 s |
-| Factory reset | Disabled on buttonless hardware; approved recovery policy pending |
+| Factory reset | Fresh app-token proof or owner signature; master challenge expires in 30 s |
 | Unlock failure delay | 2 s, doubling, max 60 s, after 3 failures |
 | Unlock token | 32 bytes |
 | Wrapped token | 60 bytes (12 IV + 32 ciphertext + 16 tag) |

@@ -155,10 +155,10 @@ There is no separate renderer class.
 ### Buttonless hardware
 
 Never configure or poll GPIO0 for application input. No page cycling or physical
-reset confirmation exists. `sys.factory_reset` validates `confirm: "ERASE"` but
-returns `E_BUSY` without arming or erasing. Lost-phone/corrupt-vault recovery is
-blocked pending an owner-approved maintenance policy; serial is not an
-unauthenticated wipe mechanism.
+reset confirmation exists. Secure profiles require fresh action-bound app-token
+proof or an owner-signed single-use reset challenge. The owner private key is
+external; only the public trust key enters firmware. See host section 6.11 for the
+approved recovery contract. Legacy mocks return `E_BUSY` without erasing.
 
 ### SerialLink
 
@@ -223,8 +223,9 @@ ephemeral secrets on every completion/failure path. Emits lifecycle requests or
 notifications to `App` so lock also cancels pairing, wipes contact RAM and queued
 plaintext, clears vault-key RAM, and changes radio mode. State becomes unlocked
 only after the complete required vault load succeeds; failed loads wipe partial
-results. Reset/recovery remains unavailable until an owner-approved buttonless
-maintenance policy is implemented; neither storage area is erased by serial.
+results. Reset authorization uses an action-bound wrapped token or the owner
+master signature. App executes the durably authorized reset only after its
+response drains; interrupted reset resumes from a plaintext marker at boot.
 
 ### Contacts
 
@@ -255,8 +256,9 @@ encoding, validation on load, persistence, and reset. NVS open/read/write helper
 remain private; a separate `NvsPartition` class is unnecessary.
 
 The current implementation persists radio/mesh/LED settings and timeout policy
-in one schema-1 `og_cfg/settings` blob. Vault salt/generation metadata remain
-future work. See the [storage module README](../src/storage/README.md) for current
+in one schema-1 `og_cfg/settings` blob. Separate `og_cfg/vault` metadata selects
+the active encrypted generation; `og_cfg/reset` journals an authorized reset.
+See the [storage module README](../src/storage/README.md) for current
 interfaces, corruption handling, and the reset-rejection device check.
 
 ### VaultStore

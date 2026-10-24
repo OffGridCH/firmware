@@ -21,6 +21,9 @@ public:
 	static int32_t readVaultMetadata(uint8_t* output, size_t& length, const char* space = "og_cfg");
 	static int32_t writeVaultMetadata(const uint8_t* input, size_t length, const char* space = "og_cfg");
 	static int32_t eraseVaultMetadata(const char* space = "og_cfg");
+	static int32_t resetPending(bool& pending);
+	static int32_t beginReset();
+	bool validCategory(const char* category, JsonObjectConst candidate);
 
 private:
 	static constexpr uint32_t SchemaVersion = 1;

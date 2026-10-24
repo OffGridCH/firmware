@@ -4,6 +4,7 @@
 #include <esp_system.h>
 #include <mbedtls/ccm.h>
 #include <mbedtls/ecdh.h>
+#include <mbedtls/ecdsa.h>
 #include <mbedtls/ecp.h>
 #include <mbedtls/gcm.h>
 #include <mbedtls/md.h>
@@ -37,6 +38,22 @@ bool isAllZero(const uint8_t* value, size_t length) {
 	}
 	return combined == 0;
 }
+}
+
+bool CryptoEngine::verifyP256(const uint8_t publicKey[65], const uint8_t* message,
+	size_t length, const uint8_t* signature, size_t signatureLength) {
+	if (!publicKey || !message || !signature || signatureLength < 8 || signatureLength > 72) return false;
+	uint8_t digest[32];
+	mbedtls_ecdsa_context context;
+	mbedtls_ecdsa_init(&context);
+	const bool ok = sha256(message, length, digest) &&
+		mbedtls_ecp_group_load(&context.grp, MBEDTLS_ECP_DP_SECP256R1) == 0 &&
+		mbedtls_ecp_point_read_binary(&context.grp, &context.Q, publicKey, 65) == 0 &&
+		mbedtls_ecp_check_pubkey(&context.grp, &context.Q) == 0 &&
+		mbedtls_ecdsa_read_signature(&context, digest, sizeof(digest), signature, signatureLength) == 0;
+	mbedtls_ecdsa_free(&context);
+	zeroize(digest, sizeof(digest));
+	return ok;
 }
 
 bool CryptoEngine::randomBytes(uint8_t* output, size_t length) {

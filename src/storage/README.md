@@ -72,8 +72,8 @@ Both phases passed on the connected board, across hardware reset: authenticated
 round trip, wrong key/generation and modified-tag rejection, cleared failed
 plaintext, refusal to activate an incomplete bank, contact slot 32/deletion and
 two generation switches with old-key rejection. This is not power-cut injection
-or physical power-removal evidence. Real secure lifecycle and authorized reset
-integration are the next stage; no mock authentication opens a real vault.
+or physical power-removal evidence. Real secure lifecycle and authorized reset now use these APIs in `secure_dev`;
+no mock authentication opens a real vault.
 
 ## Interface
 
@@ -123,11 +123,13 @@ can still be used. Boot emits an error event when loading fails; `sys.status`
 includes `storage.backend`, `config_status`, `writable`, and `last_error`.
 Hello advertises `config_storage: "nvs"` and `config_schema: 1`.
 
-Factory reset is unavailable on buttonless hardware. `confirm: "ERASE"` returns
-`E_BUSY`, with no erase or arm window; missing confirmation still returns
-`E_CONFIRM_REQUIRED`. Recovery requires an owner-approved maintenance policy.
-The internal `eraseAll()` primitive has no serial command path. If NVS cannot
-initialize, the module never erases the partition as an automatic recovery shortcut.
+Legacy mock reset is unavailable (`E_BUSY`). Secure profiles use the approved
+fresh app-token proof or owner-signed device challenge described in host section
+6.11. `og_cfg/reset` is committed before accepting a reset; App then erases vault
+records/metadata first, settings and marker last, and reboots. A hardware reset
+mid-erase resumes that previously authorized operation. An unreadable/unknown
+marker blocks provisioning rather than implying fresh storage. If NVS cannot
+initialize, no partition-wide automatic recovery erase occurs.
 
 `sys.reboot` is still simulated, but reloads configuration from actual NVS. A
 physical reset/power cycle also reloads it. Mock provisioning and contacts are

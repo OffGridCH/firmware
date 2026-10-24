@@ -1,5 +1,14 @@
 # Host API and Serial Mock
 
+## Real secure profile
+
+`secure_dev` and `secure_dev_usb` do not include this mock backend. Their real
+command groups are implemented in `Commands` and call App-owned domain modules.
+Lifecycle, identity, settings and authenticated recovery are wired; contact and
+message commands currently return explicit errors until their integration lands.
+See the project README and host specification section 6.11 for secure acceptance
+and app/master reset. The owner requested mock removal after domain replacement.
+
 ## Current Implementation: Serial Mock With Real Configuration Storage
 
 This folder implements the real JSON Lines transport and command-envelope

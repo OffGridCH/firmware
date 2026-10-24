@@ -56,6 +56,9 @@ void VaultStore::close() {
 
 bool VaultStore::load() {
 	close();
+	generation_ = 0;
+	bank_ = 0;
+	memset(salt_, 0, sizeof(salt_));
 	status_ = Status::Unavailable;
 	error_ = nvs_flash_init();
 	if (error_ != ESP_OK) return false;
@@ -197,6 +200,12 @@ bool VaultStore::open(const uint8_t key[32]) {
 	contacts_ = contacts;
 	open_ = true;
 	return true;
+}
+
+bool VaultStore::verifyKey(const uint8_t key[32]) {
+	if (status_ != Status::Ready) { error_ = ESP_ERR_INVALID_STATE; return false; }
+	uint32_t contacts = 0;
+	return validate(bank_, generation_, key, contacts);
 }
 
 bool VaultStore::prepare(uint8_t bank) {

@@ -235,25 +235,7 @@ private:
     }
 
     static LedPattern ledPattern(JsonVariantConst value) {
-        LedPattern pattern;
-        if (value.is<const char*>()) {
-            const char* names[] = {"off", "on", "flash", "blink_slow", "blink_fast", "double", "heartbeat", "pulse"};
-            for (size_t index = 0; index < 8; ++index) {
-                if (strcmp(value.as<const char*>(), names[index]) == 0) {
-                    pattern.kind = static_cast<LedPatternKind>(index);
-                    break;
-                }
-            }
-        } else {
-            pattern.kind = LedPatternKind::Custom;
-            const JsonArrayConst steps = value["steps"].as<JsonArrayConst>();
-            for (JsonVariantConst step : steps) {
-                if (pattern.stepCount == 16) break;
-                pattern.stepsMs[pattern.stepCount++] = step.as<uint16_t>();
-            }
-            pattern.repeat = value["repeat"] | 1;
-        }
-        return pattern;
+        return Commands::ledPattern(value);
     }
 #if OFFGRID_RADIO_DIAGNOSTICS
     void radioFailure(JsonObject response) {

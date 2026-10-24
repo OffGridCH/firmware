@@ -65,8 +65,8 @@ Do not configure or sample GPIO0 anywhere in application code. Button support
 and its placeholder are removed. Home stays the default page. Active pairing
 automatically overlays it; completed fingerprints remain for 15 seconds, errors
 for 3 seconds and RF/message activity for 5 seconds. No host paging command is
-introduced. `sys.factory_reset` returns `E_BUSY` with no arm window or erasure,
-pending an owner-approved maintenance/recovery policy.
+introduced. Legacy mock reset returns `E_BUSY`; secure profiles require fresh
+app-token proof or the owner master signature, with no physical gesture.
 
 App fans out Boot, accepted pairing start and dispatched command
 errors. The backend reports mock message TX/RX/delivery/failure and drained real

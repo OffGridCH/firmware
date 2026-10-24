@@ -10,6 +10,7 @@ public:
 
 	bool load();
 	bool open(const uint8_t key[32]);
+	bool verifyKey(const uint8_t key[32]);
 	void close();
 	bool create(const uint8_t key[32], const uint8_t salt[16],
 		const uint8_t* identity, size_t length);

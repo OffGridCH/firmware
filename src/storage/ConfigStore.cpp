@@ -5,6 +5,38 @@
 #include <nvs_flash.h>
 #include <string.h>
 
+int32_t ConfigStore::resetPending(bool& pending) {
+	pending = false;
+	nvs_handle_t handle;
+	esp_err_t error = nvs_open("og_cfg", NVS_READONLY, &handle);
+	if (error == ESP_ERR_NVS_NOT_FOUND) return ESP_OK;
+	if (error != ESP_OK) return error;
+	uint8_t marker = 0;
+	error = nvs_get_u8(handle, "reset", &marker);
+	nvs_close(handle);
+	if (error == ESP_ERR_NVS_NOT_FOUND) return ESP_OK;
+	if (error != ESP_OK) return error;
+	if (marker != 1) return ESP_ERR_INVALID_ARG;
+	pending = true;
+	return ESP_OK;
+}
+
+int32_t ConfigStore::beginReset() {
+	nvs_handle_t handle;
+	esp_err_t error = nvs_open("og_cfg", NVS_READWRITE, &handle);
+	if (error != ESP_OK) return error;
+	error = nvs_set_u8(handle, "reset", 1);
+	if (error == ESP_OK) error = nvs_commit(handle);
+	nvs_close(handle);
+	return error;
+}
+
+bool ConfigStore::validCategory(const char* category, JsonObjectConst candidate) {
+	candidate_.set(saved_);
+	candidate_[category].set(candidate);
+	return !candidate_.overflowed() && validRecord(candidate_.as<JsonObjectConst>());
+}
+
 int32_t ConfigStore::readVaultMetadata(uint8_t* output, size_t& length, const char* space) {
 	nvs_handle_t handle;
 	esp_err_t error = nvs_open(space, NVS_READONLY, &handle);
