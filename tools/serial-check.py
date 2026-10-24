@@ -447,6 +447,71 @@ def exercise_secure(device, credential_path, master_key, erase):
     print(f"PASS: real provisioning, reboot/unlock, wrong token, sessions/backoff, rotation and timeout. Credential retained privately: {credential_path}")
 
 
+def exercise_contacts(device, credential_path):
+    import hashlib
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+
+    hello = device.connect()
+    if hello.get("mock") is not False:
+        raise RuntimeError("contact acceptance requires secure firmware")
+    path = credential_path or Path.home() / ".config/offgrid" / f"device-{hello['device_id']}.json"
+    credentials = read_credentials(path)
+    require_equal(credentials["device_id"], hello["device_id"], "credential board ID")
+    token = base64.b64decode(credentials["token"], validate=True)
+    own = secure_unlock(device, token, hello)
+    original_timeout = device.call("sec.get_policy")["lock_timeout_s"]
+    device.call("sec.set_policy", {"lock_timeout_s": 120, "persist": False})
+    before = device.call("contact.list")["total"]
+    if before >= 32:
+        raise RuntimeError("no free contact slot; no existing contacts will be overwritten")
+    qr = device.call("pair.begin")["qr"]
+    device.call("pair.complete", {"qr": qr}, error="E_SELF_PAIR")
+    peer = X25519PrivateKey.generate().public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    peer_qr = base64.b64encode(b"OG1" + peer + os.urandom(16) + b"Check Peer").decode()
+    slot = None
+    try:
+        contact = device.call("pair.complete", {"qr": peer_qr})["contact"]
+        slot = contact["contact_id"]
+        first, second = sorted((base64.b64decode(own["public_key"]), peer))
+        value = int.from_bytes(hashlib.sha256(b"og1-fp" + first + second).digest()[:8], "big") % 10**12
+        fingerprint = f"{value:012d}"
+        expected = " ".join(fingerprint[index:index + 4] for index in (0, 4, 8))
+        require_equal(contact["fingerprint"], expected, "role-independent public fingerprint")
+        require_equal(contact["state"], "pending", "unconfirmed contact")
+        device.call("pair.complete", {"qr": peer_qr}, error="E_NO_PAIRING")
+        device.call("pair.begin")
+        device.call("pair.complete", {"qr": peer_qr}, error="E_CONTACT_EXISTS")
+        replacement = device.call("pair.complete", {"qr": peer_qr, "replace": True})["contact"]
+        require_equal(replacement["contact_id"], slot, "replacement preserves slot")
+        require_equal(replacement["tx_ctr"], 0, "new relationship counters")
+        device.call("contact.rename", {"contact_id": slot, "name": "Renamed Peer"})
+        device.call("sys.reboot")
+        device.event("sys.boot", lambda data: data["state"] == "locked", timeout=15)
+        secure_unlock(device, token)
+        persisted = device.call("contact.get", {"contact_id": slot})["contact"]
+        require_equal(persisted["name"], "Renamed Peer", "encrypted contact name survives reboot")
+        require_equal(persisted["fingerprint"], expected, "persisted fingerprint")
+        require_equal(base64.b64decode(persisted["public_key"]), peer, "persisted contact public key")
+        device.call("contact.delete", {"contact_id": slot, "confirm": False}, error="E_CONFIRM_REQUIRED")
+        device.call("contact.delete", {"contact_id": slot, "confirm": True})
+        device.call("contact.get", {"contact_id": slot}, error="E_NO_SUCH_CONTACT")
+        slot = None
+        device.call("sys.reboot")
+        device.event("sys.boot", lambda data: data["state"] == "locked", timeout=15)
+        secure_unlock(device, token)
+        require_equal(device.call("contact.list")["total"], before, "fixture removed without touching other contacts")
+    finally:
+        if device.call("sys.status")["state"] != "unlocked":
+            secure_unlock(device, token)
+        if slot is not None:
+            device.call("contact.delete", {"contact_id": slot, "confirm": True})
+        device.call("sec.set_policy", {"lock_timeout_s": original_timeout, "persist": False})
+        device.call("sec.lock")
+    print("PASS: real pairing/self/duplicate/replacement checks, fingerprint, encrypted CRUD and reboot persistence; two-board key agreement pending.")
+
+
 def unlock_mock(device, hello=None):
     if hello is None:
         hello = device.call("sys.hello")
@@ -570,6 +635,8 @@ def main():
                         help="check LED output levels using temporary settings and restore them")
     parser.add_argument("--secure-check", action="store_true",
                         help="test real vault lifecycle; creates a private local credential, never uses mock unlock")
+    parser.add_argument("--contact-check", action="store_true",
+                        help="test real pairing/contact persistence with one temporary synthetic peer")
     parser.add_argument("--allow-secure-changes", action="store_true")
     parser.add_argument("--credentials", type=Path, help="private per-device credential file")
     parser.add_argument("--master-reset", action="store_true",
@@ -597,7 +664,7 @@ def main():
     if not isinstance(command_args, dict):
         parser.error("--args must be a JSON object")
     if sum(bool(mode) for mode in (args.command, args.radio_peer, args.storage_phase, args.ui_check,
-                                  args.led_check, args.secure_check, args.master_reset)) > 1:
+                                  args.led_check, args.secure_check, args.contact_check, args.master_reset)) > 1:
         parser.error("choose only one command/checker mode")
     read_only = {"sys.hello", "sys.status", "sys.ping", "radio.get", "mesh.get", "led.get",
                  "diag.radio.status", "mock.crypto.selftest"}
@@ -613,13 +680,13 @@ def main():
         parser.error("--allow-config-changes is required; storage checks modify real NVS settings")
     if args.led_check and not args.allow_mock_changes:
         parser.error("--led-check requires --allow-mock-changes")
-    if args.secure_check and not args.allow_secure_changes:
-        parser.error("--secure-check requires --allow-secure-changes")
+    if (args.secure_check or args.contact_check) and not args.allow_secure_changes:
+        parser.error("secure/contact checks require --allow-secure-changes")
     if args.master_reset and not args.confirm_erase:
         parser.error("--master-reset requires --confirm-erase")
     if args.confirm_erase and not (args.master_reset or args.secure_check):
         parser.error("--confirm-erase applies only to --master-reset or --secure-check")
-    if not any((args.command, args.storage_phase, args.radio_peer, args.ui_check, args.secure_check,
+    if not any((args.command, args.storage_phase, args.radio_peer, args.ui_check, args.secure_check, args.contact_check,
                 args.master_reset)) and not args.allow_mock_changes:
         parser.error("--allow-mock-changes is required; this modifies a flashed mock")
     import serial
@@ -639,6 +706,8 @@ def main():
             exercise_led(Device(connection))
         elif args.secure_check:
             exercise_secure(Device(connection), args.credentials, args.master_key, args.confirm_erase)
+        elif args.contact_check:
+            exercise_contacts(Device(connection), args.credentials)
         elif args.master_reset:
             device = Device(connection)
             master_reset(device, device.connect(), args.master_key)

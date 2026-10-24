@@ -50,7 +50,7 @@ void App::init() {
 	const uint64_t mac = ESP.getEfuseMac();
 	for (size_t index = 0; index < 6; ++index) deviceId[index] = (mac >> (index * 8)) & 255;
 	security_.init(deviceId);
-	security_.setHandlers(nullptr, onLock, this);
+	security_.setHandlers(onLoad, onLock, this);
 	commands_.initSecure(configStore_, security_);
 	if (security_.state() != DeviceState::Unprovisioned)
 		radioDriver_.init(commands_.secureRadioConfig());
@@ -77,6 +77,7 @@ void App::tick() {
 	device_.tick(nowMs);
 #else
 	security_.tick(nowMs);
+	pairing_.tick(nowMs);
 	radioDriver_.tick(nowMs);
 	RadioDriver::Event event;
 	for (size_t index = 0; index < 4 && radioDriver_.popEvent(event); ++index) {
@@ -138,7 +139,7 @@ void App::handleCommand(void* context, const char* command,
 	MockDevice::handle(&app.device_, command, arguments, response, nowMs);
 #else
 	app.action_ = app.commands_.handleSecure(command, arguments, response, nowMs,
-		app.security_, app.vaultStore_, app.configStore_, app.radioDriver_);
+		app.security_, app.vaultStore_, app.configStore_, app.radioDriver_, app.contacts_, app.pairing_);
 	if ((strcmp(command, "sec.provision") == 0 || strcmp(command, "sec.unlock") == 0) &&
 		response["ok"].as<bool>() && !app.radioDriver_.ready()) {
 		if (!app.radioDriver_.init(app.commands_.secureRadioConfig()) || !app.radioDriver_.startReceive()) {
@@ -176,7 +177,7 @@ void App::updateUi(uint64_t nowMs) {
 	LedPattern preview;
 	if (device_.takeLedPreview(preview) && ledReady_) ledDriver_.preview(preview, nowMs);
 #else
-	commands_.secureSnapshot(snapshot_, nowMs, security_, radioDriver_);
+	commands_.secureSnapshot(snapshot_, nowMs, security_, radioDriver_, contacts_, pairing_);
 	if (commands_.takeSecureLedConfig(ledConfig_) && ledReady_) ledDriver_.configure(ledConfig_);
 	LedPattern preview;
 	if (commands_.takeSecureLedPreview(preview) && ledReady_) ledDriver_.preview(preview, nowMs);
@@ -189,6 +190,13 @@ void App::updateUi(uint64_t nowMs) {
 void App::onLock(void* context) {
 	App& app = *static_cast<App*>(context);
 	if (app.radioDriver_.ready()) app.radioDriver_.standby();
+	app.pairing_.cancel();
+	app.pairing_.clearFingerprint();
+	app.contacts_.close();
+}
+
+bool App::onLoad(void* context) {
+	return static_cast<App*>(context)->contacts_.load();
 }
 
 bool App::finishReset() {

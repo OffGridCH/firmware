@@ -43,6 +43,22 @@ encoding belongs to Contacts. Open verifies check, identity, index and every
 occupied contact before making a vault key available to internal operations.
 Missing occupied records fail rather than silently dropping contacts.
 
+Contact plaintext schema 1 is `version:u8 | public_key:32 | name_length:u8 |
+UTF8_name:1..24 | outgoing_key:16 | incoming_key:16 | reservation_end:u32be |
+rx_highest:u32be | active:u8 | fingerprint:14 ASCII bytes`. Names are validated
+UTF-8 and contain no NUL. No native structs/floats are serialized. Signal values
+remain RAM-only. Unlock resumes TX at the durable exclusive end; new data and
+fresh ACKs use the same allocator. Counter zero and wrapping are rejected.
+
+Replay uses a 64-bit RAM bitmap; load conservatively marks all counters at or
+below persisted highest as seen. This implementation deliberately commits the
+accepted highest **before every new delivery**, rather than the draft's
+approximate 16-message interval, so an abrupt reset cannot re-deliver accepted
+traffic from the unsaved interval. This strengthens replay recovery at the cost
+of flash write frequency/stalls; endurance and mixed-load timing remain release
+acceptance gates. Authentication must precede `Contacts::accept`; the codec/mesh
+integration enforces that boundary.
+
 Creation writes/commits all required records, authenticates readback, then
 switches metadata. Abandoned initial records without metadata boot `incomplete`,
 not `missing`, and require authorized recovery. Rotation first clears only the
@@ -74,6 +90,12 @@ plaintext, refusal to activate an incomplete bank, contact slot 32/deletion and
 two generation switches with old-key rejection. This is not power-cut injection
 or physical power-removal evidence. Real secure lifecycle and authorized reset now use these APIs in `secure_dev`;
 no mock authentication opens a real vault.
+
+The extended diagnostic also checks TX allocation 1/2, reload skipping to 257,
+the final 24-bit counter and no wrap, replay duplicate/reordering/stale cases and
+conservative replay reload. Fixture objects are static and explicitly wiped;
+allocating the entire 32-slot fixture table on Arduino's loop stack triggered a
+canary reset and was fixed before acceptance. Production tables are App-owned.
 
 ## Interface
 

@@ -4,8 +4,8 @@
 
 `secure_dev` and `secure_dev_usb` do not include this mock backend. Their real
 command groups are implemented in `Commands` and call App-owned domain modules.
-Lifecycle, identity, settings and authenticated recovery are wired; contact and
-message commands currently return explicit errors until their integration lands.
+Lifecycle, identity, settings, authenticated recovery and real contacts/pairing
+are wired; message commands currently return explicit errors until integration.
 See the project README and host specification section 6.11 for secure acceptance
 and app/master reset. The owner requested mock removal after domain replacement.
 

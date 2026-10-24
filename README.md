@@ -14,8 +14,8 @@ python3 tools/serial-check.py --port /dev/ttyUSB0 --secure-check --allow-secure-
 `secure_dev_usb` is the native-USB counterpart. These profiles compile without
 MockDevice and never bypass authentication. They implement real X25519-wrapped
 token provisioning/unlock, encrypted identity persistence, key cleanup, timeout,
-failure backoff and two-generation token rotation. Contact/message commands
-currently fail explicitly pending their real integrations.
+failure backoff and two-generation token rotation. Contacts/pairing now derive and persist real relationships; message commands
+currently fail explicitly pending mesh integration.
 
 The checker retains a synthetic device token privately under `~/.config/offgrid/`
 (mode 0600). Back it up; never commit or share it. This host test credential is
@@ -40,6 +40,15 @@ eFuses or erase unrelated namespaces. `--secure-check --allow-secure-changes
 --confirm-erase` instead tests both reset authorities with synthetic vault data,
 restores saved settings, then leaves a fresh real vault locked with its retained
 local credential. Do not use that acceptance mode on personal identities.
+
+```sh
+python3 tools/serial-check.py --port /dev/ttyUSB0 --contact-check --allow-secure-changes
+```
+
+This uses the retained real credential, creates one random synthetic peer,
+checks self/duplicate/replacement handling, fingerprint and encrypted contact
+CRUD across MCU reboot, deletes only its fixture, and locks. It refuses a full
+table rather than deleting existing contacts. Two-board key agreement is pending.
 
 UART/native-USB builds and connected-board lifecycle/reset checks pass. Tested
 invalid signature, consumed challenge, wrong action/token, session reuse, rate

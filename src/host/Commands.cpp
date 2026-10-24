@@ -155,7 +155,8 @@ void Commands::emitSecureBoot(const Security& security, uint64_t nowMs) {
 }
 
 Commands::Action Commands::handleSecure(const char* command, JsonObjectConst args, JsonObject response,
-	uint64_t nowMs, Security& security, VaultStore& vault, ConfigStore& store, RadioDriver& radio) {
+	uint64_t nowMs, Security& security, VaultStore& vault, ConfigStore& store, RadioDriver& radio,
+	Contacts& contacts, Pairing& pairing) {
 	security.activity(nowMs);
 	JsonObject result = response["result"];
 	const bool unlocked = security.state() == DeviceState::Unlocked;
@@ -343,10 +344,13 @@ Commands::Action Commands::handleSecure(const char* command, JsonObjectConst arg
 			fail(response, security.state() == DeviceState::Unprovisioned ? "E_NOT_PROVISIONED" : "E_LOCKED",
 				"unlock required");
 		} else secureConfig(command, args, response, store, radio);
-	} else if (strncmp(command, "pair.", 5) == 0 || strncmp(command, "contact.", 8) == 0 ||
-		strncmp(command, "msg.", 4) == 0) {
+	} else if (strncmp(command, "pair.", 5) == 0 || strncmp(command, "contact.", 8) == 0) {
+		if (!unlocked) fail(response, security.state() == DeviceState::Unprovisioned ? "E_NOT_PROVISIONED" : "E_LOCKED",
+			"unlock required");
+		else secureContacts(command, args, response, nowMs, security, contacts, pairing);
+	} else if (strncmp(command, "msg.", 4) == 0) {
 		fail(response, !unlocked ? "E_LOCKED" : "E_BUSY", !unlocked ? "unlock required" :
-			"secure contact/message integration is not implemented");
+			"secure message integration is not implemented");
 	} else fail(response, "E_UNKNOWN_CMD", "unknown command");
 	return Action::None;
 }
@@ -441,13 +445,18 @@ void Commands::secureConfig(const char* command, JsonObjectConst args, JsonObjec
 	}
 }
 
-void Commands::secureSnapshot(UiSnapshot& snapshot, uint64_t nowMs, const Security& security, const RadioDriver& radio) {
+void Commands::secureSnapshot(UiSnapshot& snapshot, uint64_t nowMs, const Security& security, const RadioDriver& radio,
+	const Contacts& contacts, const Pairing& pairing) {
 	snapshot = UiSnapshot{};
 	snapshot.mock = false; snapshot.uptimeMs = nowMs; snapshot.state = security.state();
 	memcpy(snapshot.deviceId, deviceId_, sizeof(deviceId_));
 	if (security.state() == DeviceState::Unlocked) {
 		snprintf(snapshot.nodeId, sizeof(snapshot.nodeId), "%04X", security.nodeId());
 		strncpy(snapshot.name, security.name(), sizeof(snapshot.name) - 1);
+		snapshot.contacts = contacts.count();
+		snapshot.pairingActive = pairing.active();
+		snapshot.pairingRemainingS = pairing.remaining(nowMs);
+		strncpy(snapshot.fingerprint, pairing.fingerprint(), sizeof(snapshot.fingerprint) - 1);
 	}
 	snapshot.radioRunning = radioRunning(radio); snapshot.radioError = radio.lastError();
 	snapshot.frequencyMhz = live_["radio"]["freq_mhz"]; snapshot.bandwidthKhz = live_["radio"]["bw_khz"];
@@ -473,6 +482,100 @@ bool Commands::takeSecureLedPreview(LedPattern& pattern) {
 	pattern = preview_; previewPending_ = false;
 	return true;
 }
+
+bool Commands::contactView(JsonObject output, uint8_t slot, const Contacts::View& view) {
+	char node[5];
+	snprintf(node, sizeof(node), "%04X", view.nodeId);
+	output["contact_id"] = slot; output["name"] = view.name; output["node_id"].set(node);
+	output["state"] = view.active ? "active" : "pending"; output["fingerprint"] = view.fingerprint;
+	output["tx_ctr"] = view.txCounter;
+	if (view.rxHighest) output["rx_highest_ctr"] = view.rxHighest;
+	else output["rx_highest_ctr"] = nullptr;
+	if (view.hasSignal) { output["last_rssi"] = view.rssi; output["last_snr"] = view.snr; }
+	else { output["last_rssi"] = nullptr; output["last_snr"] = nullptr; }
+	return encode(output, "public_key", view.publicKey, 32);
+}
+
+void Commands::secureContacts(const char* command, JsonObjectConst args, JsonObject response,
+	uint64_t nowMs, Security& security, Contacts& contacts, Pairing& pairing) {
+	JsonObject result = response["result"];
+	if (strcmp(command, "pair.begin") == 0) {
+		uint8_t qr[75]; size_t length = 0;
+		if (!pairing.begin(qr, length, nowMs) || !encode(result, "qr", qr, length)) {
+			pairing.cancel(); fail(response, "E_INTERNAL", "pairing initialization failed"); return;
+		}
+		result["qr_bytes"] = length; result["expires_s"] = 300;
+		return;
+	}
+	if (strcmp(command, "pair.cancel") == 0) { pairing.cancel(); result["cancelled"] = true; return; }
+	if (strcmp(command, "pair.complete") == 0) {
+		if (!stringArg(args, response, "qr", 68, 100) || !stringArg(args, response, "name", 1, 24, false) ||
+			!boolArg(args, response, "replace", false)) return;
+		uint8_t qr[75]; size_t length = 0;
+		if (mbedtls_base64_decode(qr, sizeof(qr), &length,
+			reinterpret_cast<const uint8_t*>(args["qr"].as<const char*>()), strlen(args["qr"])) != 0 ||
+			!base64Arg(args, response, "qr", length)) {
+			fail(response, "E_INVALID_QR", "invalid QR encoding", "qr"); return;
+		}
+		uint8_t slot = 0; bool collision = false;
+		if (!pairing.complete(qr, length, args["name"] | static_cast<const char*>(nullptr),
+			args["replace"] | false, nowMs, slot, collision)) {
+			const Pairing::Error error = pairing.error();
+			const char* code = error == Pairing::Error::NoPairing ? "E_NO_PAIRING" :
+				error == Pairing::Error::Self ? "E_SELF_PAIR" : error == Pairing::Error::Exists ? "E_CONTACT_EXISTS" :
+				error == Pairing::Error::Full ? "E_STORAGE_FULL" : error == Pairing::Error::Storage ? "E_INTERNAL" : "E_INVALID_QR";
+			if (error == Pairing::Error::Storage) security.lock("lock", nowMs);
+			fail(response, code, "pairing could not be completed"); return;
+		}
+		if (!contactView(result.createNestedObject("contact"), slot, *contacts.view(slot))) {
+			fail(response, "E_INTERNAL", "contact encoding failed"); return;
+		}
+		JsonArray warnings = result.createNestedArray("warnings");
+		if (collision) warnings.add("node_id_collision");
+		return;
+	}
+	if (strcmp(command, "contact.list") == 0) {
+		if (!integerArg(args, response, "offset", 0, 32, false) ||
+			!integerArg(args, response, "limit", 1, 10, false)) return;
+		const uint8_t offset = args["offset"] | 0, limit = args["limit"] | 10;
+		result["total"] = contacts.count(); result["offset"] = offset;
+		JsonArray values = result.createNestedArray("contacts");
+		uint8_t seen = 0;
+		for (uint8_t slot = 1; slot <= 32 && values.size() < limit; ++slot) {
+			const Contacts::View* view = contacts.view(slot);
+			if (!view || seen++ < offset) continue;
+			if (!contactView(values.createNestedObject(), slot, *view)) {
+				fail(response, "E_INTERNAL", "contact encoding failed"); return;
+			}
+			if (measureJson(response) >= BoardConfig::SerialMaxLineBytes) { values.remove(values.size() - 1); break; }
+		}
+		return;
+	}
+	if (strcmp(command, "contact.get") && strcmp(command, "contact.rename") && strcmp(command, "contact.delete")) {
+		fail(response, "E_UNKNOWN_CMD", "unknown contact command"); return;
+	}
+	if (!integerArg(args, response, "contact_id", 1, 32)) return;
+	const uint8_t slot = args["contact_id"];
+	if (!contacts.view(slot)) { fail(response, "E_NO_SUCH_CONTACT", "contact does not exist", "contact_id"); return; }
+	if (strcmp(command, "contact.delete") == 0) {
+		if (!args["confirm"].is<bool>() || !args["confirm"].as<bool>()) {
+			fail(response, "E_CONFIRM_REQUIRED", "confirm must be true", "confirm"); return;
+		}
+		if (!contacts.remove(slot)) {
+			security.lock("lock", nowMs); fail(response, "E_INTERNAL", "contact deletion storage failed"); return;
+		}
+		result["deleted"] = true;
+	} else {
+		if (strcmp(command, "contact.rename") == 0) {
+			if (!stringArg(args, response, "name", 1, 24)) return;
+			if (!contacts.rename(slot, args["name"])) {
+				security.lock("lock", nowMs); fail(response, "E_INTERNAL", "contact rename storage failed"); return;
+			}
+		}
+		if (!contactView(result.createNestedObject("contact"), slot, *contacts.view(slot)))
+			fail(response, "E_INTERNAL", "contact encoding failed");
+	}
+}
 #endif
 
 bool Commands::stringArg(JsonObjectConst args, JsonObject response, const char* field,
@@ -481,7 +584,8 @@ bool Commands::stringArg(JsonObjectConst args, JsonObject response, const char* 
 	const JsonVariantConst value = args[field];
 	const JsonString text = value.as<JsonString>();
 	if (!value.is<const char*>() || text.size() < minimum || text.size() > maximum ||
-		memchr(text.c_str(), '\0', text.size()) != nullptr) {
+		memchr(text.c_str(), '\0', text.size()) != nullptr ||
+		!validUtf8(reinterpret_cast<const uint8_t*>(text.c_str()), text.size())) {
 		fail(response, "E_INVALID_ARG", "expected a string within the allowed byte length", field);
 		return false;
 	}

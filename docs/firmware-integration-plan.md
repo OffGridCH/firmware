@@ -41,8 +41,8 @@ specification conflict explicitly; do not silently weaken a security requirement
 | `RadioDriver` | Actual SX1262 RX/TX, CAD, backoff, completion events, timeouts, recovery, stats | Connect to MeshEngine; preserve hardware completion semantics; finish fault/load acceptance; airtime regulation remains missing |
 | `VaultStore` | Authenticated versioned records, two banks, durable activation, explicit statuses and wipe-on-close | Real lifecycle/contact integration; power-cut acceptance |
 | `Security` | Real wrapped-token sessions, persistent identity, backoff, cleanup, timeout, rotation and app/master reset authorization in secure profiles | Contact load/lock wiring; power-cut/fault acceptance and hardening |
-| `Contacts` | Placeholder; mock has 32 public RAM slots | Decrypted contact keys, persistence, counters/reservations, replay windows, deletion/replacement cleanup |
-| `Pairing` | Placeholder; mock parses QR and calculates fingerprints | Real shared-key derivation, persistent contact insertion, expiry/cancel cleanup, collision handling |
+| `Contacts` | Real fixed encrypted table, durable counter reservations, conservative replay load and wipe-on-lock | Mesh queue cleanup wiring and mixed-load/endurance acceptance |
+| `Pairing` | Real X25519/HKDF relationships, QR/salt ordering, fingerprint, expiry/cancel, collision warnings and persistence | Two-board directional-key agreement acceptance |
 | `PacketCodec` | Placeholder | Encode/decode TEXT, REACTION, GEO and ACK; construct authenticated headers/nonces; encrypt and verify packets |
 | `MeshEngine` | Placeholder; delivery/retry/relay events are simulated | Real outbound queue, direct receive/delivery, ACKs, retries, replay decisions, relaying and congestion controls |
 | `OledDriver` | U8g2 startup animation and home renderer using `HomeView`, `begin`, `drawHome` | Adapt to App's `init/show/onEvent/tick`; bounded animation/transfers; state-driven overlays; independent failure handling |
@@ -458,4 +458,17 @@ host responsiveness, recovery, and the release gates separately with evidence.
   its mock profiles/check paths. Keep the real transport/configuration and isolate
   lab diagnostics. This cleanup follows real contacts/messaging, not a mock rename.
 
-Next: contacts/pairing and packet codec, then real messaging/relay wiring.
+- Stage 5: App owns Contacts/Pairing; unlock loads/validates all contacts before
+  publishing unlocked, and lock wipes contacts/cancels pairing. All pair/contact
+  host commands use real domains, stable slots and wire-size-bounded pagination.
+  Validated UTF-8 and explicit encrypted contact encoding. Durable TX blocks and
+  no-wrap allocation cover data/ACKs. Replay is committed before each acceptance
+  (stronger than periodic draft persistence; flash endurance/timing pending).
+- Secure UART/native-USB and diagnostic builds pass. On-device fixture checks:
+  counters 1/2 then 257 after reload, final counter/no wrap, 64-entry replay
+  duplicate/reordering/stale/reload handling. Real single-board pairing/contact
+  checks pass, including fingerprint, replacement, rename, reboot persistence and
+  durable deletion; test peer removed, other contacts preserved, vault locked.
+  Two-board directional key agreement is explicitly unverified with one board.
+
+Next: packet codec, then real messaging/relay wiring and removal of the mock.

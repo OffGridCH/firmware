@@ -7,6 +7,9 @@
 #include <nvs_flash.h>
 #include <stdio.h>
 #include <string.h>
+#if OFFGRID_RADIO_DIAGNOSTICS
+#include "../security/Contacts.h"
+#endif
 
 namespace {
 constexpr uint8_t Check[] = "offgrid-vault-v1";
@@ -347,7 +350,7 @@ bool VaultStore::erase() {
 
 #if OFFGRID_RADIO_DIAGNOSTICS
 bool VaultStore::selfTest(bool verify) {
-	VaultStore store;
+	static VaultStore store;
 	store.records_ = "og_vtest";
 	store.metadata_ = "og_vtest";
 	uint8_t key[32], salt[16], identity[34] = {};
@@ -416,6 +419,7 @@ bool VaultStore::selfTest(bool verify) {
 			store.rotate(key, salt) && store.generation_ == generation + 2;
 		CryptoEngine::zeroize(replacement, sizeof(replacement));
 	}
+	if (ok) ok = Contacts::selfTest(store);
 	store.close();
 	CryptoEngine::zeroize(key, sizeof(key));
 	CryptoEngine::zeroize(identity, sizeof(identity));

@@ -3,6 +3,22 @@
 #include <stddef.h>
 #include <stdint.h>
 
+inline bool validUtf8(const uint8_t* bytes, size_t length) {
+	for (size_t index = 0; index < length;) {
+		const uint8_t lead = bytes[index++];
+		if (lead <= 0x7f) continue;
+		const size_t count = lead >= 0xc2 && lead <= 0xdf ? 1 :
+			lead >= 0xe0 && lead <= 0xef ? 2 : lead >= 0xf0 && lead <= 0xf4 ? 3 : 0;
+		if (!count || length - index < count) return false;
+		const uint8_t second = bytes[index];
+		if ((lead == 0xe0 && second < 0xa0) || (lead == 0xed && second >= 0xa0) ||
+			(lead == 0xf0 && second < 0x90) || (lead == 0xf4 && second >= 0x90)) return false;
+		for (size_t offset = 0; offset < count; ++offset)
+			if ((bytes[index++] & 0xc0) != 0x80) return false;
+	}
+	return true;
+}
+
 enum class DeviceState : uint8_t { Unprovisioned, Locked, Unlocked };
 enum class UiPage : uint8_t { Home, Radio, Pairing, Count };
 enum class UiEvent : uint8_t {

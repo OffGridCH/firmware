@@ -93,7 +93,7 @@ bool Security::loadIdentity() {
 	size_t length = 0;
 	bool ok = vault_.readIdentity(record, sizeof(record), length) && length >= 34 &&
 		record[32] >= 1 && record[32] <= 24 && length == size_t(33 + record[32]) &&
-		memchr(record + 33, 0, record[32]) == nullptr;
+		memchr(record + 33, 0, record[32]) == nullptr && validUtf8(record + 33, record[32]);
 	if (ok) {
 		memcpy(privateKey_, record, sizeof(privateKey_));
 		memcpy(name_, record + 33, record[32]);

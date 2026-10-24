@@ -5,6 +5,8 @@
 #include "SerialLink.h"
 #include "../Types.h"
 #include "../security/Security.h"
+#include "../security/Contacts.h"
+#include "../security/Pairing.h"
 #include "../storage/ConfigStore.h"
 #include "../drivers/RadioDriver.h"
 
@@ -34,8 +36,10 @@ public:
 	enum class Action { None, Reboot, Reset };
 	void initSecure(ConfigStore& store, Security& security);
 	Action handleSecure(const char* command, JsonObjectConst args, JsonObject response,
-		uint64_t nowMs, Security& security, VaultStore& vault, ConfigStore& store, RadioDriver& radio);
-	void secureSnapshot(UiSnapshot& snapshot, uint64_t nowMs, const Security& security, const RadioDriver& radio);
+		uint64_t nowMs, Security& security, VaultStore& vault, ConfigStore& store, RadioDriver& radio,
+		Contacts& contacts, Pairing& pairing);
+	void secureSnapshot(UiSnapshot& snapshot, uint64_t nowMs, const Security& security, const RadioDriver& radio,
+		const Contacts& contacts, const Pairing& pairing);
 	bool takeSecureLedConfig(LedConfig& config);
 	bool takeSecureLedPreview(LedPattern& pattern);
 	void emitSecureBoot(const Security& security, uint64_t nowMs);
@@ -57,6 +61,9 @@ private:
 		ConfigStore& store, RadioDriver& radio);
 	static void securityFailure(JsonObject response, const Security& security);
 	static bool identity(JsonObject output, const Security& security);
+	static bool contactView(JsonObject output, uint8_t slot, const Contacts::View& view);
+	void secureContacts(const char* command, JsonObjectConst args, JsonObject response,
+		uint64_t nowMs, Security& security, Contacts& contacts, Pairing& pairing);
 	StaticJsonDocument<16384> live_;
 	StaticJsonDocument<8192> candidate_;
 	char deviceId_[13] = {};

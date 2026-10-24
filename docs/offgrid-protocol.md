@@ -442,6 +442,11 @@ The window state is updated **only after the tag has verified**.
 
 Persist `highest_ctr` about every 16 messages. After a reboot, treat everything at or below it as already seen.
 
+Implementation strengthening: the firmware currently commits each newly
+accepted highest before delivery, rather than leaving an unsaved interval.
+This prevents reboot re-delivery at the expense of more flash writes; endurance
+and mixed-load timing must be accepted before release.
+
 Per-contact counters prevent traffic to other contacts from advancing this window. Heavy traffic in the same direction can still move an unacknowledged packet outside it. Such a retry is rejected and the sender may eventually report `timeout`; this is the intentional security-first limit of the 64-counter replay window.
 
 ---

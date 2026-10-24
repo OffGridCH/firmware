@@ -30,6 +30,7 @@ private:
 	void updateUi(uint64_t nowMs);
 #if !OFFGRID_MOCK_DEVICE
 	static void onLock(void* context);
+	static bool onLoad(void* context);
 	bool finishReset();
 #endif
 
@@ -43,6 +44,8 @@ private:
 	ConfigStore configStore_;
 	VaultStore vaultStore_;
 	Security security_{vaultStore_};
+	Contacts contacts_{vaultStore_};
+	Pairing pairing_{security_, contacts_};
 	Commands::Action action_ = Commands::Action::None;
 #endif
 	Commands commands_;
