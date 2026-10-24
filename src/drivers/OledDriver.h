@@ -26,7 +26,6 @@ private:
     uint8_t dirtyRows_ = 0;
     uint64_t renderedAt_ = 0;
     uint64_t bootAt_ = 0;
-    bool booting_ = true;
     bool resetting_ = false;
     uint64_t unlockAt_ = 0;
     bool unlocking_ = false;
