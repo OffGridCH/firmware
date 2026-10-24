@@ -129,8 +129,13 @@ Owner maintenance instead signs a fresh, device-bound, expiring single-use
 challenge with an operator-held P-256 private key:
 
 ```sh
-python3 tools/serial-check.py --port /dev/ttyUSB0 --master-reset --confirm-erase
+python3 tools/factory-reset.py --port /dev/ttyUSB0 --confirm-erase
 ```
+
+The dedicated launcher reuses the verified signed-reset implementation in
+`serial-check.py`. It needs no app token and works in any lock/provisioning state.
+Use `--master-key /path/to/key.pem` for another owner key. It cannot reset dead,
+unresponsive or different firmware, or devices trusting a different owner key.
 
 This **erases that board's vault/settings**. The firmware embeds only the fleet
 public trust key; the private key is outside the repository under
