@@ -18,7 +18,7 @@ authentication and encrypted storage while adding:
 - `diag.led.selftest`: smooth RGB continuity, color, direction and expiry bounds.
 - `diag.codec.selftest`: published vectors and malformed/boundary cases.
 - `diag.vault.selftest`, optional `verify`: separate `og_vtest` namespace, storage,
-  counters, replay, queues, relay and exact airtime-pacing assertions.
+  counters, replay, queues, relay and immediate scheduling after successful/failed TX.
 - `diag.mesh.drop_next_ack`: unlocked, suppress exactly one genuine receipt to
   test physical retry/re-ACK without duplicate delivery. Cleared on lock.
 - `dbg.rf_trace {enabled}`: unlocked, actual PHY ciphertext bytes and outcomes;
