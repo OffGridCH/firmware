@@ -26,7 +26,7 @@ public:
 	bool validCategory(const char* category, JsonObjectConst candidate);
 
 private:
-	static constexpr uint32_t SchemaVersion = 1;
+	static constexpr uint32_t SchemaVersion = 2;
 	static constexpr size_t MaxRecordBytes = 8192;
 	static constexpr size_t DocumentBytes = 16384;
 

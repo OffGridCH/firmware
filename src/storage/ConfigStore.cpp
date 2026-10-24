@@ -1,4 +1,5 @@
 #include "ConfigStore.h"
+#include "../Types.h"
 
 #include <math.h>
 #include <nvs.h>
@@ -69,10 +70,10 @@ int32_t ConfigStore::eraseVaultMetadata(const char* space) {
 
 void ConfigStore::defaults() {
 	deserializeJson(saved_, R"json({
-	  "schema":1,
+	  "schema":2,
 	  "radio":{"freq_mhz":869.525,"bw_khz":125,"sf":9,"cr":5,"tx_power_dbm":14,"preamble":8,"sync_word":79},
 	  "mesh":{"hop_default":3,"relay_enabled":true,"relay_when_locked":false,"cad_enabled":true,"backoff_slots":8,"retries":3,"retry_base_ms":0,"rate_limit_per_src":20,"ack_default":{"text":true,"reaction":false,"geo":false}},
-	  "led":{"enabled":true,"quiet":false,"brightness":128,"state_patterns":{"unprovisioned":"pulse","locked":"blink_slow","unlocked":"off"},"event_patterns":{"tx":"flash","rx":"flash","msg_received":"double","delivered":"off","failed":{"steps":[100,100],"repeat":3},"error":"blink_fast","pairing":"heartbeat"}},
+	  "led":{"enabled":true,"quiet":false,"brightness":128,"state_patterns":{"unprovisioned":"glow","locked":"glow","unlocked":"off"},"event_patterns":{"tx":"send","rx":"off","msg_received":"receive","delivered":"off","failed":"alert","error":"alert","pairing":"pairing"}},
 	  "security":{"lock_timeout_s":15}
 	})json");
 }
@@ -81,8 +82,7 @@ bool ConfigStore::validPattern(JsonVariantConst pattern) {
 	if (pattern.is<const char*>()) {
 		const JsonString value = pattern.as<JsonString>();
 		if (strlen(value.c_str()) != value.size()) return false;
-		const char* names[] = {"off", "on", "flash", "blink_slow", "blink_fast", "double", "heartbeat", "pulse"};
-		for (const char* name : names) if (strcmp(value.c_str(), name) == 0) return true;
+		for (const char* name : LedPattern::Names) if (strcmp(value.c_str(), name) == 0) return true;
 		return false;
 	}
 	if (!pattern.is<JsonObjectConst>()) return false;
@@ -181,6 +181,28 @@ bool ConfigStore::load() {
 		lastError_ = ESP_ERR_INVALID_ARG;
 		return false;
 	}
+	const bool upgrading = candidate_["schema"].is<uint32_t>() && candidate_["schema"].as<uint32_t>() == 1;
+	if (upgrading) {
+		struct Replacement { const char* group; const char* key; const char* oldName; const char* newName; };
+		const Replacement replacements[] = {
+			{"state_patterns", "unprovisioned", "pulse", "glow"}, {"state_patterns", "locked", "blink_slow", "glow"},
+			{"event_patterns", "tx", "flash", "send"}, {"event_patterns", "rx", "flash", "off"},
+			{"event_patterns", "msg_received", "double", "receive"}, {"event_patterns", "error", "blink_fast", "alert"},
+			{"event_patterns", "pairing", "heartbeat", "pairing"}
+		};
+		for (const Replacement& replacement : replacements) {
+			JsonVariant entry = candidate_["led"][replacement.group][replacement.key];
+			if (entry.is<const char*>() && strcmp(entry, replacement.oldName) == 0) entry.set(replacement.newName);
+		}
+		const JsonVariantConst failed = candidate_["led"]["event_patterns"]["failed"];
+		if (failed.is<JsonObjectConst>() && failed.as<JsonObjectConst>().size() == 2 &&
+			failed["repeat"].is<int>() && failed["repeat"].as<int>() == 3 &&
+			failed["steps"].is<JsonArrayConst>() && failed["steps"].size() == 2 &&
+			failed["steps"][0].is<int>() && failed["steps"][0].as<int>() == 100 &&
+			failed["steps"][1].is<int>() && failed["steps"][1].as<int>() == 100)
+			candidate_["led"]["event_patterns"]["failed"] = "alert";
+		candidate_["schema"] = SchemaVersion;
+	}
 	if (candidate_["schema"].is<uint32_t>() && candidate_["schema"].as<uint32_t>() != SchemaVersion) {
 		status_ = Status::UnsupportedVersion;
 		lastError_ = ESP_ERR_NOT_SUPPORTED;
@@ -191,9 +213,14 @@ bool ConfigStore::load() {
 		lastError_ = ESP_ERR_INVALID_ARG;
 		return false;
 	}
+	writable_ = true;
+	if (upgrading && !persist()) {
+		writable_ = false;
+		status_ = Status::Unavailable;
+		return false;
+	}
 	saved_.set(candidate_);
 	status_ = Status::Loaded;
-	writable_ = true;
 	return true;
 }
 

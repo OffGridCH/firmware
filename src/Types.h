@@ -22,8 +22,20 @@ inline bool validUtf8(const uint8_t* bytes, size_t length) {
 enum class DeviceState : uint8_t { Unprovisioned, Locked, Unlocked };
 enum class UiPage : uint8_t { Home, Radio, Pairing, Count };
 enum class UiEvent : uint8_t {
-	Tx, Rx, MessageReceived, Delivered, Failed, Error, Pairing, Boot
+	Tx, Rx, MessageReceived, Delivered, Failed, Error, Pairing, Boot, FactoryReset
 };
+
+namespace UiTiming {
+constexpr uint16_t StartupLine = 260;
+constexpr uint16_t StartupCollapse = 420;
+constexpr uint16_t StartupGrow = 900;
+constexpr uint16_t StartupRipple = 950;
+constexpr uint16_t StartupSlide = 2000;
+constexpr uint16_t StartupSlideEnd = 2450;
+constexpr uint16_t StartupFill = 4450;
+constexpr uint16_t StartupEnd = 6600;
+constexpr uint16_t Reset = 1800;
+}
 
 struct UiSnapshot {
 	uint64_t uptimeMs = 0;
@@ -53,10 +65,15 @@ struct UiSnapshot {
 };
 
 enum class LedPatternKind : uint8_t {
-	Off, On, Flash, BlinkSlow, BlinkFast, Double, Heartbeat, Pulse, Custom
+	Off, On, Flash, BlinkSlow, BlinkFast, Double, Heartbeat, Pulse,
+	Glow, Send, Receive, Pairing, Startup, Reset, Alert, Custom
 };
 
 struct LedPattern {
+	inline static constexpr const char* Names[] = {
+		"off", "on", "flash", "blink_slow", "blink_fast", "double", "heartbeat", "pulse",
+		"glow", "send", "receive", "pairing", "startup", "reset", "alert"
+	};
 	LedPatternKind kind = LedPatternKind::Off;
 	uint16_t stepsMs[16] = {};
 	uint8_t stepCount = 0;

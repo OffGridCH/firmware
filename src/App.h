@@ -39,6 +39,7 @@ private:
 	MeshEngine mesh_{contacts_};
 	uint32_t reportedDrops_ = 0;
 	Commands::Action action_ = Commands::Action::None;
+	uint64_t actionAt_ = 0;
 	Commands commands_;
 	LedDriver ledDriver_;
 	OledDriver oledDriver_;

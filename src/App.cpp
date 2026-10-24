@@ -137,13 +137,17 @@ void App::tick() {
 			!radioDriver_.startTransmit(packet.bytes, packet.length, nowMs, commands_.cadEnabled(), commands_.backoffSlots()))
 			mesh_.transmissionRejected(radioDriver_.lastError() == RadioDriver::Busy, nowMs);
 	}
-	if (action_ != Commands::Action::None && serialLink_.availableTxSlots() == BoardConfig::SerialTxSlots) {
+	if (action_ != Commands::Action::None && serialLink_.availableTxSlots() == BoardConfig::SerialTxSlots &&
+		(action_ != Commands::Action::Reset || nowMs - actionAt_ >= UiTiming::Reset)) {
 		const Commands::Action action = action_;
 		action_ = Commands::Action::None;
 		security_.lock(action == Commands::Action::Reset ? "factory_reset" : "lock", nowMs);
 		hostPort.flush();
 		if (action == Commands::Action::Reboot || finishReset()) ESP.restart();
-		else serialLink_.sendError("E_INTERNAL", "authorized reset incomplete; retry maintenance recovery", nowMs);
+		else {
+			onUiEvent(this, UiEvent::Error, nowMs);
+			serialLink_.sendError("E_INTERNAL", "authorized reset incomplete; retry maintenance recovery", nowMs);
+		}
 	}
 }
 
@@ -156,6 +160,10 @@ void App::handleCommand(void* context, const char* command,
 	App& app = *static_cast<App*>(context);
 	app.action_ = app.commands_.handleSecure(command, arguments, response, nowMs,
 		app.security_, app.vaultStore_, app.configStore_, app.radioDriver_, app.contacts_, app.pairing_, app.mesh_);
+	if (app.action_ == Commands::Action::Reset) {
+		app.actionAt_ = nowMs;
+		onUiEvent(context, UiEvent::FactoryReset, nowMs);
+	}
 	if (app.mesh_.takeStorageFailure()) app.security_.lock("error", nowMs);
 	if ((strcmp(command, "sec.provision") == 0 || strcmp(command, "sec.unlock") == 0) && response["ok"].as<bool>())
 		app.mesh_.open(app.security_.nodeId());
@@ -180,11 +188,16 @@ void App::handleCommand(void* context, const char* command,
 		ui["led_duty"] = app.ledDriver_.duty();
 		ui["strip_pixels"] = BoardConfig::StripPixels;
 		ui["oled_scene"] = app.oledDriver_.scene();
+		ui["led_pattern"] = app.ledDriver_.pattern();
+		ui["led_frame_ms"] = app.ledDriver_.frameTime();
+		JsonArray pixels = ui.createNestedArray("strip_rgb");
+		for (size_t pixel = 0; pixel < BoardConfig::StripPixels; ++pixel) pixels.add(app.ledDriver_.pixel(pixel));
 	}
 }
 
 void App::onUiEvent(void* context, UiEvent event, uint64_t nowMs) {
 	App& app = *static_cast<App*>(context);
+	if (app.action_ == Commands::Action::Reset && event != UiEvent::FactoryReset) return;
 	if (app.ledReady_) app.ledDriver_.onEvent(event, nowMs);
 	if (app.oledReady_) app.oledDriver_.onEvent(event, nowMs);
 }

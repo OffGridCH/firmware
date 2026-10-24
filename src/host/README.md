@@ -15,6 +15,7 @@ Normal UART/native-USB builds exclude `diag.*`, `dbg.*` and fixed-key fixtures.
 The explicitly selected `radio_diag` / `radio_diag_usb` profiles retain real
 authentication and encrypted storage while adding:
 
+- `diag.led.selftest`: smooth RGB continuity, color, direction and expiry bounds.
 - `diag.codec.selftest`: published vectors and malformed/boundary cases.
 - `diag.vault.selftest`, optional `verify`: separate `og_vtest` namespace, storage,
   counters, replay, queues, relay and exact airtime-pacing assertions.
@@ -25,5 +26,9 @@ authentication and encrypted storage while adding:
 
 No raw-radio mock control or unauthenticated provisioning path remains.
 `sys.set_log_level` is RAM-only; structured error reporting is never disabled.
+`sys.status.ui` includes the selected `led_pattern`, four packed `strip_rgb`
+values and the last output-change `led_frame_ms`, alongside onboard `led_duty`.
+Authorized factory reset waits for a cooperative 1800-ms red fade before erase;
+the reset journal is committed before this interval.
 See the root [README](../../README.md) for real-device acceptance commands,
 operator credentials and owner-signed reset.

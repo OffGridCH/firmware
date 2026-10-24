@@ -1,12 +1,12 @@
 # Configuration Storage
 
-`ConfigStore` is a real plaintext NVS module. The surrounding identity, unlock,
-contacts, messages, and peripheral behavior remain development mocks.
+`ConfigStore` stores plaintext device configuration in NVS. Identity/contact
+secrets use the separate authenticated encrypted vault and real secure lifecycle.
 
 ## Stored Data
 
 The default ESP32 NVS partition contains namespace `og_cfg`, with one blob key
-named `settings`. Schema 1 encodes the complete saved radio, mesh, LED, and
+named `settings`. Schema 2 encodes the complete saved radio, mesh, LED, and
 security-policy configuration as JSON. It stores no raw C++ struct memory.
 
 - Radio: frequency, bandwidth, SF, CR, power, preamble and sync word.
@@ -15,17 +15,25 @@ security-policy configuration as JSON. It stores no raw C++ struct memory.
 - Security policy: `lock_timeout_s` only.
 
 Settings contain no tokens or private material. `ConfigStore` also provides
-separate `vault` metadata blob IO without rewriting schema-1 `settings`.
-`VaultStore` now implements encrypted generations; it is not yet wired to a real
-host lifecycle in the mock profiles. Do not confuse configuration with the vault.
+separate `vault` metadata blob IO without rewriting `settings`.
+Do not confuse public configuration with the encrypted vault.
+
+Schema 1 is migrated and committed once on load. Matching old factory LED
+patterns become the smooth theme: blue glow, white send/receive, purple pairing
+and red alerts. The old raw-RX flash becomes off; authenticated messages drive
+the receive wave. Nonmatching/custom entries, brightness, enable/quiet flags,
+radio, mesh and security policy are preserved. A migration write failure reports
+unavailable/read-only configuration rather than claiming successful migration.
+Unknown schemas remain read-only. Downgrading to old schema-1-only firmware is
+not supported without an authorized settings reset; vault schema stays unchanged.
 
 ## Encrypted vault format (schema 1)
 
 `og_cfg/vault` is an atomic 26-byte metadata blob:
 `"OGVM" | version:u8=1 | bank:u8 (0/1) | generation:u32be | salt:16`.
 Generation zero is invalid. Unknown/corrupt metadata never becomes a fresh vault.
-Settings schema 1 remains unchanged, including read-only handling of damaged
-settings. Metadata is updated independently; it never overwrites saved settings.
+Damaged/unknown settings remain read-only. Metadata is updated independently;
+it never overwrites saved settings.
 
 `og_vault` contains physical keys `a_check`, `a_identity`, `a_index`, `a_c01`
 through `a_c32`, with matching `b_` keys for the other generation. Each blob is:

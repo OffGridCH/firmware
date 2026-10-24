@@ -10,11 +10,14 @@ contains bounded library waits and a 100-ms Vext delay. Rendering updates at mos
 every 40 ms, pushing one changed 128-byte tile row per tick. It does not run an
 animation in a blocking loop.
 
-Locked firmware shows a large closed padlock and "Locked", never empty Home
+Power-on plays the OLED intro once, synchronized to blue strip ripples/fill using
+shared timing landmarks and a 6600-ms timeline. Unlock/relock interrupts it.
+After the intro, locked firmware shows a large closed padlock and "Locked", never empty Home
 placeholders/private identity details. Real unlock opens the shackle over 550 ms,
 holds briefly, then shrinks/moves the open lock into Home's corner by 1400 ms.
 Relock cancels the transition and pending old frame rows. Locked state overrides
-boot/error overlays. `sys.status.ui.oled_scene` exposes the last rendered scene.
+error overlays. Authorized reset shows "Factory reset" during the red LED fade.
+`sys.status.ui.oled_scene` exposes the last rendered scene.
 Pairing/fingerprint/error/activity views return automatically; no button is used.
 
 Both physical boards passed locked/unlocking/Home scene checks and <250-ms host
@@ -27,15 +30,26 @@ GPIO35 uses 5-kHz, 8-bit LEDC PWM. External GPIO45/46 each drive four owner-conf
 GRB 800-kHz NeoPixels through pinned Adafruit NeoPixel 1.12.5. Both external pins
 are strapping pins; external circuitry must not force wrong boot levels.
 
-All outputs share monochrome brightness, quiet/enabled settings and patterns.
-State timing continues beneath finite previews/events. On/off finite cycles are
-1000 ms; pulse is 1500 ms. Default locked state blinks 500 ms on/off; unlocked is
-off except activity. Native RMT `show()` is synchronous, approximately 120 us of
+Both strips share four RGB pixel values; onboard PWM mirrors their brightest
+channel. Defaults are a 5-second blue breathing glow while locked, white 1600-ms
+directional send/receive waves, purple breathing while pairing, and a red
+1800-ms authorized reset bloom (2000 ms for errors). Raw RF reception and ACK
+events do not interrupt the default theme. Unlocked idle is off.
+
+Smooth patterns use gamma-shaped envelopes and 250-ms crossfades; repeated
+same-kind events coalesce rather than restarting/flickering. State timing
+continues beneath finite previews/events. Quiet/disabled forces all LEDs off,
+including startup/reset. Legacy white step patterns and custom steps retain
+their explicit timing; finite on/off cycles are 1000 ms, pulse is 1500 ms.
+Native RMT `show()` is synchronous, approximately 120 us of
 data per four-pixel strip plus driver overhead, not falsely called asynchronous.
 Output changes are limited to 100 Hz and skipped when unchanged.
 
-The real authenticated LED checker verifies levels, switches, brightness and
-preview expiry, then restores settings and locks. `led_duty` is software-level
+The real authenticated LED checker verifies RGB channels, spatial animation,
+continuity, switches, brightness, pairing and preview expiry, then restores
+settings and locks. Lab-only `diag.led.selftest` checks envelopes at 10-ms
+intervals, direction, colors and exact expiry. `led_duty`, `strip_rgb` and
+`led_frame_ms` are software-level
 evidence, not an optical/electrical measurement.
 
 ## SX1262 radio

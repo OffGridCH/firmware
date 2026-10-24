@@ -127,18 +127,30 @@ def exercise_ui(device):
     deadline = time.monotonic() + 8
     maximum = 0
     count = 0
+    startup = False
     while time.monotonic() < deadline:
         started = time.monotonic()
-        device.call("sys.ping")
+        status = device.call("sys.status")
+        ui = status["ui"]
+        if ui["oled_scene"] == "boot":
+            if ui["led_pattern"] not in ("startup", "glow"):
+                raise RuntimeError("OLED/LED startup synchronization failed")
+            if any(pixel >> 16 or (pixel >> 8 & 255) > (pixel & 255) for pixel in ui["strip_rgb"]):
+                raise RuntimeError("startup must use OLED-blue RGB values")
+            startup |= ui["led_pattern"] == "startup"
         maximum = max(maximum, time.monotonic() - started)
         count += 1
         time.sleep(0.05)
     status = device.call("sys.status")
     require_equal(status["ui"]["oled_ready"], True, "connected OLED initialized")
     require_equal(status["ui"]["page"], 0, "buttonless Home page")
+    require_equal(startup, True, "visible synchronized OLED/LED startup")
+    require_equal(status["ui"]["led_pattern"], "glow", "post-startup idle glow")
+    if status["state"] == "locked":
+        require_equal(status["ui"]["oled_scene"], "locked", "post-startup large lock")
     if maximum >= 0.25:
         raise RuntimeError(f"UI responsiveness exceeded 250 ms: {maximum * 1000:.1f} ms")
-    print(f"PASS: {count} pings across startup/Home; maximum RTT {maximum * 1000:.1f} ms (<250 ms).")
+    print(f"PASS: synchronized blue startup and idle lock/glow, {count} status polls; maximum RTT {maximum * 1000:.1f} ms (<250 ms).")
 
 
 def exercise_framing(device):
@@ -199,6 +211,7 @@ def exercise_led(device, credential_path):
         require_equal(ui["led_ready"], True, "LED initialization")
         require_equal(ui["strip_pixels"], 4, "confirmed strip count")
         require_equal(ui["led_duty"], expected, "PWM/pixel output level")
+        require_equal(ui["strip_rgb"], [expected * 0x010101] * 4, "white legacy pixel output")
 
     try:
         device.call("led.set", {"enabled": True, "quiet": False, "brightness": 73,
@@ -216,10 +229,58 @@ def exercise_led(device, credential_path):
         expect_duty(73)
         time.sleep(1.05)
         expect_duty(0)
+        for pattern in ("send", "receive", "glow", "alert"):
+            device.call("led.test", {"pattern": pattern})
+            started = time.monotonic()
+            previous, spatial, lit = None, False, False
+            while time.monotonic() - started < 1.75:
+                before = time.monotonic()
+                ui = device.call("sys.status")["ui"]
+                if time.monotonic() - before >= 0.25:
+                    raise RuntimeError("animation blocked serial for 250 ms")
+                pixels = ui["strip_rgb"]
+                lit |= any(pixels)
+                spatial |= len(set(pixels)) > 1
+                for pixel in pixels:
+                    red, green, blue = pixel >> 16, pixel >> 8 & 255, pixel & 255
+                    if max(red, green, blue) > 73:
+                        raise RuntimeError("animation exceeded brightness cap")
+                    if pattern in ("send", "receive") and not red == green == blue:
+                        raise RuntimeError("message wave must be white")
+                    if pattern == "glow" and (red or green > blue):
+                        raise RuntimeError("locked glow must be blue")
+                    if pattern == "alert" and (green or blue):
+                        raise RuntimeError("alert must be red")
+                if previous is not None:
+                    elapsed = ui["led_frame_ms"] - previous["led_frame_ms"]
+                    bound = 73 * elapsed * 8 / 1000 + 2
+                    for pixel, old in zip(pixels, previous["strip_rgb"]):
+                        if any(abs((pixel >> shift & 255) - (old >> shift & 255)) > bound
+                               for shift in (0, 8, 16)):
+                            raise RuntimeError("animation changed too abruptly")
+                previous = ui
+                time.sleep(0.025)
+            if not lit or pattern != "alert" and not spatial:
+                raise RuntimeError(f"{pattern} animation did not animate")
+            if pattern in ("send", "receive"):
+                require_equal(previous["strip_rgb"], [0] * 4, "finite wave returns to idle")
+            if pattern == "glow":
+                device.call("led.test", {"pattern": "off"})
+                expect_duty(0)
+            device.call("led.set", {"state_patterns": {"unlocked": "off"}, "persist": False})
+            time.sleep(0.3)
+        device.call("pair.begin")
+        time.sleep(0.4)
+        ui = device.call("sys.status")["ui"]
+        require_equal(ui["led_pattern"], "pairing", "active pairing pattern")
+        if not all(0 < (pixel >> 8 & 255) < (pixel >> 16) < (pixel & 255) for pixel in ui["strip_rgb"]):
+            raise RuntimeError("pairing must be purple")
+        device.call("pair.cancel")
     finally:
+        device.call("pair.cancel")
         device.call("led.set", dict(original, persist=False))
         device.call("sec.lock")
-    print("PASS: onboard/strip driver levels, quiet/enabled, brightness and finite preview; visual acceptance pending.")
+    print("PASS: smooth RGB waves/glow, brightness, continuity, purple pairing, quiet/enabled and legacy previews; visual acceptance pending.")
 
 
 def write_credentials(path, values, create=False):
@@ -319,9 +380,12 @@ def master_reset(device, hello, key_path, test_invalid=False):
         if len(message) != 49 or message[:17] != b"og-reset-v1" + bytes.fromhex(hello["device_id"]):
             raise RuntimeError("replacement challenge has wrong action/device binding")
         signature = key.sign(message, ec.ECDSA(hashes.SHA256()))
+    started = time.monotonic()
     device.call("sys.factory_reset", {"confirm": "ERASE", "method": "master",
                                     "signature": base64.b64encode(signature).decode()})
     device.event("sys.boot", lambda data: data["state"] == "unprovisioned", timeout=15)
+    if time.monotonic() - started < 1.75:
+        raise RuntimeError("factory reset skipped the red animation interval")
     print("PASS: owner-signed maintenance reset completed.")
 
 
@@ -347,7 +411,7 @@ def exercise_secure(device, credential_path, master_key, erase):
     if "public_key" in credentials and not credentials.get("reset_in_progress"):
         require_equal(identity["public_key"], credentials["public_key"], "persisted identity")
     credentials["public_key"] = identity["public_key"]
-    if "original" not in credentials:
+    if not credentials.get("reset_in_progress"):
         credentials["original"] = read_configuration(device)
     write_credentials(credential_path, credentials)
     device.call("sec.set_policy", {"lock_timeout_s": 120, "persist": False})
@@ -389,9 +453,12 @@ def exercise_secure(device, credential_path, master_key, erase):
     if erase:
         credentials["reset_in_progress"] = True
         write_credentials(credential_path, credentials)
+        started = time.monotonic()
         device.call("sys.factory_reset",
                     dict(wrapped_arguments(device.call("sys.hello"), token, reset=True), confirm="ERASE"))
         device.event("sys.boot", lambda data: data["state"] == "unprovisioned", timeout=15)
+        if time.monotonic() - started < 1.75:
+            raise RuntimeError("app reset skipped the red animation interval")
         secure_unlock(device, token)
         device.call("sec.lock")
         device.event("sec.state", lambda data: data["state"] == "locked")
@@ -503,6 +570,11 @@ def exercise_mesh(first, second):
             token = base64.b64decode(credentials["token"], validate=True)
             if len(token) != 32:
                 raise RuntimeError("invalid retained token length")
+            deadline = time.monotonic() + 8
+            while device.call("sys.status")["ui"]["oled_scene"] == "boot":
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("startup did not finish")
+                time.sleep(0.05)
             require_equal(device.call("sys.status")["ui"]["oled_scene"], "locked", "large locked scene")
             identities.append(secure_unlock(device, token))
             tokens.append(token)
@@ -524,6 +596,7 @@ def exercise_mesh(first, second):
                 device.call("dbg.rf_trace", {"enabled": True})
             else:
                 device.call("diag.codec.selftest", error="E_UNKNOWN_CMD")
+                device.call("diag.led.selftest", error="E_UNKNOWN_CMD")
                 device.call("dbg.rf_trace", {"enabled": True}, error="E_UNKNOWN_CMD")
         if identities[0]["public_key"] == identities[1]["public_key"]:
             raise RuntimeError("boards must have distinct identities")
@@ -546,6 +619,14 @@ def exercise_mesh(first, second):
                 sent = sender.call("msg.send", dict(payload, to=slots[index], ack=True, hops=0))
                 received = recipient.event("msg.received", lambda data: data["from"] == slots[1 - index]
                                            and data["ctr"] == sent["ctr"], timeout=90)["data"]
+                time.sleep(0.35)
+                for endpoint, pattern in ((sender, "send"), (recipient, "receive")):
+                    ui = endpoint.call("sys.status")["ui"]
+                    require_equal(ui["led_pattern"], pattern, "real message LED event")
+                    if not any(ui["strip_rgb"]) or any(
+                            not (pixel >> 16) == (pixel >> 8 & 255) == (pixel & 255)
+                            for pixel in ui["strip_rgb"]):
+                        raise RuntimeError("real message event did not produce a white wave")
                 require_equal(received["type"], payload["type"], "authenticated payload type")
                 if payload["type"] == "text":
                     require_equal(received["text"], payload["text"], "physical text")
@@ -683,7 +764,7 @@ def send_command(device, command, arguments, credentials, allow_changes):
         if terminal["data"]["state"] == "failed":
             device.call("sec.lock")
             raise RuntimeError(f"real RF send failed: {terminal['data']['reason']}")
-    if command in ("diag.codec.selftest", "diag.vault.selftest"):
+    if command in ("diag.codec.selftest", "diag.vault.selftest", "diag.led.selftest"):
         require_equal(result["passed"], True, "isolated fixture acceptance")
     if allow_changes and command not in ("sec.lock", "sys.reboot", "sys.factory_reset", "sec.provision", "sec.unlock"):
         device.call("sec.lock")

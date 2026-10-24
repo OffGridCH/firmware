@@ -55,14 +55,30 @@ forensic erase guarantee.
 
 ## OLED and LEDs
 
-Locked firmware displays a large closed padlock. A genuine unlock opens the
+Power-on plays a synchronized 6.6-second blue OLED/strip intro, with a growing
+glow, travelling ripples and a final fill/fade. It then shows the large locked
+padlock with a slow blue breathing glow. A genuine unlock opens the
 shackle, then shrinks/moves the open lock to the Home corner over 1.4 seconds.
 Relocking cancels it and replaces pending frames. Rendering and I2C updates are
 cooperative; host/RF work never waits for the animation.
 
-GPIO35 PWM and two four-pixel GRB/800-kHz strips on GPIO45/46 share configurable
-monochrome patterns, brightness and quiet/disabled settings. Defaults: locked
-slow blink, unlocked off except activity. GPIO45/46 are strapping pins: external
+GPIO35 PWM and two four-pixel GRB/800-kHz strips on GPIO45/46 share brightness
+and quiet/disabled settings. The strips show smooth, gamma-shaped animations:
+
+- Locked/unprovisioned: slow blue breathing glow.
+- Sent: a white outward travelling wave; received authenticated message: a
+  broader white wave in the opposite direction.
+- Pairing: purple breathing flow for the active pairing session.
+- Authorized factory reset: red bloom/fade for 1.8 seconds before erase/reboot;
+  the OLED shows "Factory reset". Errors use a gentle red bloom too.
+- Unlocked idle: off. Raw RF frames and ACKs do not interrupt the theme by default.
+
+The onboard LED is monochrome and follows the brightest strip channel.
+Transitions crossfade without blocking serial/RF. Legacy step patterns remain
+available only when explicitly selected; all factory defaults are non-flashing.
+Settings schema 1 upgrades once to schema 2, replacing matching old factory
+patterns while preserving nondefault patterns, brightness and other settings.
+GPIO45/46 are strapping pins: external
 power/boot integrity and optical appearance still require physical inspection.
 No GPIO0 button workflow exists. See [drivers](src/drivers/README.md).
 
@@ -99,6 +115,7 @@ durable rolling-hour ledger or regulatory certification across resets.
 For lab-only, production-namespace-independent diagnostics:
 
 ```sh
+python3 tools/serial-check.py --port /dev/ttyUSB0 --command diag.led.selftest --allow-secure-changes
 python3 tools/serial-check.py --port /dev/ttyUSB0 --command diag.codec.selftest --allow-secure-changes
 python3 tools/serial-check.py --port /dev/ttyUSB0 --command diag.vault.selftest --allow-secure-changes
 ```

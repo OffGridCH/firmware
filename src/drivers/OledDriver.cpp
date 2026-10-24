@@ -18,14 +18,14 @@ static const unsigned char image_check2_bits[] U8X8_PROGMEM = {0xc0,0x0c,0x60,0x
 
 namespace boot {
 
-const uint16_t T_LINE_END     = 260;
-const uint16_t T_COLLAPSE_END = 420;
-const uint16_t T_GROW_END     = 900;
-const uint16_t T_RIPPLE_START = 950;
+const uint16_t T_LINE_END     = UiTiming::StartupLine;
+const uint16_t T_COLLAPSE_END = UiTiming::StartupCollapse;
+const uint16_t T_GROW_END     = UiTiming::StartupGrow;
+const uint16_t T_RIPPLE_START = UiTiming::StartupRipple;
 const uint16_t T_RIPPLE_DIAG  = 80;
 const uint16_t T_RIPPLE_FRAME = 45;
-const uint16_t T_SLIDE_START  = 2000;
-const uint16_t T_SLIDE_END    = 2450;
+const uint16_t T_SLIDE_START  = UiTiming::StartupSlide;
+const uint16_t T_SLIDE_END    = UiTiming::StartupSlideEnd;
 const uint16_t T_TEXT_START   = 2400;
 const uint16_t T_TEXT_LOCK    = 2700;
 const uint16_t T_TEXT_STEP    = 75;
@@ -34,8 +34,8 @@ const uint16_t T_LINE_DONE    = 3450;
 const uint16_t T_FREQ_START   = 3400;
 const uint16_t T_FREQ_LOCK    = 3750;
 const uint16_t T_FREQ_STEP    = 120;
-const uint16_t T_FILL_START   = 4450;
-const uint16_t T_END          = 6600;
+const uint16_t T_FILL_START   = UiTiming::StartupFill;
+const uint16_t T_END          = UiTiming::StartupEnd;
 
 const int8_t LOGO_W = 44, LOGO_H = 42;
 const int8_t BUB_W = 44, BUB_H = 34, BUB_R = 11;
@@ -375,12 +375,10 @@ bool OledDriver::init() {
 void OledDriver::show(const UiSnapshot& snapshot) {
     if (snapshot.state != snapshot_.state) {
         redraw_ = true;
+        booting_ = false;
+        errorUntil_ = 0;
         unlocking_ = snapshot_.state == DeviceState::Locked && snapshot.state == DeviceState::Unlocked;
         unlockAt_ = snapshot.uptimeMs;
-        if (unlocking_ || snapshot.state == DeviceState::Locked) {
-            booting_ = false;
-            errorUntil_ = 0;
-        }
     }
     if (snapshot.fingerprint[0] && strcmp(snapshot.fingerprint, snapshot_.fingerprint) != 0) {
         fingerprintUntil_ = snapshot.uptimeMs + 15000;
@@ -399,11 +397,18 @@ void OledDriver::onEvent(UiEvent event, uint64_t nowMs) {
             bootAt_ = nowMs;
             booting_ = true;
             break;
+        case UiEvent::FactoryReset:
+            resetting_ = true;
+            booting_ = false;
+            unlocking_ = false;
+            redraw_ = true;
+            break;
         case UiEvent::Pairing:
             booting_ = false;
             fingerprintUntil_ = 0;
             break;
         case UiEvent::Error:
+            resetting_ = false;
             booting_ = false;
             errorUntil_ = nowMs + 3000;
             break;
@@ -440,7 +445,17 @@ void OledDriver::tick(uint64_t nowMs) {
 
 void OledDriver::render(uint64_t nowMs) {
     display_.clearBuffer();
-    if (snapshot_.state == DeviceState::Locked) {
+    if (resetting_) {
+        scene_ = "reset";
+        display_.setFont(u8g2_font_helvB08_tf);
+        display_.drawStr(0, 25, "Factory reset");
+        display_.setFont(u8g2_font_haxrcorp4089_tr);
+        display_.drawStr(0, 43, "Erasing identity...");
+    } else if (booting_ && nowMs - bootAt_ < UiTiming::StartupEnd) {
+        scene_ = "boot";
+        boot::drawFrame(display_, nowMs - bootAt_,
+            static_cast<uint32_t>(snapshot_.frequencyMhz * 1000 + 0.5f));
+    } else if (snapshot_.state == DeviceState::Locked) {
         scene_ = "locked";
         drawLock(display_, 64, 28, 1, 0);
         display_.setFont(u8g2_font_helvB08_tf);
@@ -458,10 +473,6 @@ void OledDriver::render(uint64_t nowMs) {
         display_.drawStr(0, 20, "Operation failed");
         display_.setFont(u8g2_font_haxrcorp4089_tr);
         display_.drawStr(0, 38, "See app for details");
-    } else if (booting_) {
-        scene_ = "boot";
-        booting_ = boot::drawFrame(display_, nowMs - bootAt_,
-            static_cast<uint32_t>(snapshot_.frequencyMhz * 1000 + 0.5f));
     } else if (snapshot_.pairingActive || (nowMs < fingerprintUntil_ && snapshot_.fingerprint[0]) ||
                snapshot_.page == UiPage::Pairing) {
         scene_ = "pairing";

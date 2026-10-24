@@ -8,6 +8,9 @@
 #include <esp_system.h>
 #include "../security/CryptoEngine.h"
 #include "../security/ResetPublicKey.h"
+#if OFFGRID_RADIO_DIAGNOSTICS
+#include "../drivers/LedDriver.h"
+#endif
 
 namespace {
 class RequestReader {
@@ -56,9 +59,8 @@ void Commands::init() {
 LedPattern Commands::ledPattern(JsonVariantConst value) {
 	LedPattern pattern;
 	if (value.is<const char*>()) {
-		const char* names[] = {"off", "on", "flash", "blink_slow", "blink_fast", "double", "heartbeat", "pulse"};
-		for (size_t index = 0; index < 8; ++index) {
-			if (strcmp(value.as<const char*>(), names[index]) == 0) {
+		for (size_t index = 0; index < size_t(LedPatternKind::Custom); ++index) {
+			if (strcmp(value.as<const char*>(), LedPattern::Names[index]) == 0) {
 				pattern.kind = static_cast<LedPatternKind>(index);
 				break;
 			}
@@ -234,6 +236,9 @@ Commands::Action Commands::handleSecure(const char* command, JsonObjectConst arg
 		logLevel_ = selected; logPending_ = strcmp(selected, "off") != 0;
 		result["level"] = selected;
 #if OFFGRID_RADIO_DIAGNOSTICS
+	} else if (strcmp(command, "diag.led.selftest") == 0) {
+		if (LedDriver::selfTest()) result["passed"] = true;
+		else fail(response, "E_INTERNAL", "LED animation diagnostic failed");
 	} else if (strcmp(command, "diag.codec.selftest") == 0 || strcmp(command, "diag.vault.selftest") == 0) {
 		if (!boolArg(args, response, "verify", false)) return Action::None;
 		const bool passed = strcmp(command, "diag.codec.selftest") == 0 ?
@@ -665,8 +670,7 @@ void Commands::secureConfig(const char* command, JsonObjectConst args, JsonObjec
 		}
 	} else if (strcmp(category, "led") == 0) {
 		JsonArray patterns = result.createNestedArray("builtin_patterns");
-		const char* names[] = {"off", "on", "flash", "blink_slow", "blink_fast", "double", "heartbeat", "pulse"};
-		for (const char* name : names) patterns.add(name);
+		for (const char* name : LedPattern::Names) patterns.add(name);
 	}
 	if (measureJson(response) >= BoardConfig::SerialMaxLineBytes) { fail(response, "E_TOO_LONG", "configuration response too long"); return; }
 	if (setting) {

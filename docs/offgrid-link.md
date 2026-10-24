@@ -226,7 +226,9 @@ No args. Always returns:
 - `storage`: `config_status`, `writable`, `vault_status`, `generation`.
 - `security`: actual `secure_boot` and `flash_encryption` enablement booleans.
 - `ui`: `led_ready`, `oled_ready`, `page` (base Home page = 0), `led_duty`
-  (0..255), `strip_pixels` (4), `oled_scene`.
+  (0..255), `strip_pixels` (4), `oled_scene`, `led_pattern`, `strip_rgb`
+  (four packed `0xRRGGBB` JSON integers shared by both strips), `led_frame_ms`
+  (uptime of the last LED output change).
 
 Unlocked results additionally include:
 
@@ -240,7 +242,7 @@ stored format, not an unlocked vault; check `state` separately. `writable`
 reports configuration-store writability, not successful authentication.
 
 `oled_scene` is the last rendered RAM scene, not an optical measurement:
-`starting`, `boot`, `locked`, `unlocking`, `home`, `pairing`, `error`, or `radio`.
+`starting`, `boot`, `locked`, `unlocking`, `home`, `pairing`, `error`, `reset`, or `radio`.
 Tile transmission can still be in progress.
 
 ### `sys.reboot`
@@ -600,19 +602,40 @@ Patterns are a name or custom object:
 {"steps":[100,100,100,700],"repeat":2}
 ```
 
-Names: `off`, `on`, `flash`, `blink_slow`, `blink_fast`, `double`, `heartbeat`,
-`pulse`. Custom steps: 1..16 integer durations, each 10..10000 ms, alternating
+Smooth named patterns:
+
+| Name | RGB animation / one cycle |
+|---|---|
+| `glow` | Blue breathing flow, 5000 ms |
+| `send` | White travelling wave from pixel 0 to 3, 1600 ms |
+| `receive` | Broader white wave from pixel 3 to 0, 1600 ms |
+| `pairing` | Purple breathing flow, 3600 ms |
+| `startup` | Blue growing/ripple/fill intro, 6600 ms |
+| `reset` | Red bloom/fade, 1800 ms |
+| `alert` | Gentle red bloom/fade, 2000 ms |
+
+Legacy names remain available: `off`, `on`, `flash`, `blink_slow`, `blink_fast`,
+`double`, `heartbeat`, `pulse`. Custom steps: 1..16 integer durations, each
+10..10000 ms, alternating
 on/off from on. `repeat` is optional, 1..255, default 1. State patterns always
 loop; event/preview patterns finish. Finite on/off cycles last 1000 ms each;
 pulse lasts 1500 ms.
 
-Default states: unprovisioned pulse, locked slow blink (500 ms on/off), unlocked
-off. Events: TX/RX flash, new message double, delivered off, failure
-`{steps:[100,100],repeat:3}`, error fast blink, pairing heartbeat.
+Default states: unprovisioned/locked `glow`, unlocked `off`. Events: TX `send`,
+raw RX `off`, authenticated new message `receive`, delivered `off`,
+failure/error `alert`, pairing `pairing`. Pairing loops while its session is active.
+An `off` event means no animation override; it does not cancel an ongoing wave.
+Same-kind activity coalesces instead of repeatedly restarting a wave.
 
-The onboard LED and both four-pixel GRB strips share the same monochrome
-intensity/pattern. `enabled:false` or `quiet:true` forces all outputs off.
-Neither setting disables the OLED.
+Smooth selections crossfade over 250 ms. Both four-pixel GRB strips share the
+same RGB frames; the monochrome onboard LED follows the brightest channel.
+`enabled:false` or `quiet:true` forces all outputs off, including startup/reset.
+Neither setting disables the OLED. Factory startup/reset use fixed named
+animations; previews of those names affect LEDs only.
+
+Settings schema 1 upgrades once to schema 2. Entries matching old factory
+patterns become the defaults above; nonmatching custom patterns and all
+other settings are retained. A failed migration is reported, not silently saved.
 
 ### `led.test`
 
@@ -622,9 +645,12 @@ Result `{preview:true,repeat}`. Does not persist configuration.
 
 ### OLED behavior
 
-No display-control command is required. Locked state shows a large closed
+No display-control command is required. Power-on plays the synchronized
+6.6-second OLED/blue LED intro once, then locked state shows a large closed
 padlock. A genuine unlock opens it and shrinks/moves it into the Home corner
-over 1400 ms. Relock interrupts that transition. Pairing/fingerprint/error/
+over 1400 ms. Unlock/relock interrupts startup immediately. Relock interrupts
+the unlock transition. Authorized reset shows "Factory reset".
+Pairing/fingerprint/error/
 activity overlays are automatic. There is no button or page-advance workflow.
 Use `sys.status.ui` for readiness and last rendered scene.
 
@@ -675,7 +701,9 @@ durably journaled before the successful response; an interrupted authorized rese
 is resumed on reboot. There is no button/hold reset and no unauthenticated erase.
 
 Both methods require `"confirm":"ERASE"` exactly. Result `{pending:true}` is
-returned before the reboot; wait for `sys.boot` with `state:"unprovisioned"`.
+returned before the red 1800-ms animation completes and erase/reboot begins;
+wait for `sys.boot` with `state:"unprovisioned"`. Command reception pauses during
+this pending-reset interval; it is not an opportunity to cancel authorization.
 
 ### Registered-app authorization
 
@@ -769,6 +797,7 @@ backend, not an authentication bypass. Normal profiles return `E_UNKNOWN_CMD`.
 
 | Command | State / result |
 |---|---|
+| `diag.led.selftest` | Any state; `{passed:true}` or `E_INTERNAL`; RGB continuity, colors, direction and expiry |
 | `diag.codec.selftest` | Any state; `{passed:true}` or `E_INTERNAL`; published vectors/bounds |
 | `diag.vault.selftest` | Any state; optional `verify` boolean; `{passed:true}` or `E_INTERNAL` |
 | `diag.mesh.drop_next_ack` | Unlocked; `{armed:true}`; deliberately lose exactly one requested receipt |
