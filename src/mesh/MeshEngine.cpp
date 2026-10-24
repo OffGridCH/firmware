@@ -13,7 +13,6 @@ MeshEngine::MeshEngine(Contacts& contacts, Groups& groups) : contacts_(contacts)
 bool MeshEngine::init(bool provisioned) {
 	provisioned_ = provisioned;
 	cacheCount_ = cacheNext_ = 0;
-	nextTransmitAt_ = 0;
 	CryptoEngine::zeroize(sources_, sizeof(sources_));
 	cryptoReady_ = CryptoEngine::randomBytes(hashKey_, sizeof(hashKey_));
 	cryptoFailure_ = !cryptoReady_;
@@ -284,7 +283,7 @@ void MeshEngine::tick(uint64_t nowMs) {
 bool MeshEngine::prepareTransmission(PacketCodec::Packet& packet, uint64_t nowMs) {
 	packet = {};
 	nowMs_ = nowMs;
-	if (!radioWanted() || storageFailure_ || flight_ >= 0 || abort_ || nowMs < nextTransmitAt_) return false;
+	if (!radioWanted() || storageFailure_ || flight_ >= 0 || abort_) return false;
 	for (size_t index = 0; index < 4; ++index) {
 		if (!acks_[index].used) continue;
 		packet = acks_[index].packet;
@@ -339,7 +338,6 @@ void MeshEngine::transmissionRejected(bool busy, uint64_t nowMs) {
 }
 
 void MeshEngine::transmissionComplete(bool success, uint32_t airtimeMs, uint64_t nowMs) {
-	if (airtimeMs) nextTransmitAt_ = nowMs + uint64_t(airtimeMs) * 99;
 	if (flight_ < 0) return;
 	const size_t index = flight_;
 	flight_ = -1;
@@ -800,9 +798,13 @@ bool MeshEngine::selfTest(VaultStore& vault) {
 	header.source = 0x1234; header.counter = 1;
 	if (PacketCodec::encode(header, payload, incoming, packet) != PacketCodec::Error::None) return false;
 	mesh.receive(packet.bytes, packet.length, -90, -20, 802003);
-	if (mesh.prepareTransmission(ackPacket, 802495) || !mesh.prepareTransmission(ackPacket, 802496))
-		return false;
-	mesh.transmissionComplete(true, 0, 802497);
+	if (!mesh.prepareTransmission(ackPacket, 802003)) return false;
+	mesh.transmissionComplete(false, 5, 802004);
+	header.source = 0x1235;
+	if (PacketCodec::encode(header, payload, incoming, packet) != PacketCodec::Error::None) return false;
+	mesh.receive(packet.bytes, packet.length, -90, -20, 802005);
+	if (!mesh.prepareTransmission(ackPacket, 802005)) return false;
+	mesh.transmissionComplete(true, 0, 802006);
 	config.relayWhenLocked = false;
 	mesh.configure(config);
 	if (mesh.radioWanted()) return false;

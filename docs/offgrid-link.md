@@ -172,7 +172,7 @@ is not an Android Keystore implementation.
 ### Heartbeat and lock
 
 Send `sys.ping` about once per second while the app is active, including while
-waiting for channel access, airtime cooldown or receipts. The default inactivity
+waiting for channel access or receipts. The default inactivity
 timeout is 15 seconds. Handled commands count as activity; radio traffic alone
 does not. Cable removal is detected by inactivity, not an immediate GPIO event.
 
@@ -452,7 +452,7 @@ ACKs are authenticated, bound to the pending original counter and matched only
 after real transmission. Actual TxDone starts the retry timeout. Default automatic
 base timeout is `(2*hops+2)*(measured_airtime_ms+750)`, multiplied by `2^retry`.
 `mesh.retry_base_ms` can override the base. Maximum is three retries after the
-initial transmission; retries and airtime cooldown can make delivery take much
+initial transmission; retries and channel contention can make delivery take much
 longer than a command response.
 
 ### `msg.pending`
@@ -589,7 +589,7 @@ temporary changes in that category; unrelated categories are not persisted.
 ### `radio.stats`
 
 Unlocked only. Optional `reset` boolean (default false) returns then clears the
-counters. It does not reset keys, replay windows, rate budgets or airtime cooldown.
+counters. It does not reset keys, replay windows or rate budgets.
 
 | Fields | Meaning |
 |---|---|
@@ -603,7 +603,7 @@ counters. It does not reset keys, replay windows, rate budgets or airtime cooldo
 | `radio_failures`, `radio_timeouts` | Physical driver failures/timeouts |
 | `dropped_events`, `dropped_acks`, `radio_dropped_events`, `trace_dropped_events` | Bounded queue/trace losses |
 | `last_rssi`, `last_snr` | Latest PHY signal values; initially zero |
-| `tx_duty_cycle_max_percent` | 1: conservative shared per-boot pacing |
+| `tx_duty_cycle_max_percent` | `null`: no enforced duty-cycle limit |
 
 Lab builds additionally return `injected_ack_drops`.
 
@@ -635,11 +635,11 @@ Locked relaying needs **both** relay booleans true and a provisioned device.
 It is keyless: it does not unlock contacts or deliver private messages.
 Unprovisioned firmware never enables RF, regardless of saved policy.
 
-Own data, ACKs and relays share a cooldown of 99 times measured TX airtime after
-each transmission, including known interrupted/failed airtime. CAD, higher
-priority work and cooldown can delay sends substantially. Keep heartbeat active.
-This is a conservative 1% safeguard during a continuous boot, **not** a durable
-rolling-hour ledger across resets or certification of lawful frequency/power use.
+No duty-cycle cooldown or airtime budget is enforced in any profile. CAD,
+collision backoff, higher-priority work and retry timing still gate transmission;
+keep heartbeat active. Measured airtime is retained for statistics and retry
+timeouts. The operator must ensure the lab authorization permits the actual
+frequency, power and airtime used.
 
 ## 9. LEDs and OLED
 
@@ -668,8 +668,8 @@ Smooth named patterns:
 | Name | RGB animation / one cycle |
 |---|---|
 | `glow` | Blue breathing flow, 5000 ms |
-| `send` | White travelling wave from pixel 0 to 3, 1600 ms |
-| `receive` | Broader white wave from pixel 3 to 0, 1600 ms |
+| `send` | White travelling wave from pixel 3 to 0, 1600 ms |
+| `receive` | Broader white wave from pixel 0 to 3, 1600 ms |
 | `pairing` | Purple breathing flow, 3600 ms |
 | `startup` | Blue growing/ripple/fill intro, 6600 ms |
 | `reset` | Red bloom/fade, 1800 ms |
@@ -904,7 +904,7 @@ allowed to stall RF progress.
    compare fingerprints when adding a peer.
 6. Store chat history in the app. Track queued messages by boot-local `msg_ref`;
    distinguish physical `sent` from authenticated `delivered`.
-7. Keep reading during cooldown/retries. Surface RF/storage/loss errors and
+7. Keep reading during channel waits/retries. Surface RF/storage/loss errors and
    uncertain outcomes instead of reporting fabricated success.
 8. On boot/lock, discard stale RAM handles and sensitive client views. Re-unlock
    explicitly; do not automatically erase/re-pair or resend ambiguous messages.

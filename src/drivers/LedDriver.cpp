@@ -152,11 +152,13 @@ bool LedDriver::sample(const LedPattern& pattern, uint64_t elapsed, bool loop, u
 			case LedPatternKind::Glow:
 				pixels[pixel] = color(0, 110, 255, 0.22f + 0.55f * breath);
 				break;
-			case LedPatternKind::Send:
-				pixels[pixel] = color(255, 255, 255, bloom(phase, pixel * 160, pixel * 160 + 850));
-				break;
-			case LedPatternKind::Receive: {
+			case LedPatternKind::Send: {
 				const uint32_t start = (BoardConfig::StripPixels - 1 - pixel) * 160;
+				pixels[pixel] = color(255, 255, 255, bloom(phase, start, start + 850));
+				break;
+			}
+			case LedPatternKind::Receive: {
+				const uint32_t start = pixel * 160;
 				pixels[pixel] = color(255, 255, 255, bloom(phase, start, start + 1100));
 				break;
 			}
@@ -275,7 +277,7 @@ bool LedDriver::selfTest() {
 	LedPattern pattern; pattern.kind = LedPatternKind::Send;
 	if (!sample(pattern, 300, false, send) || sample(pattern, 1600, false, receive)) return false;
 	pattern.kind = LedPatternKind::Receive;
-	if (!sample(pattern, 300, false, receive) || send[0] <= send[3] || receive[3] <= receive[0]) return false;
+	if (!sample(pattern, 300, false, receive) || send[3] <= send[0] || receive[0] <= receive[3]) return false;
 	pattern.kind = LedPatternKind::Startup;
 	if (sample(pattern, UiTiming::StartupEnd, false, send)) return false;
 	pattern.kind = LedPatternKind::Reset;

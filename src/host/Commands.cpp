@@ -423,7 +423,7 @@ Commands::Action Commands::handleSecure(const char* command, JsonObjectConst arg
 				result["rx_malformed"] = stats.malformed;
 				result["relayed"] = stats.relayed; result["relay_suppressed"] = stats.relaySuppressed;
 				result["relay_dropped"] = stats.relayDropped; result["rate_limit_drops"] = stats.rateDrops;
-				result["tx_duty_cycle_max_percent"] = 1;
+				result["tx_duty_cycle_max_percent"] = nullptr;
 				result["trace_dropped_events"] = traceDrops_;
 #if OFFGRID_RADIO_DIAGNOSTICS
 				result["injected_ack_drops"] = stats.injectedAckDrops;
