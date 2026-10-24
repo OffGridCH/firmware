@@ -233,7 +233,7 @@ Commands::Action Commands::handleSecure(const char* command, JsonObjectConst arg
 		result["battery_mv"] = nullptr;
 		result["mock"] = false;
 		result["radio"]["running"] = radioRunning(radio);
-		result["radio"]["relay_only"] = false;
+		result["radio"]["relay_only"] = mesh.radioWanted() && !unlocked;
 		result["radio"]["initialized"] = radio.ready();
 		result["radio"]["last_error"] = radio.lastError();
 		result["storage"]["config_status"] = store.statusName();
@@ -377,6 +377,9 @@ Commands::Action Commands::handleSecure(const char* command, JsonObjectConst arg
 				result["retries"] = stats.retries; result["dropped_events"] = stats.droppedEvents;
 				result["dropped_acks"] = stats.droppedAcks;
 				result["rx_malformed"] = stats.malformed;
+				result["relayed"] = stats.relayed; result["relay_suppressed"] = stats.relaySuppressed;
+				result["relay_dropped"] = stats.relayDropped; result["rate_limit_drops"] = stats.rateDrops;
+				result["tx_duty_cycle_max_percent"] = 1;
 				if (args["reset"] | false) mesh.resetStats();
 			}
 			mesh.configure(secureMeshConfig());
@@ -396,6 +399,10 @@ MeshEngine::Config Commands::secureMeshConfig() const {
 	MeshEngine::Config config;
 	config.retries = live_["mesh"]["retries"];
 	config.retryBaseMs = live_["mesh"]["retry_base_ms"];
+	config.relayEnabled = live_["mesh"]["relay_enabled"];
+	config.relayWhenLocked = live_["mesh"]["relay_when_locked"];
+	config.backoffSlots = live_["mesh"]["backoff_slots"];
+	config.ratePerSource = live_["mesh"]["rate_limit_per_src"];
 	return config;
 }
 

@@ -17,8 +17,10 @@ MockDevice and never bypass authentication. They implement real X25519-wrapped
 token provisioning/unlock, encrypted identity persistence, key cleanup, timeout,
 failure backoff and two-generation token rotation. Contacts/pairing derive and
 persist real relationships. Real `msg.*` routes use bounded queues, authenticated
-CCM packets/ACKs and retries driven by hardware TX completion. Relay scheduling
-is not implemented yet; no synthetic success is used in secure firmware.
+CCM packets/ACKs and retries driven by hardware TX completion. Bounded keyless
+relay scheduling, keyed dedupe, source limits and locked relay policy are wired;
+physical multi-hop acceptance still needs three/four boards. No synthetic success
+is used in secure firmware.
 
 The isolated vault diagnostic also tests the direct-message domain without RF:
 eight-slot bounds, wrong ACK rejection, collision candidate verification,

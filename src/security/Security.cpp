@@ -128,7 +128,8 @@ bool Security::authenticate(Operation operation, const uint8_t publicKey[32], co
 			if (ok) {
 				identity[32] = nameLength;
 				memcpy(identity + 33, selected, nameLength);
-				ok = vault_.create(key, salt, identity, 33 + nameLength) && loadIdentity();
+				ok = vault_.create(key, salt, identity, 33 + nameLength) && loadIdentity() &&
+					(load_ ? load_(context_) : vault_.contacts() == 0);
 			}
 			CryptoEngine::zeroize(generatedPublic, sizeof(generatedPublic));
 			CryptoEngine::zeroize(digest, sizeof(digest));

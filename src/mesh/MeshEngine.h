@@ -33,6 +33,10 @@ public:
 	struct Config {
 		uint8_t retries = 3;
 		uint32_t retryBaseMs = 0;
+		bool relayEnabled = true;
+		bool relayWhenLocked = false;
+		uint8_t backoffSlots = 8;
+		uint8_t ratePerSource = 20;
 	};
 	struct Stats {
 		uint32_t tagFailures = 0;
@@ -43,13 +47,20 @@ public:
 		uint32_t retries = 0;
 		uint32_t droppedEvents = 0;
 		uint32_t droppedAcks = 0;
+		uint32_t relayed = 0;
+		uint32_t relaySuppressed = 0;
+		uint32_t relayDropped = 0;
+		uint32_t rateDrops = 0;
 	};
 	explicit MeshEngine(Contacts& contacts);
+	bool init(bool provisioned);
+	bool ready() const { return cryptoReady_; }
+	bool radioWanted() const;
 	using EventHandler = void (*)(void* context, const Event& event);
 	void setEventHandler(EventHandler handler, void* context) { handler_ = handler; context_ = context; }
 	void open(uint16_t ownId);
 	void close(uint64_t nowMs);
-	void configure(const Config& config) { config_ = config; }
+	void configure(const Config& config);
 	Error enqueue(uint8_t contact, const PacketCodec::Payload& payload, uint8_t hops,
 		uint64_t nowMs, Pending& accepted, size_t& bytes);
 	bool cancel(uint32_t reference, uint64_t nowMs);
@@ -62,6 +73,7 @@ public:
 	void radioUnavailable(uint64_t nowMs);
 	bool takeAbort();
 	bool takeStorageFailure();
+	bool takeCryptoFailure();
 	void receive(const uint8_t* bytes, size_t length, float rssi, float snr, uint64_t nowMs);
 	const Event* event() const;
 	void consumeEvent();
@@ -82,12 +94,31 @@ private:
 		bool sent = false;
 		uint64_t created = 0;
 		uint64_t due = 0;
+		uint32_t lastHash = 0;
 	};
 	struct Ack {
 		bool used = false;
 		uint8_t contact = 0;
 		PacketCodec::Packet packet;
 	};
+	struct Relay {
+		bool used = false;
+		uint32_t hash = 0;
+		uint64_t due = 0;
+		PacketCodec::Packet packet;
+	};
+	struct Source {
+		bool used = false;
+		uint16_t id = 0;
+		uint16_t relays = 0;
+		uint16_t failures = 0;
+		uint64_t start = 0;
+	};
+	bool hash(const uint8_t* bytes, size_t length, uint32_t& result);
+	bool remember(uint32_t hash);
+	Source* source(uint16_t id, uint64_t nowMs);
+	bool endpoint(const uint8_t* bytes, size_t length, const PacketCodec::Header& header,
+		float rssi, float snr, uint64_t nowMs);
 	static void contactChanged(void* context, uint8_t contact);
 	void removeContact(uint8_t contact);
 	void emit(const Event& event);
@@ -99,17 +130,28 @@ private:
 	Config config_;
 	Slot slots_[Capacity];
 	Ack acks_[4];
+	Relay relays_[8];
+	uint32_t cache_[256] = {};
+	size_t cacheCount_ = 0;
+	size_t cacheNext_ = 0;
+	uint8_t hashKey_[16] = {};
+	Source sources_[64];
 	Event events_[32];
 	size_t eventHead_ = 0;
 	size_t eventCount_ = 0;
 	int flight_ = -1;
 	bool flightAck_ = false;
+	bool flightRelay_ = false;
 	bool abort_ = false;
 	bool storageFailure_ = false;
+	bool cryptoReady_ = false;
+	bool cryptoFailure_ = false;
+	bool provisioned_ = false;
 	bool unlocked_ = false;
 	uint16_t ownId_ = 0;
 	uint32_t nextReference_ = 1;
 	uint64_t nowMs_ = 0;
+	uint64_t nextTransmitAt_ = 0;
 	Stats stats_;
 	EventHandler handler_ = nullptr;
 	void* context_ = nullptr;

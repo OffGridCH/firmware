@@ -573,7 +573,7 @@ def exercise_mesh(first, second):
             for payload in payloads:
                 sent = sender.call("msg.send", dict(payload, to=slots[index], ack=True, hops=0))
                 received = recipient.event("msg.received", lambda data: data["from"] == slots[1 - index]
-                                           and data["ctr"] == sent["ctr"], timeout=15)["data"]
+                                           and data["ctr"] == sent["ctr"], timeout=90)["data"]
                 require_equal(received["type"], payload["type"], "authenticated payload type")
                 if payload["type"] == "text":
                     require_equal(received["text"], payload["text"], "physical text")
@@ -586,7 +586,7 @@ def exercise_mesh(first, second):
                     require_equal(received["alt_m"], -15, "signed altitude")
                     require_equal(received["age_s"], 20, "quantized age")
                 sender.event("msg.status", lambda data: data["msg_ref"] == sent["msg_ref"]
-                             and data["state"] == "delivered", timeout=15)
+                             and data["state"] == "delivered", timeout=90)
                 require_equal(sender.call("msg.pending")["pending"], [], "ACK removes pending work")
                 time.sleep(3)
         for index, device in enumerate(devices):

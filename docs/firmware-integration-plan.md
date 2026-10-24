@@ -519,4 +519,23 @@ host responsiveness, recovery, and the release gates separately with evidence.
   and transition immediately. Two-board host scene/latency assertions pass.
   Physical lost-receipt/replay fault injection and multi-hop acceptance remain.
 
-Next: relay wiring, removal of the mock and remaining fault/load acceptance.
+- Stage 8 implementation: bounded eight-frame transit scheduling, 256-entry FIFO
+  cache using vetted HMAC-SHA256 truncated to 32 bits with a random per-boot key,
+  normalization of only HOP_LEFT including MIC, SNR-weighted/random delay,
+  overhear suppression, and ACK/own-before-relay priority. Endpoint auth/replay
+  precedes dedupe; failed candidates fall back to transit, including SRC==own
+  and DST collisions. Per-source relay and tag-failure budgets use a bounded
+  64-source table; full unexpired tables fail closed rather than evicting live
+  limits. Locked keyless relay is opt-in; unprovisioned RF remains off.
+- Shared own/ACK/relay transmissions now wait 99 times measured TX airtime after
+  completion (conservative 1% pacing). Aborted/failed TX airtime is accounted too.
+  This is a per-boot pacing safeguard, not jurisdiction certification or a durable
+  rolling-hour ledger; power cycles, RF limits and release certification remain.
+- Isolated real-device diagnostics pass normalized hash/MIC distinction, hop
+  decrement with byte-for-byte preserved ciphertext, suppression, exact source
+  limit, locked/unprovisioned policy, source/destination collision fallback and
+  exact 495-ms exclusion after 5-ms TX. Two-board encrypted exchanges still pass
+  with pacing enabled. Physical three/four-node forwarding/suppression remains
+  unverified because only two boards are available.
+
+Next: removal of the mock and remaining fault/load acceptance.

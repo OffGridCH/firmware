@@ -155,6 +155,12 @@ A 16-byte ACK at SF9 takes ca. 165 ms.
 
 Duty cycle limits (1 % in 868.0–868.6 MHz, 10 % in 869.4–869.65 MHz; check current BAKOM / ETSI EN 300 220 values) are **not enforced in the lab setup**. Keep **CAD (listen-before-talk) and random backoff** enabled regardless, otherwise flooding causes collisions and the test results will be unrealistically bad. Airtime accounting must be added before any real-world deployment.
 
+Current firmware strengthens the lab baseline: own data, ACKs and relays share a
+99-times-measured-airtime cooldown after each TX, including interrupted/failed
+transmits with known airtime. This conservatively paces to 1% during a continuous
+boot, but is not a durable rolling-hour ledger across resets or a certification
+of lawful frequency/power/antenna use in every jurisdiction.
+
 ---
 
 ## 5. Identity and Key Exchange

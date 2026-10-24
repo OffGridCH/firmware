@@ -86,6 +86,7 @@ bool RadioDriver::applyConfig(const Config& configuration) {
 bool RadioDriver::standby() {
 	if (!ready_) return false;
 	const bool aborted = busy();
+	const bool wasTransmitting = state_ == State::Transmitting;
 	if (!result(radio_.standby())) return false;
 	radio_.clearIrqFlags(RADIOLIB_SX126X_IRQ_ALL);
 	receiveWanted_ = false;
@@ -96,6 +97,10 @@ bool RadioDriver::standby() {
 		event.type = EventType::Failed;
 		event.error = Cancelled;
 		event.timeMs = static_cast<uint64_t>(esp_timer_get_time()) / 1000;
+		if (wasTransmitting) {
+			event.airtimeMs = event.timeMs - txStartedAt_;
+			stats_.txAirtimeMs += event.airtimeMs;
+		}
 		++stats_.failures;
 		emit(event);
 	}
@@ -236,6 +241,7 @@ bool RadioDriver::recover() {
 
 void RadioDriver::failTransfer(int16_t error, uint64_t nowMs) {
 	const bool wasReady = ready_;
+	const uint32_t airtime = state_ == State::Transmitting ? nowMs - txStartedAt_ : 0;
 	const int16_t stopped = radio_.standby();
 	takeInterrupt();
 	ready_ = wasReady && stopped == RADIOLIB_ERR_NONE;
@@ -247,6 +253,8 @@ void RadioDriver::failTransfer(int16_t error, uint64_t nowMs) {
 	event.timeMs = nowMs;
 	event.error = error;
 	event.length = txLength_;
+	event.airtimeMs = airtime;
+	stats_.txAirtimeMs += airtime;
 	emit(event);
 	if (ready_ && receiveWanted_) resumeReceive();
 	lastError_ = error;

@@ -1,10 +1,67 @@
 #include "MeshEngine.h"
 
 #include <string.h>
+#include <math.h>
 #include "../security/CryptoEngine.h"
 
 MeshEngine::MeshEngine(Contacts& contacts) : contacts_(contacts) {
 	contacts_.setChangeHandler(contactChanged, this);
+}
+
+bool MeshEngine::init(bool provisioned) {
+	provisioned_ = provisioned;
+	cacheCount_ = cacheNext_ = 0;
+	nextTransmitAt_ = 0;
+	CryptoEngine::zeroize(sources_, sizeof(sources_));
+	cryptoReady_ = CryptoEngine::randomBytes(hashKey_, sizeof(hashKey_));
+	cryptoFailure_ = !cryptoReady_;
+	return cryptoReady_;
+}
+
+bool MeshEngine::radioWanted() const {
+	return cryptoReady_ && (unlocked_ || (provisioned_ && config_.relayEnabled && config_.relayWhenLocked));
+}
+
+void MeshEngine::configure(const Config& config) {
+	config_ = config;
+	if (!config_.relayEnabled) {
+		CryptoEngine::zeroize(relays_, sizeof(relays_));
+		if (flightRelay_ && flight_ >= 0) { flight_ = -1; abort_ = true; }
+	}
+}
+
+bool MeshEngine::hash(const uint8_t* bytes, size_t length, uint32_t& result) {
+	uint8_t normalized[PacketCodec::MaxPacketBytes], digest[32];
+	memcpy(normalized, bytes, length);
+	normalized[0] &= 0xe3;
+	if (!CryptoEngine::hmacSha256(hashKey_, sizeof(hashKey_), normalized, length, digest)) {
+		cryptoReady_ = false; cryptoFailure_ = true; return false;
+	}
+	result = (uint32_t(digest[0]) << 24) | (uint32_t(digest[1]) << 16) |
+		(uint32_t(digest[2]) << 8) | digest[3];
+	return true;
+}
+
+bool MeshEngine::remember(uint32_t value) {
+	for (size_t index = 0; index < cacheCount_; ++index) if (cache_[index] == value) return false;
+	cache_[cacheNext_] = value;
+	cacheNext_ = (cacheNext_ + 1) % 256;
+	if (cacheCount_ < 256) ++cacheCount_;
+	return true;
+}
+
+MeshEngine::Source* MeshEngine::source(uint16_t id, uint64_t nowMs) {
+	for (Source& source : sources_) {
+		if (!source.used || source.id != id) continue;
+		if (nowMs - source.start >= 60000) { source.relays = source.failures = 0; source.start = nowMs; }
+		return &source;
+	}
+	for (Source& source : sources_) {
+		if (source.used && nowMs - source.start < 60000) continue;
+		source = {}; source.used = true; source.id = id; source.start = nowMs;
+		return &source;
+	}
+	return nullptr;
 }
 
 const char* MeshEngine::stateName(State state) {
@@ -38,6 +95,7 @@ const char* MeshEngine::reasonName(Reason reason) {
 void MeshEngine::open(uint16_t ownId) {
 	ownId_ = ownId;
 	unlocked_ = true;
+	provisioned_ = true;
 	storageFailure_ = false;
 }
 
@@ -48,6 +106,7 @@ void MeshEngine::close(uint64_t nowMs) {
 	for (size_t index = 0; index < Capacity; ++index)
 		if (slots_[index].view.used) finish(index, State::Failed, Reason::Locked, nowMs);
 	CryptoEngine::zeroize(acks_, sizeof(acks_));
+	CryptoEngine::zeroize(relays_, sizeof(relays_));
 	if (flight_ >= 0) abort_ = true;
 	flight_ = -1;
 	unlocked_ = false;
@@ -160,7 +219,7 @@ void MeshEngine::status(size_t index, State state, Reason reason, uint64_t nowMs
 
 void MeshEngine::finish(size_t index, State state, Reason reason, uint64_t nowMs, uint8_t hops) {
 	status(index, state, reason, nowMs, hops);
-	if (!flightAck_ && flight_ == int(index)) { abort_ = true; flight_ = -1; }
+	if (!flightAck_ && !flightRelay_ && flight_ == int(index)) { abort_ = true; flight_ = -1; }
 	CryptoEngine::zeroize(&slots_[index], sizeof(Slot));
 }
 
@@ -192,12 +251,16 @@ void MeshEngine::tick(uint64_t nowMs) {
 bool MeshEngine::prepareTransmission(PacketCodec::Packet& packet, uint64_t nowMs) {
 	packet = {};
 	nowMs_ = nowMs;
-	if (!unlocked_ || storageFailure_ || flight_ >= 0 || abort_) return false;
+	if (!radioWanted() || storageFailure_ || flight_ >= 0 || abort_ || nowMs < nextTransmitAt_) return false;
 	for (size_t index = 0; index < 4; ++index) {
 		if (!acks_[index].used) continue;
 		packet = acks_[index].packet;
 		flight_ = index;
 		flightAck_ = true;
+		flightRelay_ = false;
+		uint32_t value;
+		if (!hash(packet.bytes, packet.length, value)) { flight_ = -1; return false; }
+		remember(value);
 		return true;
 	}
 	for (size_t index = 0; index < Capacity; ++index) {
@@ -216,6 +279,15 @@ bool MeshEngine::prepareTransmission(PacketCodec::Packet& packet, uint64_t nowMs
 		}
 		flight_ = index;
 		flightAck_ = false;
+		flightRelay_ = false;
+		if (!hash(packet.bytes, packet.length, slots_[index].lastHash)) { flight_ = -1; return false; }
+		remember(slots_[index].lastHash);
+		return true;
+	}
+	for (size_t index = 0; index < 8; ++index) {
+		if (!relays_[index].used || nowMs < relays_[index].due) continue;
+		packet = relays_[index].packet;
+		flight_ = index; flightRelay_ = true; flightAck_ = false;
 		return true;
 	}
 	return false;
@@ -227,9 +299,16 @@ void MeshEngine::transmissionRejected(bool busy, uint64_t nowMs) {
 }
 
 void MeshEngine::transmissionComplete(bool success, uint32_t airtimeMs, uint64_t nowMs) {
+	if (airtimeMs) nextTransmitAt_ = nowMs + uint64_t(airtimeMs) * 99;
 	if (flight_ < 0) return;
 	const size_t index = flight_;
 	flight_ = -1;
+	if (flightRelay_) {
+		if (success) ++stats_.relayed;
+		else ++stats_.relayDropped;
+		CryptoEngine::zeroize(&relays_[index], sizeof(Relay));
+		return;
+	}
 	if (flightAck_) {
 		if (success) ++stats_.acksSent;
 		else ++stats_.droppedAcks;
@@ -253,6 +332,7 @@ void MeshEngine::radioUnavailable(uint64_t nowMs) {
 		if (slots_[index].view.used) finish(index, State::Failed, Reason::RadioError, nowMs);
 	for (const Ack& ack : acks_) if (ack.used) ++stats_.droppedAcks;
 	CryptoEngine::zeroize(acks_, sizeof(acks_));
+	CryptoEngine::zeroize(relays_, sizeof(relays_));
 	if (flight_ >= 0) abort_ = true;
 	flight_ = -1;
 }
@@ -266,6 +346,12 @@ bool MeshEngine::takeAbort() {
 bool MeshEngine::takeStorageFailure() {
 	const bool failed = storageFailure_;
 	storageFailure_ = false;
+	return failed;
+}
+
+bool MeshEngine::takeCryptoFailure() {
+	const bool failed = cryptoFailure_;
+	cryptoFailure_ = false;
 	return failed;
 }
 
@@ -287,12 +373,56 @@ void MeshEngine::ack(uint8_t contact, const PacketCodec::Header& original) {
 
 void MeshEngine::receive(const uint8_t* bytes, size_t length, float rssi, float snr, uint64_t nowMs) {
 	nowMs_ = nowMs;
-	if (!unlocked_ || storageFailure_) return;
+	if (!radioWanted() || storageFailure_) return;
 	PacketCodec::Header header;
 	if (PacketCodec::inspect(bytes, length, header) != PacketCodec::Error::None) {
 		++stats_.malformed; return;
 	}
-	if (header.destination != ownId_) return;
+	Source* budget = source(header.source, nowMs);
+	const bool addressed = unlocked_ && header.destination == ownId_;
+	bool authenticated = false;
+	if (addressed && budget && budget->failures < 20) {
+		authenticated = endpoint(bytes, length, header, rssi, snr, nowMs);
+		if (!authenticated) ++budget->failures;
+	} else if (addressed) ++stats_.rateDrops;
+	uint32_t value = 0;
+	if (!hash(bytes, length, value)) return;
+	if (!remember(value)) {
+		for (size_t index = 0; index < 8; ++index) {
+			if (!relays_[index].used || relays_[index].hash != value ||
+				(flightRelay_ && flight_ == int(index))) continue;
+			CryptoEngine::zeroize(&relays_[index], sizeof(Relay));
+			++stats_.relaySuppressed;
+		}
+		for (size_t index = 0; index < Capacity; ++index)
+			if (slots_[index].view.used && slots_[index].view.state == State::Sent &&
+				slots_[index].lastHash == value)
+				status(index, State::Relayed, Reason::None, nowMs);
+		return;
+	}
+	if (authenticated || storageFailure_ || !config_.relayEnabled || !header.hopLeft) return;
+	if (!budget || (config_.ratePerSource && budget->relays >= config_.ratePerSource)) {
+		++stats_.rateDrops; return;
+	}
+	size_t index = 0;
+	while (index < 8 && relays_[index].used) ++index;
+	if (index == 8) { ++stats_.relayDropped; return; }
+	uint32_t random = 0;
+	if (!CryptoEngine::randomBytes(reinterpret_cast<uint8_t*>(&random), sizeof(random))) {
+		cryptoReady_ = false; cryptoFailure_ = true; return;
+	}
+	Relay& relay = relays_[index];
+	relay.used = true; relay.hash = value; relay.packet.length = length;
+	memcpy(relay.packet.bytes, bytes, length);
+	relay.packet.bytes[0] = (bytes[0] & 0xe3) | ((header.hopLeft - 1) << 2);
+	const float signal = isfinite(snr) ? fmaxf(-20, fminf(10, snr)) : 10;
+	relay.due = nowMs + uint32_t((signal + 20) * 8) +
+		(config_.backoffSlots ? random % (uint32_t(config_.backoffSlots) * 25 + 1) : 0);
+	++budget->relays;
+}
+
+bool MeshEngine::endpoint(const uint8_t* bytes, size_t length, const PacketCodec::Header& header,
+	float rssi, float snr, uint64_t nowMs) {
 	for (uint8_t contact = 1; contact <= Contacts::Capacity; ++contact) {
 		const Contacts::View* peer = contacts_.view(contact);
 		if (!peer || peer->nodeId != header.source) continue;
@@ -310,14 +440,14 @@ void MeshEngine::receive(const uint8_t* bytes, size_t length, float rssi, float 
 			const PacketCodec::Error error = PacketCodec::decode(bytes, length,
 				contacts_.records_[contact - 1].incoming, payload);
 			if (error == PacketCodec::Error::Authentication) continue;
-			if (error != PacketCodec::Error::None) { ++stats_.malformed; return; }
+			if (error != PacketCodec::Error::None) { ++stats_.malformed; return true; }
 		}
 		const bool wasActive = peer->active;
 		const Contacts::Replay replay = contacts_.accept(contact, header.counter, rssi, snr);
 		if (replay == Contacts::Replay::StorageFailure) {
 			storageFailure_ = true;
 			CryptoEngine::zeroize(&payload, sizeof(payload));
-			return;
+			return true;
 		}
 		if (replay == Contacts::Replay::New) {
 			if (!wasActive) {
@@ -344,15 +474,17 @@ void MeshEngine::receive(const uint8_t* bytes, size_t length, float rssi, float 
 				ack(contact, header);
 		}
 		CryptoEngine::zeroize(&payload, sizeof(payload));
-		return;
+		return true;
 	}
 	++stats_.tagFailures;
+	return false;
 }
 
 #if OFFGRID_RADIO_DIAGNOSTICS
 bool MeshEngine::selfTest(VaultStore& vault) {
 	static Contacts contacts(vault);
 	static MeshEngine mesh(contacts);
+	if (!mesh.init(true)) return false;
 	mesh.close(0);
 	while (mesh.event()) mesh.consumeEvent();
 	mesh.resetStats();
@@ -363,6 +495,7 @@ bool MeshEngine::selfTest(VaultStore& vault) {
 	mesh.open(0xabcd);
 	Config config;
 	config.retryBaseMs = 100;
+	config.relayEnabled = false;
 	mesh.configure(config);
 	PacketCodec::Payload payload, decoded;
 	payload.ack = true;
@@ -387,7 +520,7 @@ bool MeshEngine::selfTest(VaultStore& vault) {
 	if (!mesh.pending(0) || mesh.pending(0)->state != State::Queued || mesh.event()) return false;
 	mesh.transmissionRejected(true, 100000);
 	if (!mesh.prepareTransmission(packet, 100001)) return false;
-	mesh.transmissionComplete(true, 5, 200000);
+	mesh.transmissionComplete(true, 0, 200000);
 	mesh.tick(200099);
 	if (mesh.pending(0)->state != State::Sent) return false;
 	mesh.tick(200100);
@@ -396,7 +529,7 @@ bool MeshEngine::selfTest(VaultStore& vault) {
 	PacketCodec::Header header;
 	if (PacketCodec::inspect(packet.bytes, packet.length, header) != PacketCodec::Error::None ||
 		header.counter != original || header.retry != 1) return false;
-	mesh.transmissionComplete(true, 5, 200200);
+	mesh.transmissionComplete(true, 0, 200200);
 	header.source = peerId; header.destination = 0xabcd; header.counter = 1; header.retry = 0;
 	if (PacketCodec::encodeAck(header, original + 1, incoming, packet) != PacketCodec::Error::None) return false;
 	mesh.receive(packet.bytes, packet.length, -90, 5, 200201);
@@ -426,7 +559,7 @@ bool MeshEngine::selfTest(VaultStore& vault) {
 	if (PacketCodec::inspect(ackPacket.bytes, 16, ackHeader) != PacketCodec::Error::None ||
 		ackHeader.counter <= original) return false;
 	const uint32_t ackCounter = ackHeader.counter;
-	mesh.transmissionComplete(true, 5, 200206);
+	mesh.transmissionComplete(true, 0, 200206);
 	mesh.receive(packet.bytes, packet.length, -90, 5, 200207);
 	if (mesh.event() || mesh.prepareTransmission(ackPacket, 200208)) return false;
 	header.retry = 1;
@@ -435,7 +568,7 @@ bool MeshEngine::selfTest(VaultStore& vault) {
 	if (mesh.event() || !mesh.prepareTransmission(ackPacket, 200210) ||
 		PacketCodec::inspect(ackPacket.bytes, 16, ackHeader) != PacketCodec::Error::None ||
 		ackHeader.counter <= ackCounter) return false;
-	mesh.transmissionComplete(true, 5, 200211);
+	mesh.transmissionComplete(true, 0, 200211);
 	header.retry = 0; header.counter = 100; payload.ack = false;
 	if (PacketCodec::encode(header, payload, incoming, packet) != PacketCodec::Error::None) return false;
 	mesh.receive(packet.bytes, packet.length, -90, 5, 200212);
@@ -463,7 +596,7 @@ bool MeshEngine::selfTest(VaultStore& vault) {
 	config.retries = 0; mesh.configure(config);
 	if (mesh.enqueue(2, payload, 3, 500000, accepted, bytes) != Error::None ||
 		!mesh.prepareTransmission(packet, 500001)) return false;
-	mesh.transmissionComplete(true, 5, 500002);
+	mesh.transmissionComplete(true, 0, 500002);
 	mesh.tick(500102);
 	if (mesh.count()) return false;
 	while (mesh.event()) mesh.consumeEvent();
@@ -475,7 +608,7 @@ bool MeshEngine::selfTest(VaultStore& vault) {
 		if (!mesh.prepareTransmission(packet, completed) ||
 			PacketCodec::inspect(packet.bytes, packet.length, header) != PacketCodec::Error::None ||
 			header.retry != retry || header.counter != retryCounter) return false;
-		mesh.transmissionComplete(true, 5, completed);
+		mesh.transmissionComplete(true, 0, completed);
 		const uint64_t due = completed + (uint64_t(100) << retry);
 		mesh.tick(due - 1);
 		if (mesh.count() != 1 || mesh.pending(0)->state != State::Sent) return false;
@@ -489,7 +622,7 @@ bool MeshEngine::selfTest(VaultStore& vault) {
 	payload.ack = false;
 	if (mesh.enqueue(2, payload, 0, 520000, accepted, bytes) != Error::None ||
 		!mesh.prepareTransmission(packet, 520001)) return false;
-	mesh.transmissionComplete(true, 5, 520002);
+	mesh.transmissionComplete(true, 0, 520002);
 	if (mesh.count() || !mesh.event() || mesh.event()->message.state != State::Sent) return false;
 	while (mesh.event()) mesh.consumeEvent();
 	payload.ack = true;
@@ -505,8 +638,62 @@ bool MeshEngine::selfTest(VaultStore& vault) {
 	mesh.receive(packet.bytes, packet.length, -90, 5, 700003);
 	if (contacts.view(2)->rxHighest != 1) return false;
 	while (mesh.event()) mesh.consumeEvent();
-	const bool ok = contacts.remove(2);
+	bool ok = contacts.remove(2);
 	contacts.close();
+	if (!ok || !mesh.init(true)) return false;
+	config.relayEnabled = config.relayWhenLocked = true;
+	config.ratePerSource = 2; config.backoffSlots = 0;
+	mesh.configure(config);
+	mesh.resetStats();
+	header = {};
+	header.source = 0xabcd; header.destination = 0xabcd; header.counter = 1;
+	payload.ack = false;
+	if (!mesh.radioWanted() || PacketCodec::encode(header, payload, incoming, packet) != PacketCodec::Error::None)
+		return false;
+	uint32_t firstHash = 0, modifiedHash = 0;
+	if (!mesh.hash(packet.bytes, packet.length, firstHash)) return false;
+	packet.bytes[0] -= 4;
+	if (!mesh.hash(packet.bytes, packet.length, modifiedHash) || firstHash != modifiedHash) return false;
+	packet.bytes[packet.length - 1] ^= 1;
+	if (!mesh.hash(packet.bytes, packet.length, modifiedHash) || firstHash == modifiedHash) return false;
+	packet.bytes[packet.length - 1] ^= 1;
+	packet.bytes[0] += 4;
+	mesh.receive(packet.bytes, packet.length, -90, -20, 800000);
+	if (!mesh.prepareTransmission(ackPacket, 800000) ||
+		PacketCodec::inspect(ackPacket.bytes, ackPacket.length, ackHeader) != PacketCodec::Error::None ||
+		ackHeader.hopLeft != 2 || memcmp(ackPacket.bytes + 1, packet.bytes + 1, packet.length - 1)) return false;
+	mesh.transmissionRejected(true, 800000);
+	mesh.receive(packet.bytes, packet.length, -90, -20, 800001);
+	if (mesh.stats().relaySuppressed != 1 || mesh.prepareTransmission(ackPacket, 801000)) return false;
+	header.counter = 2;
+	if (PacketCodec::encode(header, payload, incoming, packet) != PacketCodec::Error::None) return false;
+	mesh.receive(packet.bytes, packet.length, -90, -20, 802000);
+	if (!mesh.prepareTransmission(ackPacket, 802000)) return false;
+	mesh.transmissionComplete(true, 5, 802001);
+	header.counter = 3;
+	if (PacketCodec::encode(header, payload, incoming, packet) != PacketCodec::Error::None) return false;
+	mesh.receive(packet.bytes, packet.length, -90, -20, 802002);
+	if (mesh.stats().rateDrops != 1 || mesh.stats().relayed != 1) return false;
+	header.source = 0x1234; header.counter = 1;
+	if (PacketCodec::encode(header, payload, incoming, packet) != PacketCodec::Error::None) return false;
+	mesh.receive(packet.bytes, packet.length, -90, -20, 802003);
+	if (mesh.prepareTransmission(ackPacket, 802495) || !mesh.prepareTransmission(ackPacket, 802496))
+		return false;
+	mesh.transmissionComplete(true, 0, 802497);
+	config.relayWhenLocked = false;
+	mesh.configure(config);
+	if (mesh.radioWanted()) return false;
+	mesh.open(0xabcd);
+	header.source = header.destination = 0xabcd; header.counter = 4;
+	if (PacketCodec::encode(header, payload, incoming, packet) != PacketCodec::Error::None) return false;
+	mesh.receive(packet.bytes, packet.length, -90, -20, 900000);
+	if (!mesh.prepareTransmission(ackPacket, 900000)) return false;
+	mesh.transmissionComplete(true, 0, 900001);
+	mesh.close(900002);
+	mesh.takeAbort();
+	mesh.init(false);
+	config.relayWhenLocked = true; mesh.configure(config);
+	if (mesh.radioWanted()) return false;
 	return ok;
 }
 #endif
