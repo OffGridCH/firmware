@@ -2,8 +2,8 @@
 
 > **Status:** Implemented v1 wire protocol; physical three/four-board mesh acceptance pending
 > **Purpose:** Encrypted, meshed, infrastructure-free chat over raw LoRa
-> **Message types:** text, reaction, geolocation
-> **Out of scope for v1:** group chats, forward secrecy, store-and-forward, fragmentation
+> **Message types:** text, reaction, geolocation; text and geolocation in groups (section 8.5)
+> **Out of scope for v1:** forward secrecy, store-and-forward, fragmentation, receipts for group messages
 
 ---
 
@@ -314,7 +314,8 @@ Total overhead: **8 (header) + 1 (inner) + 8 (MIC) = 17 bytes**.
 | 0x0 | TEXT |
 | 0x1 | REACTION |
 | 0x2 | GEO |
-| 0x3 to 0xF | Reserved |
+| 0x3 | GROUP_SYNC (DM only, section 8.5) |
+| 0x4 to 0xF | Reserved |
 
 | Flag bit | Meaning |
 |---|---|
@@ -395,6 +396,93 @@ optional compressed text returns an explicit unsupported result.
 ### 8.4 ACK (no inner header)
 
 See [section 10](#10-receive-receipts-ack).
+
+### 8.5 Groups
+
+A group has an owner (the device that created it) and up to 15 further members. Every member must be
+paired with the owner; members do not need to be paired with each other. The owner draws a random
+group ID **GID** (4 bytes, fixed for the life of the group) and, for every **EPOCH** (1 byte, 1 to 255),
+a random group key **GK** (16 bytes). Each member has an index `i` in the current epoch, 0 being the
+owner, and sends with its own key:
+
+```
+k_i = HKDF-SHA256(ikm = GK, salt = GID ‖ EPOCH, info = "og1-gk" ‖ i (1 byte), L = 16)
+TAG = HKDF-SHA256(ikm = GK, salt = GID ‖ EPOCH, info = "og1-gt",               L = 2)
+```
+
+**Group packet.** The v1 layout of section 7 is unchanged and encrypted with `k_i`:
+
+| Field | Value |
+|---|---|
+| Routing | `HOP_START`/`HOP_LEFT` as for DMs, `RETRY` = 0 |
+| DST | TAG |
+| SRC | Sender NodeID (authenticated by the AD as usual) |
+| CTR | Sender's device-wide group counter |
+| Inner header | TEXT or GEO, `ACK_REQ` = 0. Other types and flags are rejected after authentication |
+
+There is no extra header, so group text keeps the 83-byte limit. The sender index is not transmitted:
+the receiver tries every member whose NodeID equals SRC, as it does for NodeID collisions in DMs.
+
+**Nonce uniqueness.** In one (GID, EPOCH) an index belongs to exactly one device, and every membership
+change starts a new epoch with a new GK. The CTR comes from one counter per device for all groups,
+reserved in blocks of 256 like DM counters (section 6) and never restarted while the identity exists.
+So a (k_i, CTR) pair is never used twice, even when the owner re-sends a sync for an epoch a member
+already used.
+
+**Group messages have no receipts and no retries.** `sent` is the final sender state and means
+"transmitted", not "received". With the 1 % pacing of section 4 a receipt from every member would
+block a relay for minutes per message (8 members over one relay: about 155 s of pacing).
+
+**GROUP_SYNC (0x3)** carries the group state from the owner to one member. It is a normal DM to that
+member with `ACK_REQ` = 1, encrypted with the owner's DM key, and is retried and acknowledged like a
+text. FLAGS bits 2 to 0 are 0.
+
+```
+Inner header | GID (4) | EPOCH (1) | GK (16) | YOUR_INDEX (1) | N (1) | NodeID[N] (2 each) | name (1 to 24)
+```
+
+| Field | Description |
+|---|---|
+| `YOUR_INDEX` | The recipient's index, 1 to N − 1 |
+| `N` | Member count including the owner, 2 to 16 |
+| `NodeID[N]` | NodeID per index, `NodeID[0]` is the owner |
+| name | UTF-8 group name without NUL, the rest of the packet |
+
+The body is at most 79 bytes (16 members and a 24-byte name), which makes a 96-byte packet. The
+receiver accepts it only if `NodeID[0] == SRC` and `NodeID[YOUR_INDEX]` is its own NodeID, then:
+
+| Situation | Action |
+|---|---|
+| Unknown GID | Join; the sending contact becomes the owner contact |
+| Known GID from another contact, or a group this device owns | Reject |
+| Known GID, higher EPOCH | Replace key, members and name; reset the replay state |
+| Known GID, same EPOCH and identical content | Nothing to do (a lost receipt), acknowledge |
+| Known GID, same EPOCH with different content, or lower EPOCH | Reject |
+| No free group slot | Reject |
+
+The receipt confirms that the member received the sync, as for a text; a member that rejects it (for
+example with all 8 group slots in use) acknowledges it but reports no group change. Firmware without
+group support drops TYPE 0x3 as malformed without a receipt, so the owner sees a timeout.
+
+**Membership changes.** Only the owner adds or removes members. Every change starts a new EPOCH with a
+new GK and compacted indexes; the owner then sends a sync to every remaining member. Removed members
+are not told and keep the old key.
+
+**TAG collisions.** A 16-bit TAG can equal a NodeID or another group's TAG. When the owner creates or
+changes a group it draws a new GK (up to 16 times) while the TAG equals a member's NodeID, including its
+own, or the TAG of another group on the device. A member can still meet a TAG that equals its own
+NodeID, for example when a group of another owner collides; section 11.1 keeps both paths apart.
+
+**Replay.** Per group and member the receiver keeps `highest_ctr` and a 64-bit window with the rules of
+section 9.3. A new epoch resets them.
+
+**Receiving group traffic.** Section 11.1 step 4.
+
+**Limits.** Members can impersonate each other: the MIC proves "some member of this group", the SRC is
+not signed. There is no forward secrecy; an epoch key opens all recorded traffic of that epoch. A member
+that misses the sync after a change is cut off until the owner syncs it again. If the owner device is
+lost the group can no longer change. The TAG is a stable pseudonym per epoch. The EPOCH byte allows 254
+changes per group.
 
 ### Default ACK policy
 
@@ -514,10 +602,13 @@ Offgrid uses **managed flooding**.
 1. Check sync word, PHY CRC, packet length (at least 16 bytes), and routing fields.
 2. If DST == own ID, try authentication with every contact whose NodeID matches SRC. On success, apply replay handling: deliver a new packet once; for an authenticated duplicate, do not deliver again and send a fresh ACK when the original requested one and `RETRY > 0`.
 3. Check the relay dedupe cache using the packet with HOP_LEFT zeroed and the MIC included. A hit cancels any pending rebroadcast and suppresses forwarding. Local transmissions are inserted into this cache before radio launch, so this also suppresses self-echoes.
-4. If DST == own ID and authentication failed for every candidate (or no contact matched), treat it as transit traffic. A 16-bit NodeID collision must not make a node swallow another node's packet.
-5. If HOP_LEFT > 0, schedule rebroadcast with HOP_LEFT − 1.
+4. If step 2 did not authenticate the packet and DST equals the TAG of one or more own groups, try every such group and every member other than itself whose NodeID matches SRC (section 8.5). On success, check `RETRY`, type and flags, apply the group replay window and deliver once. Continue with step 5 either way: other members may be farther away.
+5. If DST == own ID and authentication failed for every candidate (or no contact matched), treat it as transit traffic. A 16-bit NodeID collision must not make a node swallow another node's packet.
+6. If HOP_LEFT > 0, schedule rebroadcast with HOP_LEFT − 1.
 
-Never drop a packet solely because `SRC == own ID`: NodeIDs can collide. Endpoint authentication/replay handling runs before relay dedupe so a duplicate addressed packet can trigger the required fresh ACK without being delivered twice.
+Never drop a packet solely because `SRC == own ID`: NodeIDs can collide. Endpoint authentication/replay handling runs before relay dedupe so a duplicate addressed packet can trigger the required fresh ACK without being delivered twice. Group trials run after dedupe because group packets are never acknowledged, so relayed copies cost no further decryption or flash write.
+
+Step 2 counts failed tags per SRC and stops trying after 20 per minute (section 11.3). Failed group trials in step 4 are not counted, and neither is a failed step 2 when DST is also one of the device's group TAGs. Otherwise group traffic, or forgeries sent to a TAG that equals the own NodeID, would lock out the sender's DMs. The cost per packet stays bounded (at most one trial per matching contact and per matching group member), and the pacing of section 4 bounds the packet rate.
 
 The endpoint authentication step is:
 
@@ -545,7 +636,7 @@ Step 4 matters: a 16-bit NodeID can collide. A collision must never make a node 
 | Rate limit per SRC | Limit junk flooding |
 | Own messages and ACKs before relayed traffic | Priority |
 | Rate limit on tag failures per SRC | Limit verify-DoS |
-| Authenticated destination packets are not relayed | Save airtime without swallowing transit traffic on NodeID collisions |
+| Authenticated destination packets are not relayed | Save airtime without swallowing transit traffic on NodeID collisions. Group packets are relayed after delivery |
 
 Everyone relays everyone's packets, including those of strangers. This is also good for anonymity.
 
@@ -604,6 +695,8 @@ There is no running shared state that has to be tracked packet by packet:
 | Mutable HOP_LEFT would break the tag | HOP_LEFT zeroed in AD |
 | Dedupe poisoning with predicted counters | MIC included in dedupe key, keyed hash (9.2) |
 | 16-bit ID collisions | Trial verification, transit fallback (11.1) |
+| Group TAG equals a NodeID or another TAG | Owner draws a new key; receivers try both the DM and the group path; failed group trials do not count against the sender's DM budget (8.5, 11.1) |
+| Nonce reuse in groups | One key per member, device-wide group counter with reservation, new epoch and key on every membership change (8.5) |
 | Echo and loops | Locally originated packets enter the normalized dedupe cache before TX; hop limit |
 | Retransmit swallowed by mesh | RETRY field changes MIC and dedupe key |
 | Retry outside replay window | Drop as stale; same-contact traffic can advance the 64-counter window (9.3), so sender may time out |
@@ -628,12 +721,14 @@ There is no running shared state that has to be tracked packet by packet:
 | **No forward secrecy** | A stolen device or key exposes captured past traffic |
 | **Offline recipient** | The message is lost after the retries. Store-and-forward on relays is future work |
 | **No fragmentation** | Long texts must be split by the app |
+| **Groups trust every member** | Members can impersonate each other; removed members keep old keys; no receipts (8.5) |
 | **Airtime accounting resets at boot** | Shared 1% pacing is not a durable rolling-hour ledger or regulatory certification |
 
 **Possible extensions**
 
 - **Hash ratchet** for coarse forward secrecy: `epoch = CTR >> 12`, `k_epoch = HKDF(k, epoch)`, delete old keys. No handshake needed and tolerant of packet loss.
-- **Group chats** with shared group keys (DST = group ID, sender keys).
+- **Group receipts**, for example the counters last seen, carried in the next own group message.
+- **Reactions in groups** (the reference needs the author's index).
 - **Read receipts** as an additional type.
 - **Pseudonym tags** instead of static SRC/DST.
 - **Store-and-forward** on relay nodes.
@@ -857,6 +952,43 @@ Bob decodes the position as 47.05170° N, 8.30751° E (about 1 to 2 m rounding e
 | Packet sizes (a 16-byte packet is an ACK) | Whether an ACK was requested |
 | Hop count and retry count | Which message an ACK confirms |
 
+### 15.10 Group: Alice creates "Team" with Bob and writes to it
+
+Alice is the owner (index 0), Bob is member 1. Test values, computed independently with Python
+`cryptography` and reproduced by the native tests (Appendix A):
+
+| Item | Value |
+|---|---|
+| GID | `1a2b3c4d` |
+| EPOCH | 1 |
+| GK | `a0a1a2 … af` |
+| k_0 (Alice) | `a473d70b407fdcdb5e69da6778e99951` |
+| k_1 (Bob) | `ba4c2567d55a921313eb16df4e0eef8a` |
+| TAG | `D9 98` |
+
+**GROUP_SYNC to Bob** (DM with k_A→B, CTR 3, inner header `38` = TYPE 3 with `ACK_REQ`), 31-byte body:
+
+```
+1a2b3c4d 01 a0a1a2a3a4a5a6a7a8a9aaabacadaeaf 01 02 e3f0 e841 5465616d
+GID      EP GK                               ix N  [0]  [1]  "Team"
+```
+
+Packet (48 bytes):
+
+```
+6c e841 e3f0 000003 | 4892bda8b5c2e841ac6d8a4c4cf02c8d15e259ff283cff4f476662fa64d43167 | d762da4e5092658b
+```
+
+**Alice writes "Hallo Gruppe!"** with k_0, group CTR 1, inner header `00` (TEXT, no `ACK_REQ`).
+Packet (30 bytes):
+
+```
+6c d998 e3f0 000001 | b3ae67a975c7f213bbd4e19a36a6 | c24c04dfe44e90c0
+```
+
+Bob sees DST `D9 98`, which is no contact's NodeID but his group's TAG, tries the member with NodeID
+`E3 F0` (index 0) and decrypts with k_0. A relay without the key forwards it like any transit packet.
+
 ---
 
 ## Appendix A: Implementation and Verification
@@ -870,6 +1002,10 @@ reactions and GEO quantization. It is compiled only into explicit lab profiles:
 pio run -e radio_diag -t upload --upload-port /dev/ttyUSB0
 python3 tools/serial-check.py --port /dev/ttyUSB0 --command diag.codec.selftest --allow-secure-changes
 ```
+
+Host unit tests (`pio test -e native`, OpenSSL in place of mbedTLS) reproduce the vectors of sections
+15.2, 15.4 and 15.10 and cover the group sync rules, TAG re-rolls, group replay, the group path through
+`MeshEngine` including relaying, and TAG collisions with NodeIDs and other groups.
 
 Restore normal secure firmware after diagnostics. The self-test uses published
 fixture keys, not live identity/contact keys, and does not transmit. Passing it
@@ -911,3 +1047,10 @@ Python development sketch has been removed rather than offered as runnable code.
 | Dedupe cache | 256 entries |
 | ACK length | 16 bytes |
 | Maximum complete packet | 100 bytes |
+| Group HKDF labels | `"og1-gk"` ‖ index (sender keys), `"og1-gt"` (TAG) |
+| Group ID / key length | 4 / 16 bytes |
+| Groups per device | 8 |
+| Members per group | 16 including the owner |
+| GROUP_SYNC body | at most 79 bytes |
+| EPOCH | 1 to 255 |
+| Group counter reservation block | 256, one counter per device |

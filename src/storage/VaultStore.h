@@ -20,6 +20,10 @@ public:
 	bool readContact(uint8_t slot, uint8_t* output, size_t capacity, size_t& length);
 	bool writeContact(uint8_t slot, const uint8_t* input, size_t length);
 	bool deleteContact(uint8_t slot);
+	bool readGroup(uint8_t slot, uint8_t* output, size_t capacity, size_t& length);
+	bool writeGroup(uint8_t slot, const uint8_t* input, size_t length);
+	bool deleteGroup(uint8_t slot);
+	bool writeGroupCounter(uint32_t end);
 	bool erase();
 
 	Status status() const { return status_; }
@@ -28,6 +32,8 @@ public:
 	const uint8_t* salt() const { return salt_; }
 	uint32_t generation() const { return generation_; }
 	uint32_t contacts() const { return contacts_; }
+	uint8_t groups() const { return groups_; }
+	uint32_t groupCounter() const { return groupCounter_; }
 	bool isOpen() const { return open_; }
 
 #if OFFGRID_RADIO_DIAGNOSTICS
@@ -41,10 +47,16 @@ private:
 		const char* name, const uint8_t* input, size_t length);
 	bool prepare(uint8_t bank);
 	bool activate(uint8_t bank, uint32_t generation, const uint8_t salt[16],
-		const uint8_t key[32], uint32_t contacts);
-	bool validate(uint8_t bank, uint32_t generation, const uint8_t key[32], uint32_t& contacts);
+		const uint8_t key[32], uint32_t contacts, uint8_t groups, uint32_t groupCounter);
+	bool validate(uint8_t bank, uint32_t generation, const uint8_t key[32], uint32_t& contacts,
+		uint8_t& groups, uint32_t& groupCounter);
+	bool optionalRecord(uint8_t bank, uint32_t generation, const uint8_t key[32], const char* name,
+		uint8_t* output, size_t length, bool& present);
 	bool writeIndex(uint32_t contacts);
+	bool writeGroupIndex(uint8_t groups);
+	bool stored(uint8_t index) const;
 	static void contactName(uint8_t slot, char name[4]);
+	static const char* recordName(uint8_t index, char name[4]);
 
 	const char* records_ = "og_vault";
 	const char* metadata_ = "og_cfg";
@@ -52,6 +64,8 @@ private:
 	uint8_t salt_[16] = {};
 	uint32_t generation_ = 0;
 	uint32_t contacts_ = 0;
+	uint8_t groups_ = 0;
+	uint32_t groupCounter_ = 0;
 	uint8_t bank_ = 0;
 	bool open_ = false;
 	Status status_ = Status::Unavailable;

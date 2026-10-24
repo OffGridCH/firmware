@@ -4,7 +4,9 @@
 #include <math.h>
 #include "../security/CryptoEngine.h"
 
-MeshEngine::MeshEngine(Contacts& contacts) : contacts_(contacts) {
+static_assert(Groups::MaxSyncBytes == PacketCodec::MaxSyncBytes, "GROUP_SYNC body size mismatch");
+
+MeshEngine::MeshEngine(Contacts& contacts, Groups& groups) : contacts_(contacts), groups_(groups) {
 	contacts_.setChangeHandler(contactChanged, this);
 }
 
@@ -87,7 +89,8 @@ const char* MeshEngine::stateName(State state) {
 }
 
 const char* MeshEngine::typeName(PacketCodec::Type type) {
-	return type == PacketCodec::Type::Text ? "text" : type == PacketCodec::Type::Reaction ? "reaction" : "geo";
+	return type == PacketCodec::Type::Text ? "text" : type == PacketCodec::Type::Reaction ? "reaction" :
+		type == PacketCodec::Type::GroupSync ? "group_sync" : "geo";
 }
 
 const char* MeshEngine::reasonName(Reason reason) {
@@ -140,8 +143,12 @@ void MeshEngine::removeContact(uint8_t contact) {
 	}
 	size_t kept = 0;
 	for (size_t index = 0; index < eventCount_; ++index) {
-		const Event& event = events_[(eventHead_ + index) % 32];
-		if (event.message.contact == contact && event.type != EventType::Status) continue;
+		Event& event = events_[(eventHead_ + index) % 32];
+		if (event.message.contact == contact && event.type != EventType::Status) {
+			// A group message stays; only its link to the deleted contact goes.
+			if (!event.message.group) continue;
+			event.message.contact = 0;
+		}
 		if (kept != index) events_[(eventHead_ + kept) % 32] = event;
 		++kept;
 	}
@@ -157,15 +164,17 @@ bool MeshEngine::allocate(uint8_t contact, uint32_t& counter) {
 	return false;
 }
 
+// contact != 0 sends a DM (group names the group of a GROUP_SYNC); contact == 0 sends to group.
 MeshEngine::Error MeshEngine::enqueue(uint8_t contact, const PacketCodec::Payload& payload,
-	uint8_t hops, uint64_t nowMs, Pending& accepted, size_t& bytes) {
+	uint8_t hops, uint64_t nowMs, Pending& accepted, size_t& bytes, uint8_t group) {
 	accepted = {};
 	bytes = 0;
 	nowMs_ = nowMs;
 	if (!unlocked_) return Error::Locked;
-	const Contacts::View* peer = contacts_.view(contact);
-	if (!peer) return Error::NoContact;
+	if (contact ? !contacts_.view(contact) : !groups_.view(group)) return Error::NoContact;
 	if (hops > 7) return Error::Invalid;
+	if (!contact && (payload.ack || (payload.type != PacketCodec::Type::Text && payload.type != PacketCodec::Type::Geo)))
+		return Error::Invalid;
 	size_t index = 0;
 	while (index < Capacity && slots_[index].view.used) ++index;
 	if (index == Capacity || nextReference_ == 0) return Error::Full;
@@ -173,12 +182,15 @@ MeshEngine::Error MeshEngine::enqueue(uint8_t contact, const PacketCodec::Payloa
 	if (PacketCodec::validate(payload, frameLength) != PacketCodec::Error::None)
 		return Error::Invalid;
 	uint32_t counter = 0;
-	if (!allocate(contact, counter)) return storageFailure_ ? Error::Storage : Error::CounterExhausted;
+	if (!contact && groups_.exhausted()) return Error::CounterExhausted;
+	if (!contact && !groups_.allocate(counter)) { storageFailure_ = true; return Error::Storage; }
+	if (contact && !allocate(contact, counter)) return storageFailure_ ? Error::Storage : Error::CounterExhausted;
 	Slot& slot = slots_[index];
 	slot = {};
 	slot.view.used = true;
 	slot.view.reference = nextReference_++;
 	slot.view.contact = contact;
+	slot.view.group = group;
 	slot.view.type = payload.type;
 	slot.view.counter = counter;
 	slot.payload = payload;
@@ -244,6 +256,15 @@ bool MeshEngine::cancel(uint32_t reference, uint64_t nowMs) {
 	return false;
 }
 
+// A changed key outdates queued GROUP_SYNCs; a deleted group also takes its queued messages.
+void MeshEngine::groupChanged(uint8_t group, bool deleted, uint64_t nowMs) {
+	for (size_t index = 0; index < Capacity; ++index) {
+		const Pending& view = slots_[index].view;
+		if (view.used && view.group == group && (deleted || view.type == PacketCodec::Type::GroupSync))
+			finish(index, State::Cancelled, Reason::None, nowMs);
+	}
+}
+
 void MeshEngine::tick(uint64_t nowMs) {
 	nowMs_ = nowMs;
 	if (!unlocked_ || storageFailure_) return;
@@ -280,12 +301,19 @@ bool MeshEngine::prepareTransmission(PacketCodec::Packet& packet, uint64_t nowMs
 		if (!slot.view.used || (slot.view.state != State::Queued && slot.view.state != State::Retrying)) continue;
 		PacketCodec::Header header;
 		header.source = ownId_;
-		header.destination = contacts_.records_[slot.view.contact - 1].view.nodeId;
 		header.counter = slot.view.counter;
 		header.hopStart = header.hopLeft = slot.hops;
 		header.retry = slot.view.retry;
-		if (PacketCodec::encode(header, slot.payload, contacts_.records_[slot.view.contact - 1].outgoing,
-			packet) != PacketCodec::Error::None) {
+		uint8_t key[16] = {};
+		const Groups::View* group = slot.view.contact ? nullptr : groups_.view(slot.view.group);
+		if (slot.view.contact) {
+			header.destination = contacts_.records_[slot.view.contact - 1].view.nodeId;
+			memcpy(key, contacts_.records_[slot.view.contact - 1].outgoing, sizeof(key));
+		} else if (group) header.destination = group->tag;
+		const bool encoded = (slot.view.contact || (group && groups_.senderKey(slot.view.group, group->member, key))) &&
+			PacketCodec::encode(header, slot.payload, key, packet) == PacketCodec::Error::None;
+		CryptoEngine::zeroize(key, sizeof(key));
+		if (!encoded) {
 			finish(index, State::Failed, Reason::RadioError, nowMs);
 			return false;
 		}
@@ -396,10 +424,13 @@ void MeshEngine::receive(const uint8_t* bytes, size_t length, float rssi, float 
 	}
 	Source* budget = source(header.source, nowMs);
 	const bool addressed = unlocked_ && header.destination == ownId_;
+	// A group TAG can equal this node's ID. Such a packet is also tried as group traffic below, so a
+	// failed DM trial is not charged to the sender: group traffic must not lock out its DMs.
+	const bool grouped = unlocked_ && groups_.addressed(header.destination);
 	bool authenticated = false;
 	if (addressed && budget && budget->failures < 20) {
 		authenticated = endpoint(bytes, length, header, rssi, snr, nowMs);
-		if (!authenticated) ++budget->failures;
+		if (!authenticated && !grouped) ++budget->failures;
 	} else if (addressed) { receiveAction_ = "dropped_rate_limit"; ++stats_.rateDrops; }
 	uint32_t value = 0;
 	if (!hash(bytes, length, value)) return;
@@ -417,6 +448,8 @@ void MeshEngine::receive(const uint8_t* bytes, size_t length, float rssi, float 
 				status(index, State::Relayed, Reason::None, nowMs);
 		return;
 	}
+	// Group traffic is decrypted once per flood (after dedupe) and relayed even when it was for us.
+	if (!authenticated && grouped) groupEndpoint(bytes, length, header, rssi, snr, nowMs);
 	if (authenticated || storageFailure_ || !config_.relayEnabled) return;
 	if (!header.hopLeft) { receiveAction_ = "dropped_hop_limit"; return; }
 	if (!budget || (config_.ratePerSource && budget->relays >= config_.ratePerSource)) {
@@ -480,6 +513,23 @@ bool MeshEngine::endpoint(const uint8_t* bytes, size_t length, const PacketCodec
 				receiveAction_ = "ack_matched";
 				++stats_.acksReceived;
 				finish(matching, State::Delivered, Reason::None, nowMs, header.hopStart - header.hopLeft);
+			} else if (payload.type == PacketCodec::Type::GroupSync) {
+				uint8_t group = 0;
+				const Groups::Sync sync = groups_.apply(contact, header.source, ownId_,
+					reinterpret_cast<const uint8_t*>(payload.text), payload.syncLength, group);
+				if (sync == Groups::Sync::StorageFailure) {
+					storageFailure_ = true;
+					CryptoEngine::zeroize(&payload, sizeof(payload));
+					return true;
+				}
+				receiveAction_ = "delivered";
+				if (sync == Groups::Sync::Joined || sync == Groups::Sync::Updated) {
+					Event event;
+					event.type = EventType::GroupState; event.message.group = group; event.timeMs = nowMs;
+					event.epoch = groups_.view(group)->epoch; event.joined = sync == Groups::Sync::Joined;
+					emit(event);
+				}
+				if (payload.ack) ack(contact, header);
 			} else {
 				receiveAction_ = "delivered";
 				Event event;
@@ -505,10 +555,58 @@ bool MeshEngine::endpoint(const uint8_t* bytes, size_t length, const PacketCodec
 	return false;
 }
 
+// Tries every group whose TAG is the destination and every other member using the source NodeID.
+// Failures are not charged to the per-source DM budget: each try costs one HKDF and one CCM check,
+// and LoRa airtime bounds how many such packets can arrive.
+bool MeshEngine::groupEndpoint(const uint8_t* bytes, size_t length, const PacketCodec::Header& header,
+	float rssi, float snr, uint64_t nowMs) {
+	if (length == 16) return false;
+	for (uint8_t group = 1; group <= Groups::Capacity; ++group) {
+		const Groups::View* view = groups_.view(group);
+		if (!view || view->tag != header.destination) continue;
+		for (uint8_t member = 0; member < view->count; ++member) {
+			if (member == view->member || view->nodes[member] != header.source) continue;
+			uint8_t key[16];
+			PacketCodec::Payload payload;
+			PacketCodec::Error error = PacketCodec::Error::Crypto;
+			if (groups_.senderKey(group, member, key)) error = PacketCodec::decode(bytes, length, key, payload);
+			CryptoEngine::zeroize(key, sizeof(key));
+			if (error == PacketCodec::Error::Authentication) continue;
+			if (error != PacketCodec::Error::None || header.retry || payload.ack ||
+				(payload.type != PacketCodec::Type::Text && payload.type != PacketCodec::Type::Geo)) {
+				CryptoEngine::zeroize(&payload, sizeof(payload));
+				receiveAction_ = "dropped_malformed"; ++stats_.malformed; return true;
+			}
+			const Contacts::Replay replay = groups_.accept(group, member, header.counter);
+			if (replay == Contacts::Replay::StorageFailure) storageFailure_ = true;
+			else if (replay == Contacts::Replay::New) {
+				receiveAction_ = "delivered";
+				Event event;
+				event.type = EventType::Received;
+				event.message.group = group; event.message.counter = header.counter;
+				for (uint8_t contact = 1; contact <= Contacts::Capacity && !event.message.contact; ++contact)
+					if (contacts_.view(contact) && contacts_.view(contact)->nodeId == header.source)
+						event.message.contact = contact;
+				event.member = member; event.node = header.source;
+				event.payload = payload; event.timeMs = nowMs;
+				event.hops = header.hopStart - header.hopLeft; event.rssi = rssi; event.snr = snr;
+				emit(event);
+				CryptoEngine::zeroize(&event, sizeof(event));
+			} else { receiveAction_ = "dropped_duplicate"; ++stats_.replayDrops; }
+			CryptoEngine::zeroize(&payload, sizeof(payload));
+			return true;
+		}
+	}
+	++stats_.tagFailures;
+	receiveAction_ = "dropped_tag";
+	return false;
+}
+
 #if OFFGRID_RADIO_DIAGNOSTICS
 bool MeshEngine::selfTest(VaultStore& vault) {
 	static Contacts contacts(vault);
-	static MeshEngine mesh(contacts);
+	static Groups groups(vault);
+	static MeshEngine mesh(contacts, groups);
 	if (!mesh.init(true)) return false;
 	mesh.close(0);
 	while (mesh.event()) mesh.consumeEvent();

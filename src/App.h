@@ -35,8 +35,9 @@ private:
 	VaultStore vaultStore_;
 	Security security_{vaultStore_};
 	Contacts contacts_{vaultStore_};
+	Groups groups_{vaultStore_};
 	Pairing pairing_{security_, contacts_};
-	MeshEngine mesh_{contacts_};
+	MeshEngine mesh_{contacts_, groups_};
 	uint32_t reportedDrops_ = 0;
 	Commands::Action action_ = Commands::Action::None;
 	uint64_t actionAt_ = 0;

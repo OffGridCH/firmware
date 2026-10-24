@@ -9,8 +9,9 @@ public:
 	static constexpr size_t TagBytes = 8;
 	static constexpr size_t MaxTextBytes = 83;
 	static constexpr size_t MaxPacketBytes = 100;
+	static constexpr size_t MaxSyncBytes = 79;
 	enum class Error { None, Format, UnsupportedCompression, Authentication, Crypto };
-	enum class Type : uint8_t { Text, Reaction, Geo };
+	enum class Type : uint8_t { Text, Reaction, Geo, GroupSync };
 	struct Header {
 		uint8_t hopStart = 3;
 		uint8_t hopLeft = 3;
@@ -32,6 +33,8 @@ public:
 		int16_t altitude = 0;
 		bool hasAge = false;
 		uint16_t ageSeconds = 0;
+		// GROUP_SYNC is a DM-only type; its binary body (at most 79 bytes) is kept in text.
+		uint8_t syncLength = 0;
 	};
 	struct Packet {
 		uint8_t bytes[MaxPacketBytes] = {};
