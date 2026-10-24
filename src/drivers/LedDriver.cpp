@@ -60,7 +60,6 @@ void LedDriver::show(const UiSnapshot& snapshot) {
 		state_ = snapshot.state;
 		stateAt_ = snapshot.uptimeMs;
 		overrideActive_ = false;
-		booting_ = false;
 	}
 	if (pairing_ != snapshot.pairingActive) {
 		pairing_ = snapshot.pairingActive;
@@ -78,14 +77,10 @@ void LedDriver::onEvent(UiEvent event, uint64_t nowMs) {
 		booting_ = false;
 		overrideActive_ = false;
 	} else if (event == UiEvent::Pairing) {
-		booting_ = false;
 		overrideActive_ = false;
 	} else {
 		const size_t index = static_cast<size_t>(event);
-		if (event == UiEvent::Error) {
-			resetting_ = false;
-			booting_ = false;
-		}
+		if (event == UiEvent::Error) resetting_ = false;
 		if (index >= LedConfig::EventCount) return;
 		if (booting_ && nowMs - bootAt_ < UiTiming::StartupEnd) return;
 		const LedPattern& pattern = config_.eventPatterns[index];

@@ -7,6 +7,7 @@
 static const unsigned char image_phone_on_bits[] U8X8_PROGMEM = {0x3e,0x41,0x5d,0x5d,0x5d,0x5d,0x5d,0x41,0x49,0x3e};
 static const unsigned char image_phone_off_bits[] U8X8_PROGMEM = {0x3e,0x41,0x41,0x55,0x49,0x55,0x41,0x41,0x49,0x3e};
 static const unsigned char image_lock_closed_bits[] U8X8_PROGMEM = {0x1c,0x22,0x22,0x7f,0x77,0x77,0x7f,0x3e};
+static const unsigned char image_lock_open_bits[] U8X8_PROGMEM = {0xe0,0x00,0x10,0x01,0x10,0x01,0x1f,0x00,0x1b,0x00,0x1b,0x00,0x1f,0x00,0x0e,0x00};
 static const unsigned char image_lock_unprov_bits[] U8X8_PROGMEM = {0x1c,0x22,0x22,0x7f,0x41,0x41,0x41,0x7f};
 static const unsigned char image_radio_bits[] U8X8_PROGMEM = {0x82,0x00,0x29,0x01,0x45,0x01,0x55,0x01,0x29,0x01,0x92,0x00,0x10,0x00,0x38,0x00};
 static const unsigned char image_contacts_bits[] U8X8_PROGMEM = {0x1c,0x3e,0x3e,0x1c,0x00,0x3e,0x7f,0x7f};
@@ -196,47 +197,13 @@ static bool drawFrame(U8G2 &d, uint32_t t, uint32_t freqKhz) {
 
 }
 
-static void drawLock(U8G2& d, float centerX, float bodyY, float scale, float opening) {
-    const float angle = opening * 0.75f;
-    const float cosine = cosf(angle), sine = sinf(angle);
-    auto point = [&](float x, float y, int16_t& px, int16_t& py) {
-        const float dx = x - 11, dy = y - 4;
-        px = lroundf(centerX + (11 + dx * cosine - dy * sine) * scale);
-        py = lroundf(bodyY + (4 + dx * sine + dy * cosine) * scale);
-    };
-    int16_t previousX, previousY;
-    point(-11, 4, previousX, previousY);
-    for (uint8_t index = 0; index <= 18; ++index) {
-        const float phase = float(index) * PI / 18;
-        int16_t x, y;
-        point(-11 * cosf(phase), -9 - 11 * sinf(phase), x, y);
-        d.drawLine(previousX, previousY, x, y);
-        if (scale > 0.5f) d.drawLine(previousX + 1, previousY, x + 1, y);
-        previousX = x; previousY = y;
-    }
-    int16_t endX, endY;
-    point(11, 4, endX, endY);
-    d.drawLine(previousX, previousY, endX, endY);
-    if (scale > 0.5f) d.drawLine(previousX + 1, previousY, endX + 1, endY);
-    const int16_t width = lroundf(34 * scale), height = lroundf(25 * scale);
-    d.drawRBox(lroundf(centerX - 17 * scale), lroundf(bodyY), width, height,
-        scale > 0.5f ? 3 : 1);
-    if (scale > 0.5f) {
-        d.setDrawColor(0);
-        d.drawDisc(lroundf(centerX), lroundf(bodyY + 9 * scale), lroundf(3 * scale));
-        d.drawBox(lroundf(centerX - scale), lroundf(bodyY + 9 * scale),
-            lroundf(3 * scale), lroundf(8 * scale));
-        d.setDrawColor(1);
-    }
-}
-
 static void renderHome(U8G2 &d, const UiSnapshot &s, UiEvent activity, bool lockIcon = true) {
     char buf[32];
     const bool unlocked = s.state == DeviceState::Unlocked;
 
     if (lockIcon) switch (s.state) {
         case DeviceState::Locked:   d.drawXBMP(0, 0, 7, 8, image_lock_closed_bits); break;
-        case DeviceState::Unlocked: drawLock(d, 4, 5, 0.2f, 1); break;
+        case DeviceState::Unlocked: d.drawXBMP(0, 0, 9, 8, image_lock_open_bits); break;
         default:                    d.drawXBMP(0, 0, 7, 8, image_lock_unprov_bits); break;
     }
     d.setFont(u8g2_font_helvB08_tf);
@@ -291,6 +258,112 @@ static void renderHome(U8G2 &d, const UiSnapshot &s, UiEvent activity, bool lock
     d.drawStr(12, 60, text);
     if (ticks >= 2) d.drawXBMP(116, 54, 12, 5, image_check2_bits);
     else if (ticks == 1) d.drawXBMP(120, 54, 8, 5, image_check_bits);
+}
+
+namespace lockscreen {
+
+const float CX = 64, TOP = 23;
+const float BODY_HW = 15, BODY_H = 20, BODY_R = 3;
+const float LEG = 8, THICK = 4, ARC_R = 10, LEG_TOP = -5, LEG_DEPTH = 3;
+const float LIFT = 6;
+const float END_S = 5.0f / 30.0f, END_CX = 2.5f, END_TOP = 4;
+
+const uint16_t T_INFO_OUT    = 250;
+const uint16_t T_LIFT_END    = 350;
+const uint16_t T_SWING_START = 200;
+const uint16_t T_SWING_END   = 700;
+const uint16_t T_FLY_START   = 900;
+const uint16_t T_END         = 1400;
+
+static void drawArc(U8G2 &d, int16_t x0, int16_t y0, int16_t rx, int16_t ry, uint8_t opt) {
+    if (ry < 0) return;
+    if (rx < 1 || ry < 1) d.drawVLine(x0, y0 - ry, ry + 1);
+    else d.drawFilledEllipse(x0, y0, rx, ry, opt);
+}
+
+// Coordinates are relative to the centre line and top of the body. lift is in px,
+// swing 0..1 turns the shackle half a revolution around its right leg.
+static void drawPadlock(U8G2 &d, float cx, float top, float s, float lift, float swing) {
+    auto X = [&](float u) { return (int16_t)lroundf(cx + u * s); };
+    auto Y = [&](float v) { return (int16_t)lroundf(top + v * s); };
+
+    float freeLeg = LEG - 2 * LEG * cosf(PI * swing);
+    float legTop = LEG_TOP - lift;
+    float half = fabsf(LEG - freeLeg) / 2;
+    int16_t mid = X((LEG + freeLeg) / 2), arcY = Y(legTop) - 1;
+    int16_t rxo = (int16_t)lroundf((half + THICK / 2) * s) - 1, ryo = (int16_t)lroundf(ARC_R * s) - 1;
+    int16_t rxi = (int16_t)lroundf((half - THICK / 2) * s) - 1, ryi = (int16_t)lroundf((ARC_R - THICK) * s) - 1;
+
+    d.setDrawColor(0);
+    int16_t bx0 = X(-BODY_HW) - 1, bx1 = max(X(BODY_HW), X(freeLeg + THICK / 2)) + 1;
+    int16_t by0 = arcY - ryo - 1;
+    d.drawBox(bx0, by0, bx1 - bx0, Y(BODY_H) + 1 - by0);
+
+    // Split into two quarters so the arc can be an even number of pixels wide.
+    d.setDrawColor(1);
+    drawArc(d, mid - 1, arcY, rxo, ryo, U8G2_DRAW_UPPER_LEFT);
+    drawArc(d, mid,     arcY, rxo, ryo, U8G2_DRAW_UPPER_RIGHT);
+    if (rxi >= 0 && ryi >= 0) {
+        d.setDrawColor(0);
+        drawArc(d, mid - 1, arcY, rxi, ryi, U8G2_DRAW_UPPER_LEFT);
+        drawArc(d, mid,     arcY, rxi, ryi, U8G2_DRAW_UPPER_RIGHT);
+        d.setDrawColor(1);
+    }
+
+    int16_t legY = Y(legTop);
+    auto drawLeg = [&](float c, int16_t bottom) {
+        int16_t x = X(c - THICK / 2), w = max<int16_t>(1, X(c + THICK / 2) - x);
+        if (bottom > legY) d.drawBox(x, legY, w, bottom - legY);
+    };
+    drawLeg(LEG, Y(LEG_DEPTH));
+    drawLeg(freeLeg, Y(LEG_DEPTH - lift));
+
+    int16_t x = X(-BODY_HW), y = Y(0), w = X(BODY_HW) - x, h = Y(BODY_H) - y;
+    int16_t r = (int16_t)lroundf(BODY_R * s);
+    if (r > w / 2 - 1) r = w / 2 - 1;
+    if (r > h / 2 - 1) r = h / 2 - 1;
+    if (r >= 1) d.drawRBox(x, y, w, h, r);
+    else        d.drawBox(x, y, w, h);
+
+    if (s > 0.5f) {
+        d.setDrawColor(0);
+        d.drawRBox(X(-2), Y(5), X(2) - X(-2), Y(10) - Y(5), 1);
+        d.drawBox(X(-1), Y(9), X(1) - X(-1), Y(15) - Y(9));
+        d.setDrawColor(1);
+    }
+}
+
+static void drawInfo(U8G2 &d, int16_t dy) {
+    d.setFont(u8g2_font_haxrcorp4089_tr);
+    d.drawStr((128 - d.getStrWidth("Locked")) / 2, 57 + dy, "Locked");
+}
+
+static void drawLocked(U8G2 &d) {
+    drawPadlock(d, CX, TOP, 1, 0, 0);
+    drawInfo(d, 0);
+}
+
+// Shackle lifts and swings open, then the lock flies into the dashboard's lock icon
+// while the dashboard wipes in from the bottom.
+static void drawUnlockFrame(U8G2 &d, uint32_t t, const UiSnapshot &home) {
+    float lift  = LIFT * boot::easeOutBack(boot::prog(t, 0, T_LIFT_END));
+    float swing = boot::easeInOutCubic(boot::prog(t, T_SWING_START, T_SWING_END));
+    float f     = boot::easeInOutCubic(boot::prog(t, T_FLY_START, T_END));
+
+    if (f > 0) {
+        renderHome(d, home, UiEvent::Boot, false);
+        int16_t reveal = 64 - (int16_t)(64 * f);
+        d.setDrawColor(0);
+        d.drawBox(0, 0, 128, reveal);
+        d.setDrawColor(1);
+        if (reveal > 0) d.drawHLine(0, reveal, 128);
+    } else {
+        drawInfo(d, (int16_t)(20 * boot::easeInOutCubic(boot::prog(t, 0, T_INFO_OUT))));
+    }
+
+    drawPadlock(d, CX + (END_CX - CX) * f, TOP + (END_TOP - TOP) * f, 1 + (END_S - 1) * f, lift, swing);
+}
+
 }
 
 static void renderRadio(U8G2 &d, const UiSnapshot &s) {
@@ -375,10 +448,10 @@ bool OledDriver::init() {
 void OledDriver::show(const UiSnapshot& snapshot) {
     if (snapshot.state != snapshot_.state) {
         redraw_ = true;
-        booting_ = false;
         errorUntil_ = 0;
         unlocking_ = snapshot_.state == DeviceState::Locked && snapshot.state == DeviceState::Unlocked;
-        unlockAt_ = snapshot.uptimeMs;
+        // The boot animation always finishes; an unlock during it plays right after.
+        unlockAt_ = max(snapshot.uptimeMs, bootAt_ + UiTiming::StartupEnd);
     }
     if (snapshot.fingerprint[0] && strcmp(snapshot.fingerprint, snapshot_.fingerprint) != 0) {
         fingerprintUntil_ = snapshot.uptimeMs + 15000;
@@ -395,21 +468,17 @@ void OledDriver::onEvent(UiEvent event, uint64_t nowMs) {
     switch (event) {
         case UiEvent::Boot:
             bootAt_ = nowMs;
-            booting_ = true;
             break;
         case UiEvent::FactoryReset:
             resetting_ = true;
-            booting_ = false;
             unlocking_ = false;
             redraw_ = true;
             break;
         case UiEvent::Pairing:
-            booting_ = false;
             fingerprintUntil_ = 0;
             break;
         case UiEvent::Error:
             resetting_ = false;
-            booting_ = false;
             errorUntil_ = nowMs + 3000;
             break;
         default:
@@ -451,22 +520,16 @@ void OledDriver::render(uint64_t nowMs) {
         display_.drawStr(0, 25, "Factory reset");
         display_.setFont(u8g2_font_haxrcorp4089_tr);
         display_.drawStr(0, 43, "Erasing identity...");
-    } else if (booting_ && nowMs - bootAt_ < UiTiming::StartupEnd) {
+    } else if (nowMs - bootAt_ < UiTiming::StartupEnd) {
         scene_ = "boot";
         boot::drawFrame(display_, nowMs - bootAt_,
             static_cast<uint32_t>(snapshot_.frequencyMhz * 1000 + 0.5f));
     } else if (snapshot_.state == DeviceState::Locked) {
         scene_ = "locked";
-        drawLock(display_, 64, 28, 1, 0);
-        display_.setFont(u8g2_font_helvB08_tf);
-        display_.drawStr(64 - display_.getStrWidth("Locked") / 2, 63, "Locked");
-    } else if (unlocking_ && nowMs - unlockAt_ < 1400) {
+        lockscreen::drawLocked(display_);
+    } else if (unlocking_ && nowMs - unlockAt_ < lockscreen::T_END) {
         scene_ = "unlocking";
-        const uint32_t elapsed = nowMs - unlockAt_;
-        const float opening = boot::easeInOutCubic(boot::prog(elapsed, 0, 550));
-        const float shrink = boot::easeInOutCubic(boot::prog(elapsed, 650, 1400));
-        if (shrink > 0) renderHome(display_, snapshot_, UiEvent::Boot, false);
-        drawLock(display_, 64 - 60 * shrink, 28 - 23 * shrink, 1 - 0.8f * shrink, opening);
+        lockscreen::drawUnlockFrame(display_, nowMs - unlockAt_, snapshot_);
     } else if (nowMs < errorUntil_) {
         scene_ = "error";
         display_.setFont(u8g2_font_helvB08_tf);
