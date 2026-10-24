@@ -492,6 +492,12 @@ void Commands::secureMessages(const char* command, JsonObjectConst args, JsonObj
 			item["type"] = MeshEngine::typeName(message->type); item["ctr"] = message->counter;
 			item["state"] = MeshEngine::stateName(message->state); item["retry"] = message->retry;
 		}
+		JsonArray recent = result.createNestedArray("recent");
+		for (size_t index = 0; const MeshEngine::Recent* entry = mesh.recent(index); ++index) {
+			JsonObject item = recent.createNestedObject();
+			item["msg_ref"] = entry->reference; item["state"] = MeshEngine::stateName(entry->state);
+			if (entry->reason != MeshEngine::Reason::None) item["reason"] = MeshEngine::reasonName(entry->reason);
+		}
 		return;
 	}
 	if (strcmp(command, "msg.cancel") == 0) {

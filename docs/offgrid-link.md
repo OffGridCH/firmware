@@ -455,11 +455,16 @@ longer than a command response.
 No args. Result:
 
 ```json
-{"pending":[{"msg_ref":1,"to":1,"type":"text","ctr":1,"state":"sent","retry":0}]}
+{"pending":[{"msg_ref":1,"to":1,"type":"text","ctr":1,"state":"sent","retry":0}],
+ "recent":[{"msg_ref":3,"state":"delivered"},{"msg_ref":2,"state":"failed","reason":"timeout"}]}
 ```
 
-Lists own RAM work only, not ACK/relay queues or message history. Terminal work
+`pending` lists own RAM work only, not ACK/relay queues or message history. Terminal work
 is removed. Pending contents are lost on reboot/lock; they are not a persistent inbox.
+`recent` holds the final state of the last 16 messages since boot, newest first, without
+content; it survives lock but not reboot. A host that missed a terminal `msg.status`
+settles the message from it. `msg_ref` restarts at 1 after every boot, so a host must only
+match refs it received in the current boot.
 
 ### `msg.cancel`
 
@@ -690,8 +695,9 @@ the message. There is no persistent inbox or event replay API.
 
 Continuously drain serial even while requests are pending. On boot/reconnect,
 perform hello, unlock, reload contacts and inspect pending work/loss counters.
-Terminal events lost under backpressure cannot be reconstructed from
-`msg.pending`; keep uncertain app states explicit instead of fabricating delivery.
+Terminal events lost under backpressure or while disconnected can be settled from
+`msg.pending.recent` for the last 16 messages of the current boot; older ones stay
+uncertain, so keep that state explicit instead of fabricating delivery.
 
 ## 11. Factory reset
 

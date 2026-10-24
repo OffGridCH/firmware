@@ -229,8 +229,15 @@ void MeshEngine::status(size_t index, State state, Reason reason, uint64_t nowMs
 	emit(event);
 }
 
+const MeshEngine::Recent* MeshEngine::recent(size_t index) const {
+	return index < recentCount_ ? &recent_[(recentHead_ + index) % RecentCapacity] : nullptr;
+}
+
 void MeshEngine::finish(size_t index, State state, Reason reason, uint64_t nowMs, uint8_t hops) {
 	status(index, state, reason, nowMs, hops);
+	recentHead_ = (recentHead_ + RecentCapacity - 1) % RecentCapacity;
+	recent_[recentHead_] = {slots_[index].view.reference, state, reason};
+	if (recentCount_ < RecentCapacity) ++recentCount_;
 	if (!flightAck_ && !flightRelay_ && flight_ == int(index)) { abort_ = true; flight_ = -1; }
 	CryptoEngine::zeroize(&slots_[index], sizeof(Slot));
 }
