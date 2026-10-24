@@ -42,9 +42,19 @@ bool MeshEngine::hash(const uint8_t* bytes, size_t length, uint32_t& result) {
 	return true;
 }
 
+// An entry only has to outlive one flood (7 hops of about a second each). Without an expiry a resend
+// that repeats earlier bytes exactly (same counter and RETRY) would be dropped by every relay for as long
+// as the 256-entry ring keeps it, which in a quiet mesh can be hours.
+constexpr uint64_t DedupeLifetimeMs = 30000;
+
 bool MeshEngine::remember(uint32_t value) {
-	for (size_t index = 0; index < cacheCount_; ++index) if (cache_[index] == value) return false;
-	cache_[cacheNext_] = value;
+	for (size_t index = 0; index < cacheCount_; ++index) {
+		if (cache_[index].hash != value) continue;
+		if (nowMs_ - cache_[index].at < DedupeLifetimeMs) return false;
+		cache_[index].at = nowMs_;
+		return true;
+	}
+	cache_[cacheNext_] = {value, nowMs_};
 	cacheNext_ = (cacheNext_ + 1) % 256;
 	if (cacheCount_ < 256) ++cacheCount_;
 	return true;

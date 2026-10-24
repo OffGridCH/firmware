@@ -136,7 +136,11 @@ private:
 	Slot slots_[Capacity];
 	Ack acks_[4];
 	Relay relays_[8];
-	uint32_t cache_[256] = {};
+	struct Seen {
+		uint32_t hash = 0;
+		uint64_t at = 0;
+	};
+	Seen cache_[256];
 	size_t cacheCount_ = 0;
 	size_t cacheNext_ = 0;
 	uint8_t hashKey_[16] = {};
