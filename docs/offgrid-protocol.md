@@ -381,6 +381,13 @@ Inner header | lat (3 B) | lon (3 B) | [alt (2 B)] | [age (1 B)]
 
 No timestamps are used anywhere in the protocol, because devices may have no clock. The receiver timestamps messages on arrival.
 
+Firmware codec limits: reject nonfinite/out-of-range coordinates; clamp rounded
+upper endpoints to `0xFFFFFF` (never wrap +90/+180 to zero). Age is rounded to
+the nearest 10 seconds, capped at 2550 seconds. Reserved types/flags/emoji indices,
+malformed lengths and invalid UTF-8/NUL text are rejected after authentication.
+The firmware caps complete frames at 100 bytes and text bodies at 83 bytes;
+optional compressed text returns an explicit unsupported result.
+
 ### 8.4 ACK (no inner header)
 
 See [section 10](#10-receive-receipts-ack).

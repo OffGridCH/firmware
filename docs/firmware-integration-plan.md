@@ -43,7 +43,7 @@ specification conflict explicitly; do not silently weaken a security requirement
 | `Security` | Real wrapped-token sessions, persistent identity, backoff, cleanup, timeout, rotation and app/master reset authorization in secure profiles | Contact load/lock wiring; power-cut/fault acceptance and hardening |
 | `Contacts` | Real fixed encrypted table, durable counter reservations, conservative replay load and wipe-on-lock | Mesh queue cleanup wiring and mixed-load/endurance acceptance |
 | `Pairing` | Real X25519/HKDF relationships, QR/salt ordering, fingerprint, expiry/cancel, collision warnings and persistence | Two-board directional-key agreement acceptance |
-| `PacketCodec` | Placeholder | Encode/decode TEXT, REACTION, GEO and ACK; construct authenticated headers/nonces; encrypt and verify packets |
+| `PacketCodec` | Real bounded TEXT/REACTION/GEO/ACK codec; published vectors verified on device | Mesh callers and physical interoperability acceptance |
 | `MeshEngine` | Placeholder; delivery/retry/relay events are simulated | Real outbound queue, direct receive/delivery, ACKs, retries, replay decisions, relaying and congestion controls |
 | `OledDriver` | U8g2 startup animation and home renderer using `HomeView`, `begin`, `drawHome` | Adapt to App's `init/show/onEvent/tick`; bounded animation/transfers; state-driven overlays; independent failure handling |
 | `LedDriver` | Onboard PWM and owner-confirmed dual four-pixel GRB NeoPixels; copied settings/preview and master switches | Visual/power and mixed-RF timing acceptance pending; RMT transfers are synchronous and bounded by four pixels |
@@ -471,4 +471,16 @@ host responsiveness, recovery, and the release gates separately with evidence.
   durable deletion; test peer removed, other contacts preserved, vault locked.
   Two-board directional key agreement is explicitly unverified with one board.
 
-Next: packet codec, then real messaging/relay wiring and removal of the mock.
+- Stage 6: bounded typed PacketCodec now emits/validates the 8-byte header,
+  specified 13-byte nonce and normalized AD, AES-128-CCM/tag8, empty 16-byte ACK
+  bound to original CTR, UTF-8 TEXT, REACTION and GEO. Strict flags/lengths,
+  83-byte text cap, no zero/wrapped counters, finite/ranged coordinates,
+  clamped upper endpoints, signed altitude and rounded age. Optional compression
+  is explicitly unsupported. Failure output is cleared; plaintext scratch wiped.
+- UART secure and diagnostic builds pass; isolated on-device
+  `diag.codec.selftest` matches all four published encrypted vectors exactly,
+  verifies relay HOP_LEFT mutability, rejects tampered immutable bytes/tags and
+  wrong original ACK counter, and covers text/geo/counter boundaries and malformed
+  authenticated payloads. No RF transmission; secure locked image restored.
+
+Next: real messaging/relay wiring and removal of the mock.

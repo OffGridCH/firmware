@@ -21,6 +21,7 @@
 #include "../storage/ConfigStore.h"
 #include "../storage/VaultStore.h"
 #include "../drivers/RadioDriver.h"
+#include "../mesh/PacketCodec.h"
 
 class MockDevice {
 public:
@@ -1486,6 +1487,14 @@ private:
         JsonObject result = response["result"].as<JsonObject>();
         lastActivity_ = nowMs;
 #if OFFGRID_RADIO_DIAGNOSTICS
+        if (strcmp(command, "diag.codec.selftest") == 0) {
+            if (!PacketCodec::selfTest()) {
+                Commands::fail(response, "E_INTERNAL", "packet codec diagnostic failed");
+                return;
+            }
+            result["passed"] = true;
+            return;
+        }
         if (strcmp(command, "diag.vault.selftest") == 0) {
             if (!Commands::boolArg(args, response, "verify", false)) return;
             const bool passed = VaultStore::selfTest(args["verify"] | false);
