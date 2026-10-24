@@ -809,7 +809,8 @@ private:
             }
             snprintf(message.text, sizeof(message.text), "%s", args["text"].as<const char*>());
         } else if (strcmp(type, "reaction") == 0) {
-            if (!args["target"].is<JsonObject>()) {
+            // args is a const view: is<JsonObject>() is false for every value there.
+            if (!args["target"].is<JsonObjectConst>()) {
                 Commands::fail(response, "E_INVALID_ARG", "target must be an object", "target");
                 return false;
             }
