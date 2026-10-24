@@ -107,10 +107,12 @@ retry/re-ACK without redelivery, exact eight-slot host queue bounds, cancellatio
 lock and deletion cleanup, and actual ciphertext trace.
 
 RF acceptance requires antennas and lawful local settings. The supplied check
-uses 869.525 MHz/BW125/SF9/CR4/5, 0 dBm and CAD. Shared data/ACK/relay scheduling
-waits 99 times measured TX airtime after transmission, including interrupted/
-failed TX with known airtime. This conservative 1% per-boot pacing is not a
-durable rolling-hour ledger or regulatory certification across resets.
+uses 869.525 MHz/BW125/SF9/CR4/5, 0 dBm and CAD. There is no duty-cycle cooldown
+or enforced airtime budget in any profile. CAD, collision backoff, bounded
+queues, per-source relay limits and retries remain enabled/configurable.
+Airtime is still measured for statistics and retry timing. Use only where your
+lab authorization permits these transmissions; firmware does not enforce
+regulatory duty-cycle limits.
 
 For lab-only, production-namespace-independent diagnostics:
 

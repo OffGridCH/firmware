@@ -156,7 +156,6 @@ private:
 	uint16_t ownId_ = 0;
 	uint32_t nextReference_ = 1;
 	uint64_t nowMs_ = 0;
-	uint64_t nextTransmitAt_ = 0;
 	Stats stats_;
 	const char* receiveAction_ = "ignored";
 	EventHandler handler_ = nullptr;

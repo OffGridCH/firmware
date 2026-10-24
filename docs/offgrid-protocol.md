@@ -153,11 +153,11 @@ A 16-byte ACK at SF9 takes ca. 165 ms.
 
 ### Airtime pacing and regulatory limits
 
-Own data, ACKs and relays share a
-99-times-measured-airtime cooldown after each TX, including interrupted/failed
-transmits with known airtime. This conservatively paces to 1% during a continuous
-boot, but is not a durable rolling-hour ledger across resets or a certification
-of lawful frequency/power/antenna use in every jurisdiction.
+Firmware does not enforce a duty-cycle cooldown or airtime budget. Own data,
+ACKs and relays can proceed after radio completion subject to CAD, collision
+backoff, priority and per-source limits. Measured airtime remains available for
+statistics and retry timing. Operate only within authorized lab conditions;
+legal frequency/power/airtime compliance is the operator's responsibility.
 
 ---
 
@@ -609,7 +609,7 @@ There is no running shared state that has to be tracked packet by packet:
 | Retry outside replay window | Drop as stale; same-contact traffic can advance the 64-counter window (9.3), so sender may time out |
 | ACK forgery or mix-up | AD bound to original CTR, replay window |
 | ACK storm | One ACK per message, small hop limit, no ACK for ACK |
-| Flooding exhausts airtime | CAD, random backoff, bounded relay/source budgets and shared per-boot airtime pacing |
+| Flooding exhausts airtime | CAD, random backoff and bounded relay/source budgets; no enforced duty-cycle budget |
 | No clock on device | No timestamps in protocol, receiver stamps arrival |
 | Lost or stolen device | Delete contact and re-pair. Revocation over the air is impossible because the key is compromised |
 | Flood of invalid tags | Rate limit per SRC |
@@ -628,7 +628,7 @@ There is no running shared state that has to be tracked packet by packet:
 | **No forward secrecy** | A stolen device or key exposes captured past traffic |
 | **Offline recipient** | The message is lost after the retries. Store-and-forward on relays is future work |
 | **No fragmentation** | Long texts must be split by the app |
-| **Airtime accounting resets at boot** | Shared 1% pacing is not a durable rolling-hour ledger or regulatory certification |
+| **No enforced duty-cycle budget** | Lab operation only where authorized; operator controls regulatory compliance |
 
 **Possible extensions**
 
