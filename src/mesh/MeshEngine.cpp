@@ -311,7 +311,7 @@ void MeshEngine::transmissionRejected(bool busy, uint64_t nowMs) {
 }
 
 void MeshEngine::transmissionComplete(bool success, uint32_t airtimeMs, uint64_t nowMs) {
-	if (airtimeMs) nextTransmitAt_ = nowMs + uint64_t(airtimeMs) * 99;
+	if (airtimeMs) nextTransmitAt_ = nowMs + uint64_t(airtimeMs) * (100 / (config_.dutyPercent ? config_.dutyPercent : 1) - 1);
 	if (flight_ < 0) return;
 	const size_t index = flight_;
 	flight_ = -1;

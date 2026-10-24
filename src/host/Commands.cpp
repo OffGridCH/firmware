@@ -409,7 +409,7 @@ Commands::Action Commands::handleSecure(const char* command, JsonObjectConst arg
 				result["rx_malformed"] = stats.malformed;
 				result["relayed"] = stats.relayed; result["relay_suppressed"] = stats.relaySuppressed;
 				result["relay_dropped"] = stats.relayDropped; result["rate_limit_drops"] = stats.rateDrops;
-				result["tx_duty_cycle_max_percent"] = 1;
+				result["tx_duty_cycle_max_percent"] = secureMeshConfig().dutyPercent;
 				result["trace_dropped_events"] = traceDrops_;
 #if OFFGRID_RADIO_DIAGNOSTICS
 				result["injected_ack_drops"] = stats.injectedAckDrops;
@@ -476,6 +476,11 @@ MeshEngine::Config Commands::secureMeshConfig() const {
 	config.relayWhenLocked = live_["mesh"]["relay_when_locked"];
 	config.backoffSlots = live_["mesh"]["backoff_slots"];
 	config.ratePerSource = live_["mesh"]["rate_limit_per_src"];
+	// ERC 70-03 band h1.4 (869.40 to 869.65 MHz) allows 10 % duty cycle, the rest of the plan 1 % or less.
+	// The whole channel has to fit: 125 kHz at 869.525 MHz does, 500 kHz there would not.
+	const float frequency = live_["radio"]["freq_mhz"];
+	const float halfMhz = live_["radio"]["bw_khz"].as<float>() / 2000.0f;
+	config.dutyPercent = frequency - halfMhz >= 869.3995f && frequency + halfMhz <= 869.6505f ? 10 : 1;  // 0.5 kHz float slack
 	return config;
 }
 

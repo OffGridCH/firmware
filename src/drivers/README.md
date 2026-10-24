@@ -82,7 +82,8 @@ lock/unlock explicitly reinitializes unavailable hardware.
 
 App routes real RX/TX/error events to MeshEngine in every profile. Locked keyless
 receive/relay is opt-in; unprovisioned firmware does not initialize RF. Mesh
-enforces shared 99-times-airtime pacing after TX. This is a per-boot safeguard,
+enforces shared airtime pacing after TX: 9 x airtime when the channel lies inside 869.40–869.65 MHz
+(10 %), 99 x elsewhere (1 %). This is a per-boot safeguard,
 not a durable legal rolling-hour ledger across resets.
 
 There is no raw-radio simulator backend. Explicit lab profiles add secure

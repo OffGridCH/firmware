@@ -153,9 +153,10 @@ A 16-byte ACK at SF9 takes ca. 165 ms.
 
 ### Airtime pacing and regulatory limits
 
-Own data, ACKs and relays share a
-99-times-measured-airtime cooldown after each TX, including interrupted/failed
-transmits with known airtime. This conservatively paces to 1% during a continuous
+Own data, ACKs and relays share a cooldown after each TX of (100 / p - 1) times
+the measured airtime, including interrupted/failed transmits with known airtime.
+p is 10 % when the whole channel lies inside 869.40–869.65 MHz (ERC 70-03 band h1.4, where all presets sit;
+9 x airtime) and 1 % on any other frequency (99 x airtime). This paces a continuous
 boot, but is not a durable rolling-hour ledger across resets or a certification
 of lawful frequency/power/antenna use in every jurisdiction.
 
@@ -628,7 +629,7 @@ There is no running shared state that has to be tracked packet by packet:
 | **No forward secrecy** | A stolen device or key exposes captured past traffic |
 | **Offline recipient** | The message is lost after the retries. Store-and-forward on relays is future work |
 | **No fragmentation** | Long texts must be split by the app |
-| **Airtime accounting resets at boot** | Shared 1% pacing is not a durable rolling-hour ledger or regulatory certification |
+| **Airtime accounting resets at boot** | Shared band pacing (10 % or 1 %) is not a durable rolling-hour ledger or regulatory certification |
 
 **Possible extensions**
 

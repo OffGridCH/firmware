@@ -37,6 +37,9 @@ public:
 		bool relayWhenLocked = false;
 		uint8_t backoffSlots = 8;
 		uint8_t ratePerSource = 20;
+		// Share of airtime this node may use; after each TX it stays quiet for (100 / percent - 1) times
+		// the measured airtime. 1 % by default; 10 % is allowed in 869.40 to 869.65 MHz (ERC 70-03 h1.4).
+		uint8_t dutyPercent = 1;
 	};
 	struct Stats {
 		uint32_t tagFailures = 0;
