@@ -68,12 +68,9 @@ void PacketCodec::cryptoInputs(const uint8_t* bytes, uint8_t nonce[13], uint8_t 
 	write24(ad + HeaderBytes, originalCounter);
 }
 
-PacketCodec::Error PacketCodec::encode(const Header& header, const Payload& payload,
-	const uint8_t key[16], Packet& packet) {
-	packet = {};
-	if (!key || !valid(header)) return Error::Format;
+PacketCodec::Error PacketCodec::serialize(const Payload& payload, uint8_t* bytes, size_t& length) {
 	Plaintext plain;
-	size_t length = 0;
+	length = 0;
 	const uint8_t ack = payload.ack ? 8 : 0;
 	switch (payload.type) {
 	case Type::Text: {
@@ -110,6 +107,27 @@ PacketCodec::Error PacketCodec::encode(const Header& header, const Payload& payl
 		break;
 	default: return Error::Format;
 	}
+	memcpy(bytes, plain.bytes, length);
+	return Error::None;
+}
+
+PacketCodec::Error PacketCodec::validate(const Payload& payload, size_t& frameLength) {
+	frameLength = 0;
+	Plaintext plain;
+	size_t length = 0;
+	const Error error = serialize(payload, plain.bytes, length);
+	if (error == Error::None) frameLength = HeaderBytes + length + TagBytes;
+	return error;
+}
+
+PacketCodec::Error PacketCodec::encode(const Header& header, const Payload& payload,
+	const uint8_t key[16], Packet& packet) {
+	packet = {};
+	if (!key || !valid(header)) return Error::Format;
+	Plaintext plain;
+	size_t length = 0;
+	const Error error = serialize(payload, plain.bytes, length);
+	if (error != Error::None) return error;
 	writeHeader(header, packet.bytes);
 	uint8_t nonce[13], ad[11];
 	cryptoInputs(packet.bytes, nonce, ad);

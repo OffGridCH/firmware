@@ -1,4 +1,5 @@
 #include "VaultStore.h"
+#include "../mesh/MeshEngine.h"
 #include "ConfigStore.h"
 #include "VaultStore.h"
 
@@ -420,6 +421,7 @@ bool VaultStore::selfTest(bool verify) {
 		CryptoEngine::zeroize(replacement, sizeof(replacement));
 	}
 	if (ok) ok = Contacts::selfTest(store);
+	if (ok) ok = MeshEngine::selfTest(store);
 	store.close();
 	CryptoEngine::zeroize(key, sizeof(key));
 	CryptoEngine::zeroize(identity, sizeof(identity));

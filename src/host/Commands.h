@@ -9,6 +9,7 @@
 #include "../security/Pairing.h"
 #include "../storage/ConfigStore.h"
 #include "../drivers/RadioDriver.h"
+#include "../mesh/MeshEngine.h"
 
 class Commands {
 public:
@@ -37,7 +38,7 @@ public:
 	void initSecure(ConfigStore& store, Security& security);
 	Action handleSecure(const char* command, JsonObjectConst args, JsonObject response,
 		uint64_t nowMs, Security& security, VaultStore& vault, ConfigStore& store, RadioDriver& radio,
-		Contacts& contacts, Pairing& pairing);
+		Contacts& contacts, Pairing& pairing, MeshEngine& mesh);
 	void secureSnapshot(UiSnapshot& snapshot, uint64_t nowMs, const Security& security, const RadioDriver& radio,
 		const Contacts& contacts, const Pairing& pairing);
 	bool takeSecureLedConfig(LedConfig& config);
@@ -45,6 +46,10 @@ public:
 	void emitSecureBoot(const Security& security, uint64_t nowMs);
 	RadioDriver::Config secureRadioConfig() const;
 	bool lockedRelay() const { return live_["mesh"]["relay_when_locked"].as<bool>(); }
+	MeshEngine::Config secureMeshConfig() const;
+	bool cadEnabled() const { return live_["mesh"]["cad_enabled"].as<bool>(); }
+	uint8_t backoffSlots() const { return live_["mesh"]["backoff_slots"].as<uint8_t>(); }
+	bool emitMeshEvent(const MeshEngine::Event& event);
 #endif
 
 private:
@@ -64,6 +69,8 @@ private:
 	static bool contactView(JsonObject output, uint8_t slot, const Contacts::View& view);
 	void secureContacts(const char* command, JsonObjectConst args, JsonObject response,
 		uint64_t nowMs, Security& security, Contacts& contacts, Pairing& pairing);
+	void secureMessages(const char* command, JsonObjectConst args, JsonObject response,
+		uint64_t nowMs, MeshEngine& mesh, const RadioDriver& radio);
 	StaticJsonDocument<16384> live_;
 	StaticJsonDocument<8192> candidate_;
 	char deviceId_[13] = {};

@@ -44,7 +44,7 @@ specification conflict explicitly; do not silently weaken a security requirement
 | `Contacts` | Real fixed encrypted table, durable counter reservations, conservative replay load and wipe-on-lock | Mesh queue cleanup wiring and mixed-load/endurance acceptance |
 | `Pairing` | Real X25519/HKDF relationships, QR/salt ordering, fingerprint, expiry/cancel, collision warnings and persistence | Two-board directional-key agreement acceptance |
 | `PacketCodec` | Real bounded TEXT/REACTION/GEO/ACK codec; published vectors verified on device | Mesh callers and physical interoperability acceptance |
-| `MeshEngine` | Placeholder; delivery/retry/relay events are simulated | Real outbound queue, direct receive/delivery, ACKs, retries, replay decisions, relaying and congestion controls |
+| `MeshEngine` | Real bounded direct TX/RX, ACK matching, authenticated replay, retries, cancellation and typed events | Two-board RF acceptance, relay scheduling, keyed dedupe, source limits and load/fault hardening |
 | `OledDriver` | U8g2 startup animation and home renderer using `HomeView`, `begin`, `drawHome` | Adapt to App's `init/show/onEvent/tick`; bounded animation/transfers; state-driven overlays; independent failure handling |
 | `LedDriver` | Onboard PWM and owner-confirmed dual four-pixel GRB NeoPixels; copied settings/preview and master switches | Visual/power and mixed-RF timing acceptance pending; RMT transfers are synchronous and bounded by four pixels |
 | Buttonless core | GPIO0 sampling, page advance, hold/reset paths and placeholder removed | Reset stays unavailable pending approved maintenance policy |
@@ -483,4 +483,27 @@ host responsiveness, recovery, and the release gates separately with evidence.
   wrong original ACK counter, and covers text/geo/counter boundaries and malformed
   authenticated payloads. No RF transmission; secure locked image restored.
 
-Next: real messaging/relay wiring and removal of the mock.
+- Stage 7 coherent direct-message slice: App owns MeshEngine; real `msg.*`
+  validates/copies bounded typed payloads into eight slots. Hardware TX completion
+  (not radio queue acceptance) marks sent and starts exponential retry timing;
+  retries retain CTR and change nonce/RETRY, with no fourth retry. Incoming CCM
+  authentication precedes replay/persistence/contact activation/delivery; trial
+  candidate verification handles matching short IDs. ACKs bind pending originals,
+  share durable counter allocation, and duplicates re-ACK without redelivery.
+  Cancel/delete/replacement/lock clear associated work/plaintext. Radio failures
+  produce real failed statuses; persistence failures lock the device.
+- Typed events use 32 fixed slots, independently of serial output or UI progress;
+  overflow is counted and explicitly reported after host space returns. ACK queue
+  capacity is four; loss/exhaustion is reported, never fabricated as success.
+  `radio.stats` and `sys.status` expose loss counters. Accepted receive events can
+  be lost under prolonged host backpressure; this is explicit, not store-and-forward.
+- Secure UART/native-USB and diagnostic builds pass. On-device isolated fixture
+  passes queue bounds, no sent-before-completion, wrong ACK/no replay mutation,
+  delivery match, fresh re-ACK counters, stale rejection, candidate-ID collision,
+  all retry boundaries, no-ACK completion, timeout, delete/cancel/lock/radio-error
+  cleanup and exact event-overflow accounting. Real contact regression passes;
+  UI check: 135 pings, max RTT 16.0 ms (<250 ms). Secure locked image restored.
+  No RF transmission performed: physical pairing/delivery acceptance is next
+  when a second board is attached.
+
+Next: two-board direct-message acceptance, relay wiring and removal of the mock.

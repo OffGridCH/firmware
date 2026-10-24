@@ -52,6 +52,8 @@ void App::init() {
 	security_.init(deviceId);
 	security_.setHandlers(onLoad, onLock, this);
 	commands_.initSecure(configStore_, security_);
+	mesh_.configure(commands_.secureMeshConfig());
+	mesh_.setEventHandler(onMeshEvent, this);
 	if (security_.state() != DeviceState::Unprovisioned)
 		radioDriver_.init(commands_.secureRadioConfig());
 	if (!configStore_.writable() || security_.error() == Security::Error::Storage)
@@ -78,20 +80,41 @@ void App::tick() {
 #else
 	security_.tick(nowMs);
 	pairing_.tick(nowMs);
+	mesh_.tick(nowMs);
 	radioDriver_.tick(nowMs);
 	RadioDriver::Event event;
 	for (size_t index = 0; index < 4 && radioDriver_.popEvent(event); ++index) {
 		if (event.type == RadioDriver::EventType::Failed) {
+			mesh_.transmissionComplete(false, 0, nowMs);
 			onUiEvent(this, UiEvent::Error, nowMs);
 			serialLink_.sendError("E_RADIO", "radio operation failed", nowMs);
-		} else if (event.type == RadioDriver::EventType::Received) onUiEvent(this, UiEvent::Rx, nowMs);
+		} else if (event.type == RadioDriver::EventType::Received) {
+			onUiEvent(this, UiEvent::Rx, nowMs);
+			mesh_.receive(event.bytes, event.length, event.rssi, event.snr, nowMs);
+		} else if (event.type == RadioDriver::EventType::Transmitted)
+			mesh_.transmissionComplete(true, event.airtimeMs, nowMs);
 	}
+	if (mesh_.takeStorageFailure()) {
+		security_.lock("error", nowMs);
+		onUiEvent(this, UiEvent::Error, nowMs);
+		serialLink_.sendError("E_INTERNAL", "contact counter/replay persistence failed; locked", nowMs);
+	}
+	if (!radioDriver_.ready()) mesh_.radioUnavailable(nowMs);
 	if (security_.eventReason() && serialLink_.availableTxSlots() > 0) {
 		StaticJsonDocument<384> event;
 		event["evt"] = "sec.state"; event["t"] = nowMs;
 		event["data"]["state"] = security_.state() == DeviceState::Unlocked ? "unlocked" : "locked";
 		event["data"]["reason"] = security_.eventReason();
 		if (serialLink_.sendJson(event)) security_.clearEvent();
+	}
+	if (!security_.eventReason() && serialLink_.availableTxSlots() > 0) {
+		const MeshEngine::Event* event = mesh_.event();
+		if (event && commands_.emitMeshEvent(*event)) mesh_.consumeEvent();
+		const uint32_t drops = mesh_.stats().droppedEvents + mesh_.stats().droppedAcks + radioDriver_.stats().droppedEvents;
+		if (drops > reportedDrops_ &&
+			serialLink_.sendError("E_INTERNAL", "radio/mesh event or ACK loss; inspect radio.stats", nowMs))
+			reportedDrops_ = drops;
+		else if (drops < reportedDrops_) reportedDrops_ = drops;
 	}
 	serialLink_.setReceiveEnabled(security_.eventReason() == nullptr && action_ == Commands::Action::None);
 #endif
@@ -117,6 +140,19 @@ void App::tick() {
 	if (ledReady_) ledDriver_.tick(nowMs);
 	if (oledReady_) oledDriver_.tick(nowMs);
 #if !OFFGRID_MOCK_DEVICE
+	const bool canLaunch = !mesh_.takeAbort();
+	if (!canLaunch && radioDriver_.ready()) {
+		if (!radioDriver_.standby() ||
+			(security_.state() == DeviceState::Unlocked && !radioDriver_.startReceive()))
+			serialLink_.sendError("E_RADIO", "radio cancellation failed", nowMs);
+	}
+	if (canLaunch && security_.state() == DeviceState::Unlocked && action_ == Commands::Action::None &&
+		(radioDriver_.state() == RadioDriver::State::Receiving || radioDriver_.state() == RadioDriver::State::Standby)) {
+		PacketCodec::Packet packet;
+		if (mesh_.prepareTransmission(packet, nowMs) &&
+			!radioDriver_.startTransmit(packet.bytes, packet.length, nowMs, commands_.cadEnabled(), commands_.backoffSlots()))
+			mesh_.transmissionRejected(radioDriver_.lastError() == RadioDriver::Busy, nowMs);
+	}
 	if (action_ != Commands::Action::None && serialLink_.availableTxSlots() == BoardConfig::SerialTxSlots) {
 		const Commands::Action action = action_;
 		action_ = Commands::Action::None;
@@ -139,7 +175,10 @@ void App::handleCommand(void* context, const char* command,
 	MockDevice::handle(&app.device_, command, arguments, response, nowMs);
 #else
 	app.action_ = app.commands_.handleSecure(command, arguments, response, nowMs,
-		app.security_, app.vaultStore_, app.configStore_, app.radioDriver_, app.contacts_, app.pairing_);
+		app.security_, app.vaultStore_, app.configStore_, app.radioDriver_, app.contacts_, app.pairing_, app.mesh_);
+	if (app.mesh_.takeStorageFailure()) app.security_.lock("error", nowMs);
+	if ((strcmp(command, "sec.provision") == 0 || strcmp(command, "sec.unlock") == 0) && response["ok"].as<bool>())
+		app.mesh_.open(app.security_.nodeId());
 	if ((strcmp(command, "sec.provision") == 0 || strcmp(command, "sec.unlock") == 0) &&
 		response["ok"].as<bool>() && !app.radioDriver_.ready()) {
 		if (!app.radioDriver_.init(app.commands_.secureRadioConfig()) || !app.radioDriver_.startReceive()) {
@@ -178,6 +217,7 @@ void App::updateUi(uint64_t nowMs) {
 	if (device_.takeLedPreview(preview) && ledReady_) ledDriver_.preview(preview, nowMs);
 #else
 	commands_.secureSnapshot(snapshot_, nowMs, security_, radioDriver_, contacts_, pairing_);
+	snapshot_.pendingMessages = mesh_.count();
 	if (commands_.takeSecureLedConfig(ledConfig_) && ledReady_) ledDriver_.configure(ledConfig_);
 	LedPattern preview;
 	if (commands_.takeSecureLedPreview(preview) && ledReady_) ledDriver_.preview(preview, nowMs);
@@ -189,10 +229,21 @@ void App::updateUi(uint64_t nowMs) {
 #if !OFFGRID_MOCK_DEVICE
 void App::onLock(void* context) {
 	App& app = *static_cast<App*>(context);
+	app.mesh_.close(static_cast<uint64_t>(esp_timer_get_time()) / 1000);
+	app.mesh_.takeAbort();
 	if (app.radioDriver_.ready()) app.radioDriver_.standby();
 	app.pairing_.cancel();
 	app.pairing_.clearFingerprint();
 	app.contacts_.close();
+}
+
+void App::onMeshEvent(void* context, const MeshEngine::Event& event) {
+	if (event.type == MeshEngine::EventType::Received) onUiEvent(context, UiEvent::MessageReceived, event.timeMs);
+	else if (event.type == MeshEngine::EventType::Status) {
+		if (event.message.state == MeshEngine::State::Sent) onUiEvent(context, UiEvent::Tx, event.timeMs);
+		else if (event.message.state == MeshEngine::State::Delivered) onUiEvent(context, UiEvent::Delivered, event.timeMs);
+		else if (event.message.state == MeshEngine::State::Failed) onUiEvent(context, UiEvent::Failed, event.timeMs);
+	}
 }
 
 bool App::onLoad(void* context) {

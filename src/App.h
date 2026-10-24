@@ -31,6 +31,7 @@ private:
 #if !OFFGRID_MOCK_DEVICE
 	static void onLock(void* context);
 	static bool onLoad(void* context);
+	static void onMeshEvent(void* context, const MeshEngine::Event& event);
 	bool finishReset();
 #endif
 
@@ -46,6 +47,8 @@ private:
 	Security security_{vaultStore_};
 	Contacts contacts_{vaultStore_};
 	Pairing pairing_{security_, contacts_};
+	MeshEngine mesh_{contacts_};
+	uint32_t reportedDrops_ = 0;
 	Commands::Action action_ = Commands::Action::None;
 #endif
 	Commands commands_;

@@ -1,8 +1,9 @@
 # Offgrid Firmware
 
 Firmware for the Heltec WiFi LoRa 32 V3. Explicit development profiles provide a
-**real persistent encrypted vault** or the older serial mock. Encrypted RF
-messaging is not wired yet; these are not production-ready modem images.
+**real persistent encrypted vault and direct-message core** or the older serial
+mock. Two-board delivery and relaying acceptance are pending; these are not
+production-ready modem images.
 
 ## Real Vault and Recovery
 
@@ -14,8 +15,16 @@ python3 tools/serial-check.py --port /dev/ttyUSB0 --secure-check --allow-secure-
 `secure_dev_usb` is the native-USB counterpart. These profiles compile without
 MockDevice and never bypass authentication. They implement real X25519-wrapped
 token provisioning/unlock, encrypted identity persistence, key cleanup, timeout,
-failure backoff and two-generation token rotation. Contacts/pairing now derive and persist real relationships; message commands
-currently fail explicitly pending mesh integration.
+failure backoff and two-generation token rotation. Contacts/pairing derive and
+persist real relationships. Real `msg.*` routes use bounded queues, authenticated
+CCM packets/ACKs and retries driven by hardware TX completion. Relay scheduling
+is not implemented yet; no synthetic success is used in secure firmware.
+
+The isolated vault diagnostic also tests the direct-message domain without RF:
+eight-slot bounds, wrong ACK rejection, collision candidate verification,
+authenticated replay, fresh re-ACK counters, all three retries/no fourth retry,
+timeouts, cancellation, contact deletion, lock cleanup and bounded event loss.
+These checks are not proof of physical delivery; a second board is needed next.
 
 The checker retains a synthetic device token privately under `~/.config/offgrid/`
 (mode 0600). Back it up; never commit or share it. This host test credential is

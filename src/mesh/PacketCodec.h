@@ -38,6 +38,7 @@ public:
 		size_t length = 0;
 	};
 	static Error inspect(const uint8_t* bytes, size_t length, Header& header);
+	static Error validate(const Payload& payload, size_t& frameLength);
 	static Error encode(const Header& header, const Payload& payload,
 		const uint8_t key[16], Packet& packet);
 	static Error decode(const uint8_t* bytes, size_t length, const uint8_t key[16], Payload& payload);
@@ -50,6 +51,7 @@ public:
 #endif
 
 private:
+	static Error serialize(const Payload& payload, uint8_t* bytes, size_t& length);
 	static bool valid(const Header& header);
 	static void writeHeader(const Header& header, uint8_t* bytes);
 	static void cryptoInputs(const uint8_t* bytes, uint8_t nonce[13], uint8_t ad[11],

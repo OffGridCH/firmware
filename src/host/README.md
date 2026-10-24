@@ -5,7 +5,9 @@
 `secure_dev` and `secure_dev_usb` do not include this mock backend. Their real
 command groups are implemented in `Commands` and call App-owned domain modules.
 Lifecycle, identity, settings, authenticated recovery and real contacts/pairing
-are wired; message commands currently return explicit errors until integration.
+are wired. Real `msg.*` commands now use MeshEngine, durable per-contact counters
+and actual radio completion/error events. Physical two-board delivery acceptance
+and relay scheduling are pending; these profiles never fabricate delivery.
 See the project README and host specification section 6.11 for secure acceptance
 and app/master reset. The owner requested mock removal after domain replacement.
 

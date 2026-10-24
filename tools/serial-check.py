@@ -494,6 +494,13 @@ def exercise_contacts(device, credential_path):
         require_equal(persisted["name"], "Renamed Peer", "encrypted contact name survives reboot")
         require_equal(persisted["fingerprint"], expected, "persisted fingerprint")
         require_equal(base64.b64decode(persisted["public_key"]), peer, "persisted contact public key")
+        require_equal(device.call("msg.pending")["pending"], [], "real queue starts empty after reboot")
+        device.call("msg.send", {"to": slot, "type": "text", "text": "x" * 84}, error="E_TOO_LONG")
+        device.call("msg.send", {"to": slot, "type": "geo", "lat": 91, "lon": 0}, error="E_INVALID_ARG")
+        device.call("msg.send", {"to": slot, "type": "reaction",
+                                "target": {"author": "peer", "ref": 1}, "emoji": "invalid"}, error="E_INVALID_ARG")
+        device.call("msg.cancel", {"msg_ref": 4294967295}, error="E_INVALID_ARG")
+        require_equal(device.call("msg.pending")["pending"], [], "rejected messages never queue or transmit")
         device.call("contact.delete", {"contact_id": slot, "confirm": False}, error="E_CONFIRM_REQUIRED")
         device.call("contact.delete", {"contact_id": slot, "confirm": True})
         device.call("contact.get", {"contact_id": slot}, error="E_NO_SUCH_CONTACT")
@@ -509,7 +516,8 @@ def exercise_contacts(device, credential_path):
             device.call("contact.delete", {"contact_id": slot, "confirm": True})
         device.call("sec.set_policy", {"lock_timeout_s": original_timeout, "persist": False})
         device.call("sec.lock")
-    print("PASS: real pairing/self/duplicate/replacement checks, fingerprint, encrypted CRUD and reboot persistence; two-board key agreement pending.")
+    device.call("msg.pending", error="E_LOCKED")
+    print("PASS: real pairing/contact persistence and no-RF message validation; two-board key agreement and delivery pending.")
 
 
 def unlock_mock(device, hello=None):

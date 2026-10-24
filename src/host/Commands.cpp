@@ -99,6 +99,28 @@ bool decode(JsonObjectConst args, JsonObject response, const char* field, uint8_
 bool radioRunning(const RadioDriver& radio) {
 	return radio.ready() && radio.state() != RadioDriver::State::Standby && radio.state() != RadioDriver::State::Off;
 }
+
+const char* const emojiTable[] = {nullptr, "\xf0\x9f\x91\x8d", "\xe2\x9d\xa4\xef\xb8\x8f",
+	"\xf0\x9f\x98\x82", "\xf0\x9f\x98\xae", "\xf0\x9f\x98\xa2", "\xf0\x9f\x99\x8f"};
+
+void writePayload(JsonObject output, const PacketCodec::Payload& payload, bool receiving) {
+	output["type"] = MeshEngine::typeName(payload.type);
+	switch (payload.type) {
+	case PacketCodec::Type::Text: output["text"].set(payload.text); break;
+	case PacketCodec::Type::Reaction:
+		output["target"]["author"] = (receiving ? !payload.targetOwn : payload.targetOwn) ? "me" : "peer";
+		output["target"]["ref"] = payload.reference;
+		output["emoji"] = emojiTable[payload.emoji];
+		break;
+	case PacketCodec::Type::Geo:
+		output["lat"] = payload.latitude; output["lon"] = payload.longitude;
+		if (payload.hasAltitude) output["alt_m"] = payload.altitude;
+		else output["alt_m"] = nullptr;
+		if (payload.hasAge) output["age_s"] = payload.ageSeconds;
+		else output["age_s"] = nullptr;
+		break;
+	}
+}
 }
 
 void Commands::initSecure(ConfigStore& store, Security& security) {
@@ -156,7 +178,7 @@ void Commands::emitSecureBoot(const Security& security, uint64_t nowMs) {
 
 Commands::Action Commands::handleSecure(const char* command, JsonObjectConst args, JsonObject response,
 	uint64_t nowMs, Security& security, VaultStore& vault, ConfigStore& store, RadioDriver& radio,
-	Contacts& contacts, Pairing& pairing) {
+	Contacts& contacts, Pairing& pairing, MeshEngine& mesh) {
 	security.activity(nowMs);
 	JsonObject result = response["result"];
 	const bool unlocked = security.state() == DeviceState::Unlocked;
@@ -223,8 +245,10 @@ Commands::Action Commands::handleSecure(const char* command, JsonObjectConst arg
 		if (unlocked) {
 			result["contacts"]["used"] = __builtin_popcount(vault.contacts());
 			result["contacts"]["capacity"] = 32;
-			result["queue"]["pending"] = 0;
+			result["queue"]["pending"] = mesh.count();
 			result["queue"]["capacity"] = 8;
+			result["queue"]["dropped_events"] = mesh.stats().droppedEvents;
+			result["queue"]["dropped_acks"] = mesh.stats().droppedAcks;
 		}
 	} else if (strcmp(command, "sys.reboot") == 0) {
 		return Action::Reboot;
@@ -343,16 +367,149 @@ Commands::Action Commands::handleSecure(const char* command, JsonObjectConst arg
 		if (!unlocked && strcmp(verb, ".get") != 0) {
 			fail(response, security.state() == DeviceState::Unprovisioned ? "E_NOT_PROVISIONED" : "E_LOCKED",
 				"unlock required");
-		} else secureConfig(command, args, response, store, radio);
+		} else {
+			const MeshEngine::Stats stats = mesh.stats();
+			secureConfig(command, args, response, store, radio);
+			if (response["ok"].as<bool>() && strcmp(command, "radio.stats") == 0) {
+				result["rx_tag_failures"] = stats.tagFailures;
+				result["rx_dedupe_drops"] = stats.replayDrops;
+				result["acks_sent"] = stats.acksSent; result["acks_received"] = stats.acksReceived;
+				result["retries"] = stats.retries; result["dropped_events"] = stats.droppedEvents;
+				result["dropped_acks"] = stats.droppedAcks;
+				result["rx_malformed"] = stats.malformed;
+				if (args["reset"] | false) mesh.resetStats();
+			}
+			mesh.configure(secureMeshConfig());
+		}
 	} else if (strncmp(command, "pair.", 5) == 0 || strncmp(command, "contact.", 8) == 0) {
 		if (!unlocked) fail(response, security.state() == DeviceState::Unprovisioned ? "E_NOT_PROVISIONED" : "E_LOCKED",
 			"unlock required");
 		else secureContacts(command, args, response, nowMs, security, contacts, pairing);
 	} else if (strncmp(command, "msg.", 4) == 0) {
-		fail(response, !unlocked ? "E_LOCKED" : "E_BUSY", !unlocked ? "unlock required" :
-			"secure message integration is not implemented");
+		if (!unlocked) fail(response, "E_LOCKED", "unlock required");
+		else secureMessages(command, args, response, nowMs, mesh, radio);
 	} else fail(response, "E_UNKNOWN_CMD", "unknown command");
 	return Action::None;
+}
+
+MeshEngine::Config Commands::secureMeshConfig() const {
+	MeshEngine::Config config;
+	config.retries = live_["mesh"]["retries"];
+	config.retryBaseMs = live_["mesh"]["retry_base_ms"];
+	return config;
+}
+
+void Commands::secureMessages(const char* command, JsonObjectConst args, JsonObject response,
+	uint64_t nowMs, MeshEngine& mesh, const RadioDriver& radio) {
+	JsonObject result = response["result"];
+	if (strcmp(command, "msg.pending") == 0) {
+		JsonArray pending = result.createNestedArray("pending");
+		for (size_t index = 0; index < MeshEngine::Capacity; ++index) {
+			const MeshEngine::Pending* message = mesh.pending(index);
+			if (!message) continue;
+			JsonObject item = pending.createNestedObject();
+			item["msg_ref"] = message->reference; item["to"] = message->contact;
+			item["type"] = MeshEngine::typeName(message->type); item["ctr"] = message->counter;
+			item["state"] = MeshEngine::stateName(message->state); item["retry"] = message->retry;
+		}
+		return;
+	}
+	if (strcmp(command, "msg.cancel") == 0) {
+		if (!integerArg(args, response, "msg_ref", 1, UINT32_MAX)) return;
+		if (!mesh.cancel(args["msg_ref"], nowMs)) {
+			fail(response, "E_INVALID_ARG", "message is not pending", "msg_ref"); return;
+		}
+		result["state"] = "cancelled";
+		return;
+	}
+	if (strcmp(command, "msg.send") != 0) { fail(response, "E_UNKNOWN_CMD", "unknown message command"); return; }
+	if (!integerArg(args, response, "to", 1, 32) || !stringArg(args, response, "type", 1, 8) ||
+		!integerArg(args, response, "hops", 0, 7, false) || !boolArg(args, response, "ack", false)) return;
+	PacketCodec::Payload payload;
+	const char* type = args["type"];
+	if (strcmp(type, "text") == 0) {
+		if (!stringArg(args, response, "text", 0, 2047)) return;
+		const JsonString text = args["text"];
+		if (text.size() > PacketCodec::MaxTextBytes) {
+			fail(response, "E_TOO_LONG", "text exceeds 83 UTF-8 bytes", "text"); return;
+		}
+		memcpy(payload.text, text.c_str(), text.size());
+	} else if (strcmp(type, "reaction") == 0) {
+		payload.type = PacketCodec::Type::Reaction;
+		const JsonObjectConst target = args["target"];
+		if (target.isNull() || !stringArg(target, response, "author", 2, 4) ||
+			!integerArg(target, response, "ref", 0, 65535)) {
+			if (target.isNull()) fail(response, "E_INVALID_ARG", "target object required", "target");
+			return;
+		}
+		const char* author = target["author"];
+		if (strcmp(author, "me") && strcmp(author, "peer")) {
+			fail(response, "E_INVALID_ARG", "author must be me or peer", "target.author"); return;
+		}
+		payload.targetOwn = strcmp(author, "me") == 0;
+		payload.reference = target["ref"];
+		if (!args.containsKey("emoji")) { fail(response, "E_INVALID_ARG", "emoji required, null removes", "emoji"); return; }
+		if (!args["emoji"].isNull()) {
+			if (!stringArg(args, response, "emoji", 1, 8)) return;
+			for (uint8_t index = 1; index <= 6; ++index)
+				if (strcmp(args["emoji"], emojiTable[index]) == 0) payload.emoji = index;
+			if (!payload.emoji) { fail(response, "E_INVALID_ARG", "unsupported emoji", "emoji"); return; }
+		}
+	} else if (strcmp(type, "geo") == 0) {
+		payload.type = PacketCodec::Type::Geo;
+		if (!numberArg(args, response, "lat", -90, 90) || !numberArg(args, response, "lon", -180, 180)) return;
+		payload.latitude = args["lat"]; payload.longitude = args["lon"];
+		payload.hasAltitude = args.containsKey("alt_m") && !args["alt_m"].isNull();
+		payload.hasAge = args.containsKey("age_s") && !args["age_s"].isNull();
+		if (payload.hasAltitude && !integerArg(args, response, "alt_m", -32768, 32767)) return;
+		if (payload.hasAge && !integerArg(args, response, "age_s", 0, 2550)) return;
+		if (payload.hasAltitude) payload.altitude = args["alt_m"];
+		if (payload.hasAge) payload.ageSeconds = args["age_s"];
+	} else { fail(response, "E_INVALID_ARG", "type must be text, reaction or geo", "type"); return; }
+	payload.ack = args["ack"] | live_["mesh"]["ack_default"][type].as<bool>();
+	MeshEngine::Pending accepted;
+	size_t bytes = 0;
+	if (!radio.ready()) {
+		CryptoEngine::zeroize(&payload, sizeof(payload));
+		fail(response, "E_RADIO", "radio unavailable"); return;
+	}
+	const MeshEngine::Error error = mesh.enqueue(args["to"], payload,
+		args["hops"] | live_["mesh"]["hop_default"].as<uint8_t>(), nowMs, accepted, bytes);
+	CryptoEngine::zeroize(&payload, sizeof(payload));
+	if (error != MeshEngine::Error::None) {
+		const char* code = error == MeshEngine::Error::NoContact ? "E_NO_SUCH_CONTACT" :
+			error == MeshEngine::Error::Full ? "E_QUEUE_FULL" : error == MeshEngine::Error::Locked ? "E_LOCKED" :
+			error == MeshEngine::Error::Storage ? "E_INTERNAL" :
+			error == MeshEngine::Error::CounterExhausted ? "E_BUSY" : "E_INVALID_ARG";
+		fail(response, code, error == MeshEngine::Error::CounterExhausted ? "counter exhausted; re-pair" : "message enqueue failed");
+		return;
+	}
+	result["msg_ref"] = accepted.reference; result["ctr"] = accepted.counter;
+	result["ack_requested"] = args["ack"] | live_["mesh"]["ack_default"][type].as<bool>();
+	result["hops"] = args["hops"] | live_["mesh"]["hop_default"].as<uint8_t>();
+	result["state"] = "queued"; result["bytes_on_air"] = bytes;
+	result["est_airtime_ms"] = RadioDriver::airtimeMs(radio.config(), bytes);
+}
+
+bool Commands::emitMeshEvent(const MeshEngine::Event& value) {
+	StaticJsonDocument<768> event;
+	event["t"] = value.timeMs;
+	JsonObject data = event.createNestedObject("data");
+	if (value.type == MeshEngine::EventType::ContactActive) {
+		event["evt"] = "contact.state"; data["contact_id"] = value.message.contact; data["state"] = "active";
+	} else if (value.type == MeshEngine::EventType::Received) {
+		event["evt"] = "msg.received";
+		writePayload(data, value.payload, true);
+		data["from"] = value.message.contact; data["ctr"] = value.message.counter; data["retry"] = value.message.retry;
+		data["hops"] = value.hops; data["rssi"] = value.rssi; data["snr"] = value.snr;
+	} else {
+		event["evt"] = "msg.status";
+		data["msg_ref"] = value.message.reference; data["to"] = value.message.contact;
+		data["state"] = MeshEngine::stateName(value.message.state); data["retry"] = value.message.retry;
+		if (value.reason != MeshEngine::Reason::None) data["reason"] = MeshEngine::reasonName(value.reason);
+		if (value.message.state == MeshEngine::State::Delivered) { data["hops"] = value.hops; data["rtt_ms"] = value.rttMs; }
+	}
+	return link_.sendJson(event);
 }
 
 void Commands::secureConfig(const char* command, JsonObjectConst args, JsonObject response,
@@ -371,6 +528,7 @@ void Commands::secureConfig(const char* command, JsonObjectConst args, JsonObjec
 		result["tx_packets"] = radio.stats().transmitted;
 		result["rx_packets"] = radio.stats().received;
 		result["rx_crc_errors"] = radio.stats().crcErrors;
+		result["radio_dropped_events"] = radio.stats().droppedEvents;
 		result["tx_airtime_ms_total"] = radio.stats().txAirtimeMs;
 		result["last_rssi"] = radio.stats().lastRssi;
 		result["last_snr"] = radio.stats().lastSnr;

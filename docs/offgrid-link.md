@@ -719,6 +719,13 @@ Errors: `E_NO_SUCH_CONTACT`, `E_TOO_LONG`, `E_QUEUE_FULL`, `E_INVALID_ARG`, `E_L
 
 The pending queue lives in RAM only, so after a reboot unfinished messages are gone. The app treats everything still pending at `sys.boot` as failed.
 
+The real firmware queues domain events independently of host output (32 events)
+and never delays RF/replay progress waiting for serial space. Prolonged host
+backpressure can lose events; `sys.status.queue.dropped_events` and
+`radio.stats.dropped_events` count this, with an explicit error after space
+returns. `dropped_acks` and `radio_dropped_events` expose ACK/radio event loss.
+This is not a persistent inbox or store-and-forward implementation.
+
 #### `msg.cancel`
 Arg `msg_ref` ✱. Stops sending and retrying. A packet that has already been transmitted cannot be unsent. Result: `{"state": "cancelled"}`, then a `msg.status` event.
 
