@@ -506,4 +506,17 @@ host responsiveness, recovery, and the release gates separately with evidence.
   No RF transmission performed: physical pairing/delivery acceptance is next
   when a second board is attached.
 
-Next: two-board direct-message acceptance, relay wiring and removal of the mock.
+- Two-board milestone: owner attached `/dev/ttyUSB1` (device 9C139EA211C8),
+  authorized secure installation/provisioning and short lawful RF tests with both
+  antennas. Existing first-board identity/settings preserved. Both directions
+  physically delivered authenticated TEXT/REACTION/GEO and original-bound ACKs;
+  checked fingerprint agreement, reaction direction, geo quantization/altitude/
+  age, active-contact persistence across MCU reboot and empty acknowledged queues.
+  Test relationships removed; original settings restored; both vaults left locked.
+  Tests used 869.525 MHz/BW125/SF9/CR4/5, 0 dBm, CAD and pauses, not arbitrary RF.
+- Owner UI requirement: large closed lock while locked; on real unlock animate
+  opening then shrink/move to the corner in 1400 ms. Lock interrupts stale frames
+  and transition immediately. Two-board host scene/latency assertions pass.
+  Physical lost-receipt/replay fault injection and multi-hop acceptance remain.
+
+Next: relay wiring, removal of the mock and remaining fault/load acceptance.

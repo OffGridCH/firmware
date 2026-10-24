@@ -11,6 +11,7 @@ public:
     void show(const UiSnapshot& snapshot);
     void onEvent(UiEvent event, uint64_t nowMs);
     void tick(uint64_t nowMs);
+    const char* scene() const { return scene_; }
 
 private:
     static constexpr uint8_t Rows = 8;
@@ -26,6 +27,10 @@ private:
     uint64_t renderedAt_ = 0;
     uint64_t bootAt_ = 0;
     bool booting_ = true;
+    uint64_t unlockAt_ = 0;
+    bool unlocking_ = false;
+    bool redraw_ = false;
+    const char* scene_ = "starting";
     uint64_t fingerprintUntil_ = 0;
     uint64_t errorUntil_ = 0;
     uint64_t activityUntil_ = 0;

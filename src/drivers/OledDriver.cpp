@@ -2,11 +2,11 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <string.h>
+#include <math.h>
 
 static const unsigned char image_phone_on_bits[] U8X8_PROGMEM = {0x3e,0x41,0x5d,0x5d,0x5d,0x5d,0x5d,0x41,0x49,0x3e};
 static const unsigned char image_phone_off_bits[] U8X8_PROGMEM = {0x3e,0x41,0x41,0x55,0x49,0x55,0x41,0x41,0x49,0x3e};
 static const unsigned char image_lock_closed_bits[] U8X8_PROGMEM = {0x1c,0x22,0x22,0x7f,0x77,0x77,0x7f,0x3e};
-static const unsigned char image_lock_open_bits[] U8X8_PROGMEM = {0xe0,0x00,0x10,0x01,0x10,0x01,0x1f,0x00,0x1b,0x00,0x1b,0x00,0x1f,0x00,0x0e,0x00};
 static const unsigned char image_lock_unprov_bits[] U8X8_PROGMEM = {0x1c,0x22,0x22,0x7f,0x41,0x41,0x41,0x7f};
 static const unsigned char image_radio_bits[] U8X8_PROGMEM = {0x82,0x00,0x29,0x01,0x45,0x01,0x55,0x01,0x29,0x01,0x92,0x00,0x10,0x00,0x38,0x00};
 static const unsigned char image_contacts_bits[] U8X8_PROGMEM = {0x1c,0x3e,0x3e,0x1c,0x00,0x3e,0x7f,0x7f};
@@ -196,13 +196,47 @@ static bool drawFrame(U8G2 &d, uint32_t t, uint32_t freqKhz) {
 
 }
 
-static void renderHome(U8G2 &d, const UiSnapshot &s, UiEvent activity) {
+static void drawLock(U8G2& d, float centerX, float bodyY, float scale, float opening) {
+    const float angle = opening * 0.75f;
+    const float cosine = cosf(angle), sine = sinf(angle);
+    auto point = [&](float x, float y, int16_t& px, int16_t& py) {
+        const float dx = x - 11, dy = y - 4;
+        px = lroundf(centerX + (11 + dx * cosine - dy * sine) * scale);
+        py = lroundf(bodyY + (4 + dx * sine + dy * cosine) * scale);
+    };
+    int16_t previousX, previousY;
+    point(-11, 4, previousX, previousY);
+    for (uint8_t index = 0; index <= 18; ++index) {
+        const float phase = float(index) * PI / 18;
+        int16_t x, y;
+        point(-11 * cosf(phase), -9 - 11 * sinf(phase), x, y);
+        d.drawLine(previousX, previousY, x, y);
+        if (scale > 0.5f) d.drawLine(previousX + 1, previousY, x + 1, y);
+        previousX = x; previousY = y;
+    }
+    int16_t endX, endY;
+    point(11, 4, endX, endY);
+    d.drawLine(previousX, previousY, endX, endY);
+    if (scale > 0.5f) d.drawLine(previousX + 1, previousY, endX + 1, endY);
+    const int16_t width = lroundf(34 * scale), height = lroundf(25 * scale);
+    d.drawRBox(lroundf(centerX - 17 * scale), lroundf(bodyY), width, height,
+        scale > 0.5f ? 3 : 1);
+    if (scale > 0.5f) {
+        d.setDrawColor(0);
+        d.drawDisc(lroundf(centerX), lroundf(bodyY + 9 * scale), lroundf(3 * scale));
+        d.drawBox(lroundf(centerX - scale), lroundf(bodyY + 9 * scale),
+            lroundf(3 * scale), lroundf(8 * scale));
+        d.setDrawColor(1);
+    }
+}
+
+static void renderHome(U8G2 &d, const UiSnapshot &s, UiEvent activity, bool lockIcon = true) {
     char buf[32];
     const bool unlocked = s.state == DeviceState::Unlocked;
 
-    switch (s.state) {
+    if (lockIcon) switch (s.state) {
         case DeviceState::Locked:   d.drawXBMP(0, 0, 7, 8, image_lock_closed_bits); break;
-        case DeviceState::Unlocked: d.drawXBMP(0, 0, 9, 8, image_lock_open_bits); break;
+        case DeviceState::Unlocked: drawLock(d, 4, 5, 0.2f, 1); break;
         default:                    d.drawXBMP(0, 0, 7, 8, image_lock_unprov_bits); break;
     }
     d.setFont(u8g2_font_helvB08_tf);
@@ -341,12 +375,22 @@ bool OledDriver::init() {
 }
 
 void OledDriver::show(const UiSnapshot& snapshot) {
+    if (snapshot.state != snapshot_.state) {
+        redraw_ = true;
+        unlocking_ = snapshot_.state == DeviceState::Locked && snapshot.state == DeviceState::Unlocked;
+        unlockAt_ = snapshot.uptimeMs;
+        if (unlocking_ || snapshot.state == DeviceState::Locked) {
+            booting_ = false;
+            errorUntil_ = 0;
+        }
+    }
     if (snapshot.fingerprint[0] && strcmp(snapshot.fingerprint, snapshot_.fingerprint) != 0) {
         fingerprintUntil_ = snapshot.uptimeMs + 15000;
     }
     if (snapshot.state != DeviceState::Unlocked) {
         activity_ = UiEvent::Boot;
         fingerprintUntil_ = 0;
+        unlocking_ = false;
     }
     snapshot_ = snapshot;
 }
@@ -378,7 +422,9 @@ void OledDriver::onEvent(UiEvent event, uint64_t nowMs) {
 void OledDriver::tick(uint64_t nowMs) {
     constexpr uint64_t FrameMs = 40;
     uint8_t *buffer = display_.getBufferPtr();
-    if (dirtyRows_ == 0 && nowMs - renderedAt_ >= FrameMs) {
+    if (redraw_ || (dirtyRows_ == 0 && nowMs - renderedAt_ >= FrameMs)) {
+        redraw_ = false;
+        dirtyRows_ = 0;
         renderedAt_ = nowMs;
         render(nowMs);
         for (uint8_t row = 0; row < Rows; ++row) {
@@ -396,20 +442,37 @@ void OledDriver::tick(uint64_t nowMs) {
 
 void OledDriver::render(uint64_t nowMs) {
     display_.clearBuffer();
-    if (nowMs < errorUntil_) {
+    if (snapshot_.state == DeviceState::Locked) {
+        scene_ = "locked";
+        drawLock(display_, 64, 28, 1, 0);
+        display_.setFont(u8g2_font_helvB08_tf);
+        display_.drawStr(64 - display_.getStrWidth("Locked") / 2, 63, "Locked");
+    } else if (unlocking_ && nowMs - unlockAt_ < 1400) {
+        scene_ = "unlocking";
+        const uint32_t elapsed = nowMs - unlockAt_;
+        const float opening = boot::easeInOutCubic(boot::prog(elapsed, 0, 550));
+        const float shrink = boot::easeInOutCubic(boot::prog(elapsed, 650, 1400));
+        if (shrink > 0) renderHome(display_, snapshot_, UiEvent::Boot, false);
+        drawLock(display_, 64 - 60 * shrink, 28 - 23 * shrink, 1 - 0.8f * shrink, opening);
+    } else if (nowMs < errorUntil_) {
+        scene_ = "error";
         display_.setFont(u8g2_font_helvB08_tf);
         display_.drawStr(0, 20, "Operation failed");
         display_.setFont(u8g2_font_haxrcorp4089_tr);
         display_.drawStr(0, 38, "See app for details");
     } else if (booting_) {
+        scene_ = "boot";
         booting_ = boot::drawFrame(display_, nowMs - bootAt_,
             static_cast<uint32_t>(snapshot_.frequencyMhz * 1000 + 0.5f));
     } else if (snapshot_.pairingActive || (nowMs < fingerprintUntil_ && snapshot_.fingerprint[0]) ||
                snapshot_.page == UiPage::Pairing) {
+        scene_ = "pairing";
         renderPairing(display_, snapshot_);
     } else if (snapshot_.page == UiPage::Radio) {
+        scene_ = "radio";
         renderRadio(display_, snapshot_);
     } else {
+        scene_ = "home";
         renderHome(display_, snapshot_, nowMs < activityUntil_ ? activity_ : UiEvent::Boot);
     }
 }

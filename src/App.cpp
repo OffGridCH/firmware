@@ -200,6 +200,7 @@ void App::handleCommand(void* context, const char* command,
 		ui["page"] = static_cast<uint8_t>(UiPage::Home);
 		ui["led_duty"] = app.ledDriver_.duty();
 		ui["strip_pixels"] = BoardConfig::StripPixels;
+		ui["oled_scene"] = app.oledDriver_.scene();
 	}
 }
 

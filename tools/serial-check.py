@@ -520,6 +520,98 @@ def exercise_contacts(device, credential_path):
     print("PASS: real pairing/contact persistence and no-RF message validation; two-board key agreement and delivery pending.")
 
 
+def exercise_mesh(first, second):
+    devices = (first, second)
+    tokens, identities, originals, slots = [], [], [], [None, None]
+    try:
+        for device in devices:
+            hello = device.connect()
+            if hello.get("mock") is not False or hello["state"] != "locked":
+                raise RuntimeError("two-board acceptance requires locked secure firmware and retained credentials")
+            path = Path.home() / ".config/offgrid" / f"device-{hello['device_id']}.json"
+            credentials = read_credentials(path)
+            require_equal(credentials["device_id"], hello["device_id"], "credential board ID")
+            if "pending_token" in credentials:
+                raise RuntimeError("resolve interrupted credential rotation first")
+            token = base64.b64decode(credentials["token"], validate=True)
+            if len(token) != 32:
+                raise RuntimeError("invalid retained token length")
+            require_equal(device.call("sys.status")["ui"]["oled_scene"], "locked", "large locked scene")
+            identities.append(secure_unlock(device, token))
+            tokens.append(token)
+            originals.append(read_configuration(device))
+            started = time.monotonic()
+            scenes, maximum = set(), 0
+            while time.monotonic() - started < 1.7:
+                before = time.monotonic()
+                scenes.add(device.call("sys.status")["ui"]["oled_scene"])
+                maximum = max(maximum, time.monotonic() - before)
+                time.sleep(0.04)
+            if not {"unlocking", "home"}.issubset(scenes) or maximum >= 0.250:
+                raise RuntimeError(f"unlock scene/latency failure: {scenes}, {maximum:.3f}s")
+            device.call("sec.set_policy", {"lock_timeout_s": 120, "persist": False})
+            device.call("radio.set", {"preset": "lab_default", "tx_power_dbm": 0, "persist": False})
+            device.call("mesh.set", {"relay_enabled": False, "relay_when_locked": False,
+                                    "cad_enabled": True, "retry_base_ms": 3000, "persist": False})
+        if identities[0]["public_key"] == identities[1]["public_key"]:
+            raise RuntimeError("boards must have distinct identities")
+        qrs = [device.call("pair.begin")["qr"] for device in devices]
+        for index, device in enumerate(devices):
+            paired = device.call("pair.complete", {"qr": qrs[1 - index]})["contact"]
+            slots[index] = paired["contact_id"]
+            require_equal(paired["public_key"], identities[1 - index]["public_key"], "physical peer identity")
+        require_equal(first.call("contact.get", {"contact_id": slots[0]})["contact"]["fingerprint"],
+                      second.call("contact.get", {"contact_id": slots[1]})["contact"]["fingerprint"],
+                      "two-board fingerprint agreement")
+        payloads = [
+            {"type": "text", "text": "OffGrid physical acceptance"},
+            {"type": "reaction", "target": {"author": "peer", "ref": 1}, "emoji": "\U0001f44d"},
+            {"type": "geo", "lat": 47.0517, "lon": 8.3075, "alt_m": -15, "age_s": 17},
+        ]
+        for index, sender in enumerate(devices):
+            recipient = devices[1 - index]
+            for payload in payloads:
+                sent = sender.call("msg.send", dict(payload, to=slots[index], ack=True, hops=0))
+                received = recipient.event("msg.received", lambda data: data["from"] == slots[1 - index]
+                                           and data["ctr"] == sent["ctr"], timeout=15)["data"]
+                require_equal(received["type"], payload["type"], "authenticated payload type")
+                if payload["type"] == "text":
+                    require_equal(received["text"], payload["text"], "physical text")
+                elif payload["type"] == "reaction":
+                    require_equal(received["target"], {"author": "me", "ref": 1}, "reaction direction")
+                    require_equal(received["emoji"], payload["emoji"], "physical emoji")
+                else:
+                    if abs(received["lat"] - payload["lat"]) > 0.000011 or abs(received["lon"] - payload["lon"]) > 0.000022:
+                        raise RuntimeError("physical GEO quantization exceeded bounds")
+                    require_equal(received["alt_m"], -15, "signed altitude")
+                    require_equal(received["age_s"], 20, "quantized age")
+                sender.event("msg.status", lambda data: data["msg_ref"] == sent["msg_ref"]
+                             and data["state"] == "delivered", timeout=15)
+                require_equal(sender.call("msg.pending")["pending"], [], "ACK removes pending work")
+                time.sleep(3)
+        for index, device in enumerate(devices):
+            require_equal(device.call("contact.get", {"contact_id": slots[index]})["contact"]["state"],
+                          "active", "authenticated contact activation")
+            device.call("sys.reboot")
+            device.event("sys.boot", lambda data: data["state"] == "locked", timeout=15)
+            secure_unlock(device, tokens[index])
+            require_equal(device.call("contact.get", {"contact_id": slots[index]})["contact"]["state"],
+                          "active", "active contact survives MCU reboot")
+        print("PASS: two physical boards exchanged authenticated TEXT/REACTION/GEO and bound ACKs both ways; contacts persist; OLED lock/open/Home scenes and RTT verified.")
+    finally:
+        for index, device in enumerate(devices[:len(tokens)]):
+            if device.call("sys.status")["state"] != "unlocked":
+                secure_unlock(device, tokens[index])
+            if slots[index] is not None:
+                device.call("contact.delete", {"contact_id": slots[index], "confirm": True})
+            device.call("pair.cancel")
+            if index < len(originals):
+                for category in ("radio", "mesh"):
+                    device.call(f"{category}.set", dict(originals[index][category], persist=False))
+                device.call("sec.set_policy", dict(originals[index]["policy"], persist=False))
+            device.call("sec.lock")
+
+
 def unlock_mock(device, hello=None):
     if hello is None:
         hello = device.call("sys.hello")
@@ -657,6 +749,7 @@ def main():
     parser.add_argument("--allow-config-changes", action="store_true",
                         help="permit real flash writes and mock provisioning for storage checks")
     parser.add_argument("--radio-peer", help="second real radio_diag board port for a two-way RF check")
+    parser.add_argument("--mesh-peer", help="second secure board port for real encrypted two-way acceptance")
     parser.add_argument("--allow-radio-transmit", action="store_true",
                         help="confirm antennas and lawful frequency/power/airtime before raw RF transmission")
     parser.add_argument("--radio-count", type=int, default=1,
@@ -671,7 +764,7 @@ def main():
         parser.error(f"--args is not valid JSON: {error}")
     if not isinstance(command_args, dict):
         parser.error("--args must be a JSON object")
-    if sum(bool(mode) for mode in (args.command, args.radio_peer, args.storage_phase, args.ui_check,
+    if sum(bool(mode) for mode in (args.command, args.radio_peer, args.mesh_peer, args.storage_phase, args.ui_check,
                                   args.led_check, args.secure_check, args.contact_check, args.master_reset)) > 1:
         parser.error("choose only one command/checker mode")
     read_only = {"sys.hello", "sys.status", "sys.ping", "radio.get", "mesh.get", "led.get",
@@ -684,6 +777,8 @@ def main():
         parser.error("radio mode is separate from storage mode and requires --allow-radio-transmit")
     if args.radio_peer == args.port or not 1 <= args.radio_count <= 10:
         parser.error("radio ports must differ and radio-count must be 1..10")
+    if args.mesh_peer and (args.mesh_peer == args.port or not args.allow_radio_transmit or not args.allow_secure_changes):
+        parser.error("--mesh-peer needs a different port, --allow-radio-transmit and --allow-secure-changes")
     if args.storage_phase and not args.allow_config_changes:
         parser.error("--allow-config-changes is required; storage checks modify real NVS settings")
     if args.led_check and not args.allow_mock_changes:
@@ -694,7 +789,7 @@ def main():
         parser.error("--master-reset requires --confirm-erase")
     if args.confirm_erase and not (args.master_reset or args.secure_check):
         parser.error("--confirm-erase applies only to --master-reset or --secure-check")
-    if not any((args.command, args.storage_phase, args.radio_peer, args.ui_check, args.secure_check, args.contact_check,
+    if not any((args.command, args.storage_phase, args.radio_peer, args.mesh_peer, args.ui_check, args.secure_check, args.contact_check,
                 args.master_reset)) and not args.allow_mock_changes:
         parser.error("--allow-mock-changes is required; this modifies a flashed mock")
     import serial
@@ -719,15 +814,18 @@ def main():
         elif args.master_reset:
             device = Device(connection)
             master_reset(device, device.connect(), args.master_key)
-        elif args.radio_peer:
+        elif args.radio_peer or args.mesh_peer:
             peer = serial.Serial(port=None, baudrate=args.baud, timeout=0.2, write_timeout=3)
             peer.dtr = False
             peer.rts = False
-            peer.port = args.radio_peer
+            peer.port = args.radio_peer or args.mesh_peer
             peer.open()
             with peer:
                 peer.reset_input_buffer()
-                exercise_radio(Device(connection), Device(peer), args.radio_count)
+                if args.mesh_peer:
+                    exercise_mesh(Device(connection), Device(peer))
+                else:
+                    exercise_radio(Device(connection), Device(peer), args.radio_count)
         elif args.storage_phase:
             exercise_storage(Device(connection), args.storage_phase, args.state)
         else:

@@ -1,5 +1,20 @@
 # Radio Driver
 
+## OLED lock screen
+
+Locked devices show a large centered closed padlock and "Locked", never the
+empty Home placeholders or private identity/contact information. A real
+locked-to-unlocked transition opens the shackle over 550 ms, holds briefly, then
+shrinks/moves the open lock into the Home corner, completing at 1400 ms.
+Relocking cancels the animation and invalidates pending old frame rows. Rendering
+and I2C continue cooperatively; authentication/radio work never waits for it.
+Locked state takes precedence over boot/error overlays. `sys.status.ui.oled_scene`
+reports the most recently rendered scene for acceptance instrumentation.
+
+Two-board secure acceptance checks locked/opening/Home transitions and status
+RTT below 250 ms, alongside actual encrypted traffic. Scene checks are not an
+optical measurement; final visual appearance needs owner observation.
+
 ## LED outputs
 
 Owner-confirmed wiring: onboard GPIO35 PWM, four GRB 800 kHz NeoPixels on GPIO45

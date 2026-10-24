@@ -24,7 +24,14 @@ The isolated vault diagnostic also tests the direct-message domain without RF:
 eight-slot bounds, wrong ACK rejection, collision candidate verification,
 authenticated replay, fresh re-ACK counters, all three retries/no fourth retry,
 timeouts, cancellation, contact deletion, lock cleanup and bounded event loss.
-These checks are not proof of physical delivery; a second board is needed next.
+Two-board secure acceptance now also passed physical TEXT/REACTION/GEO and bound
+ACK exchange in both directions, fingerprint agreement and reboot persistence.
+Use `--mesh-peer SECOND_PORT --allow-secure-changes --allow-radio-transmit` with
+retained credentials on both boards; it restores settings and deletes its test
+relationships. Antennas and lawful local RF settings remain mandatory.
+
+While locked the OLED shows a large padlock. Unlock opens it, then shrinks/moves
+it to the Home corner over 1.4 seconds without blocking serial/radio progress.
 
 The checker retains a synthetic device token privately under `~/.config/offgrid/`
 (mode 0600). Back it up; never commit or share it. This host test credential is
