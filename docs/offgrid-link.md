@@ -1,7 +1,7 @@
 # OffGrid Serial API
 
 - **Firmware:** 0.3.0
-- **Host protocol:** 1.0
+- **Host protocol:** 1.1 (adds groups; 1.0 apps keep working)
 - **Hardware:** Heltec WiFi LoRa 32 V3 / ESP32-S3
 - **Transport:** USB serial, UTF-8 JSON Lines
 
@@ -204,12 +204,13 @@ Result fields:
 | `device`, `chip` | `heltec_wifi_lora_32_v3`, `ESP32-S3` |
 | `device_id` | Stable 12-digit uppercase hex |
 | `fw` | `{version:"0.3.0", build:"<compiler build date>"}` |
-| `proto`, `state` | `"1.0"`, current state |
+| `proto`, `state` | `"1.1"`, current state |
 | `mock` | Always `false`; reject old images reporting `true` |
 | `radio_diagnostics` | `false` normally; `true` only in explicit lab profiles |
 | `authentication`, `config_storage` | `x25519-aes256gcm`, `nvs` |
 | `session` | `{device_eph_pub:<Base64 32 bytes>, nonce:<Base64 16 bytes>}` |
-| `limits` | `{max_line:2048,max_contacts:32,max_text_bytes:83,pending_queue:8}` |
+| `limits` | `{max_line:2048,max_contacts:32,max_text_bytes:83,pending_queue:8,max_groups:8,max_group_members:16,max_group_text_bytes:83}` |
+| `features` | `["groups"]`; firmware without this entry has no `group.*` commands |
 | `recovery` | `{master:"ECDSA-P256-SHA256",app_wrap_label:"og-reset-wrap-v1"}` |
 
 ### `sys.ping`
@@ -233,6 +234,7 @@ No args. Always returns:
 Unlocked results additionally include:
 
 - `contacts: {used,capacity:32}`.
+- `groups: {used,capacity:8}`.
 - `queue: {pending,capacity:8,dropped_events,dropped_acks}`.
 
 `config_status` is `defaults`, `loaded`, `invalid`, `unsupported_version` or
@@ -395,6 +397,9 @@ Persists only the local name; it does not change keys or notify the peer.
 Required `contact_id`, `confirm:true`. Result `{deleted:true}`.
 Durably removes that relationship and cancels its own queued messages with
 `reason:"contact_deleted"`. It does not delete the peer's copy or chat history.
+Groups keep the member. On the owner its `contact_id` reads `null` and
+`group.sync` to it fails until the peer is paired again in the same slot; to
+replace it, `group.remove` the old index and `group.add` the new contact.
 
 ## 6. Messages
 
@@ -458,6 +463,8 @@ No args. Result:
 {"pending":[{"msg_ref":1,"to":1,"type":"text","ctr":1,"state":"sent","retry":0}]}
 ```
 
+Group messages carry `group_id` instead of `to`; a `group_sync` carries both.
+
 Lists own RAM work only, not ACK/relay queues or message history. Terminal work
 is removed. Pending contents are lost on reboot/lock; they are not a persistent inbox.
 
@@ -484,6 +491,60 @@ Only `delivered` proves an authenticated peer receipt. `rtt_ms` in that event is
 time from local enqueue to ACK acceptance, including waits/retries, not pure RF RTT.
 Duplicate authenticated data is not delivered twice; a retry can get a fresh ACK.
 Stale data outside the 64-counter replay window is dropped.
+
+### Groups
+
+All `group.*` commands require unlocked state (`E_NOT_PROVISIONED` or
+`E_LOCKED` otherwise). The device that creates a group is its owner; only the
+owner changes members. Every member must be paired with the owner, not with
+the other members. On-air format and limits:
+[radio protocol section 8.5](offgrid-protocol.md#85-groups).
+
+Group object:
+
+| Field | Value |
+|---|---|
+| `group_id` | Local slot 1..8 |
+| `gid` | 8 uppercase hex digits, the same on every member |
+| `name` | 1..24 UTF-8 bytes, set by the owner |
+| `epoch` | 1..255; every member change increments it |
+| `owner` | `true` on the owner device |
+| `owner_contact_id` | The owner's contact slot on a member, `null` on the owner |
+| `member`, `member_count` | Own index (owner 0) and member count including the owner |
+| `members` | `[{member, node_id, contact_id or null}]`, not in `group.list` |
+
+A member sees the other members by NodeID; `contact_id` is filled in when a
+contact with that NodeID exists on this device.
+
+| Command | Args | Result |
+|---|---|---|
+| `group.create` | `name`, `members` (1..15 distinct contact IDs) | `{group}`; local only, sync each member next |
+| `group.list` | none | `{groups:[group without members], total}` |
+| `group.get` | `group_id` | `{group}` |
+| `group.sync` | `group_id`, `contact_id`, optional `hops` | Like `msg.send`; owner only |
+| `group.add` | `group_id`, `members` (contact IDs) | `{group}` with a new epoch; owner only |
+| `group.remove` | `group_id`, `members` (member indexes, not 0) | `{group}` with a new epoch, at least 2 members stay; owner only |
+| `group.send` | `group_id`, `type` (`text` or `geo`) with the `msg.send` fields, optional `hops` | Like `msg.send`, `ack_requested:false` |
+| `group.delete` | `group_id`, `confirm:true` | `{deleted:true}`; this device only |
+
+`group.sync` sends the current key and member list to one member as an
+acknowledged DM; follow it with `msg.status` (`type` `group_sync`). After
+`group.create`, `group.add` and `group.remove`, sync every member that is still
+in the group. A change or delete cancels queued syncs of the old epoch. Removed
+members are not told; they keep the old key but cannot read the new epoch.
+
+Group messages have no receipts and no retries: `ack:true` returns
+`E_INVALID_ARG`, and `sent` is the final state. Reactions are not supported in
+groups.
+
+```json
+{"id":30,"cmd":"group.create","args":{"name":"Team","members":[1,2]}}
+{"id":30,"ok":true,"result":{"group":{"group_id":1,"gid":"1A2B3C4D","name":"Team","epoch":1,"owner":true,"owner_contact_id":null,"member":0,"member_count":3,"members":[{"member":0,"node_id":"E3F0","contact_id":null},{"member":1,"node_id":"E841","contact_id":1},{"member":2,"node_id":"5C07","contact_id":2}]}}}
+{"id":31,"cmd":"group.sync","args":{"group_id":1,"contact_id":1}}
+{"id":31,"ok":true,"result":{"msg_ref":7,"ctr":3,"ack_requested":true,"hops":3,"state":"queued","bytes_on_air":50,"est_airtime_ms":329}}
+{"id":32,"cmd":"group.send","args":{"group_id":1,"type":"text","text":"Hallo Gruppe!"}}
+{"id":32,"ok":true,"result":{"msg_ref":8,"ctr":1,"ack_requested":false,"hops":3,"state":"queued","bytes_on_air":30,"est_airtime_ms":227}}
+```
 
 ## 7. Radio configuration and statistics
 
@@ -664,8 +725,10 @@ clock time. Do not reply to events.
 | `sys.boot` | `device_id`, `fw` (version string), `proto`, `state`, `mock:false`, `radio_diagnostics`, `reset_reason` (`software` or `power_on`) |
 | `sec.state` | `state`, `reason`: `provision`, `unlock`, `lock`, `heartbeat_timeout`, `factory_reset`, or `error` |
 | `contact.state` | `contact_id`, `state:"active"` |
-| `msg.status` | `msg_ref`, `to`, `state`, `retry`; optional `reason`; delivered also has `hops`,`rtt_ms` |
+| `msg.status` | `msg_ref`, `to` and/or `group_id`, `state`, `retry`; optional `reason`; delivered also has `hops`,`rtt_ms` |
 | `msg.received` | `from`, `ctr`, `retry`, `hops`, `rssi`, `snr`, plus typed payload |
+| `group.state` | `group_id`, `state` (`joined` or `updated`), `epoch`; a sync from the owner was applied |
+| `group.received` | `group_id`, `member`, `node_id`, `from` (contact ID or `null`), `ctr`, `retry`, `hops`, `rssi`, `snr`, plus typed payload (`text` or `geo`) |
 | `log` | `level`, `msg` (no keys/tokens) |
 | `error` | `code`, `message`; unsolicited transport/storage/RF/loss notice |
 
@@ -675,7 +738,13 @@ Received payload examples:
 {"evt":"msg.received","t":7000,"data":{"from":1,"type":"text","ctr":1,"text":"Hello!","hops":0,"retry":0,"rssi":-72,"snr":9.0}}
 {"evt":"msg.received","t":9000,"data":{"from":1,"type":"reaction","ctr":2,"target":{"author":"me","ref":1},"emoji":"👍","hops":0,"retry":0,"rssi":-72,"snr":9.0}}
 {"evt":"msg.received","t":11000,"data":{"from":1,"type":"geo","ctr":3,"lat":47.0517,"lon":8.30751,"alt_m":null,"age_s":null,"hops":0,"retry":0,"rssi":-72,"snr":9.0}}
+{"evt":"group.state","t":12000,"data":{"group_id":1,"state":"joined","epoch":1}}
+{"evt":"group.received","t":13000,"data":{"type":"text","text":"Hallo Gruppe!","group_id":1,"member":0,"node_id":"E3F0","from":1,"ctr":1,"retry":0,"hops":0,"rssi":-72,"snr":9.0}}
 ```
+
+Group texts arrive as `group.received`, never as `msg.received`, so an app
+that does not know groups cannot file them into a direct chat. On a `joined`
+event, read the members with `group.get`.
 
 There is no incoming-message ACK command: the device handles authenticated
 radio receipts automatically. Store received content/history in the app.
@@ -764,10 +833,11 @@ No irreversible eFuses/download-mode settings are modified by this API.
 | `E_SELF_PAIR` | Own identity scanned |
 | `E_CONTACT_EXISTS` | Existing public-key relationship; explicit replacement required |
 | `E_NO_SUCH_CONTACT` | Empty contact slot |
-| `E_STORAGE_FULL` | All 32 contact slots occupied |
+| `E_NO_SUCH_GROUP` | Empty group slot |
+| `E_STORAGE_FULL` | All 32 contact slots or all 8 group slots occupied |
 | `E_TOO_LONG` | Text exceeds 83 bytes or response cannot fit |
 | `E_QUEUE_FULL` | Eight own message slots already occupied |
-| `E_BUSY` | Counter exhausted; re-pair rather than wrapping |
+| `E_BUSY` | Counter exhausted; re-pair rather than wrapping. For groups also: epoch 255 reached, create a new group |
 | `E_RADIO` | Radio unavailable/configuration failed; inspect status |
 | `E_INTERNAL` | Crypto/storage/capacity failure; inspect status/error events, do not assume success |
 
@@ -781,6 +851,7 @@ can lock the device; handle the subsequent `sec.state`.
 | JSON nesting | 8 |
 | Names | 1..24 UTF-8 bytes |
 | Contacts | 32 |
+| Groups | 8, each with 2..16 members including the owner |
 | Contact page requested size | 1..10; actual result can be smaller |
 | Own message slots | 8 |
 | Text body | 0..83 UTF-8 bytes |

@@ -105,6 +105,12 @@ PacketCodec::Error PacketCodec::serialize(const Payload& payload, uint8_t* bytes
 		}
 		if (payload.hasAge) plain.bytes[length++] = (payload.ageSeconds + 5) / 10;
 		break;
+	case Type::GroupSync:
+		if (payload.syncLength < 1 || payload.syncLength > MaxSyncBytes) return Error::Format;
+		plain.bytes[0] = 0x30 | ack;
+		memcpy(plain.bytes + 1, payload.text, payload.syncLength);
+		length = 1 + payload.syncLength;
+		break;
 	default: return Error::Format;
 	}
 	memcpy(bytes, plain.bytes, length);
@@ -187,6 +193,12 @@ PacketCodec::Error PacketCodec::decode(const uint8_t* bytes, size_t length,
 		if (candidate.hasAge) candidate.ageSeconds = uint16_t(plain.bytes[offset]) * 10;
 		break;
 	}
+	case 3:
+		if ((flags & 7) || plainLength < 2 || plainLength > MaxSyncBytes + 1) return Error::Format;
+		candidate.type = Type::GroupSync;
+		candidate.syncLength = plainLength - 1;
+		memcpy(candidate.text, plain.bytes + 1, plainLength - 1);
+		break;
 	default: return Error::Format;
 	}
 	payload = candidate;

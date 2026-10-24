@@ -16,6 +16,8 @@ namespace {
 constexpr uint8_t Check[] = "offgrid-vault-v1";
 constexpr size_t Header = 19;
 constexpr size_t Tag = 16;
+// check, identity, index, c01-c32, gindex, gctr, g1-g8
+constexpr uint8_t RecordCount = 45;
 
 void put32(uint8_t* output, uint32_t value) {
 	for (size_t index = 0; index < 4; ++index) output[index] = value >> (24 - index * 8);
@@ -55,6 +57,8 @@ const char* VaultStore::statusName() const {
 void VaultStore::close() {
 	CryptoEngine::zeroize(key_, sizeof(key_));
 	contacts_ = 0;
+	groups_ = 0;
+	groupCounter_ = 0;
 	open_ = false;
 }
 
@@ -172,7 +176,36 @@ void VaultStore::contactName(uint8_t slot, char name[4]) {
 	snprintf(name, 4, "c%02u", slot);
 }
 
-bool VaultStore::validate(uint8_t bank, uint32_t generation, const uint8_t key[32], uint32_t& contacts) {
+const char* VaultStore::recordName(uint8_t index, char name[4]) {
+	if (index == 0) return "check";
+	if (index == 1) return "identity";
+	if (index == 2) return "index";
+	if (index < 35) { contactName(index - 2, name); return name; }
+	if (index == 35) return "gindex";
+	if (index == 36) return "gctr";
+	snprintf(name, 4, "g%u", index - 36);
+	return name;
+}
+
+bool VaultStore::stored(uint8_t index) const {
+	if (index < 3) return true;
+	if (index < 35) return contacts_ & (uint32_t(1) << (index - 3));
+	if (index == 35) return groups_ != 0;
+	if (index == 36) return groupCounter_ != 0;
+	return groups_ & (1 << (index - 37));
+}
+
+// Group records were added after vault format 1; a vault without them simply has no groups.
+bool VaultStore::optionalRecord(uint8_t bank, uint32_t generation, const uint8_t key[32], const char* name,
+	uint8_t* output, size_t length, bool& present) {
+	size_t actual = 0;
+	present = readRecord(bank, generation, key, name, output, MaxPlaintext, actual);
+	if (!present && error_ == ESP_ERR_NVS_NOT_FOUND) { error_ = ESP_OK; return true; }
+	return present && actual == length;
+}
+
+bool VaultStore::validate(uint8_t bank, uint32_t generation, const uint8_t key[32], uint32_t& contacts,
+	uint8_t& groups, uint32_t& groupCounter) {
 	uint8_t plaintext[MaxPlaintext] = {};
 	size_t length = 0;
 	bool ok = readRecord(bank, generation, key, "check", plaintext, sizeof(plaintext), length) &&
@@ -190,6 +223,18 @@ bool VaultStore::validate(uint8_t bank, uint32_t generation, const uint8_t key[3
 			ok = readRecord(bank, generation, key, name, plaintext, sizeof(plaintext), length);
 		}
 	}
+	groups = 0;
+	groupCounter = 0;
+	bool present = false;
+	if (ok) ok = optionalRecord(bank, generation, key, "gindex", plaintext, 1, present);
+	if (ok && present) groups = plaintext[0];
+	for (uint8_t slot = 1; ok && slot <= 8; ++slot) {
+		if (!(groups & (1 << (slot - 1)))) continue;
+		char name[4];
+		ok = readRecord(bank, generation, key, recordName(36 + slot, name), plaintext, sizeof(plaintext), length);
+	}
+	if (ok) ok = optionalRecord(bank, generation, key, "gctr", plaintext, 4, present);
+	if (ok && present) groupCounter = get32(plaintext);
 	CryptoEngine::zeroize(plaintext, sizeof(plaintext));
 	if (!ok && error_ == ESP_OK) error_ = ESP_ERR_INVALID_ARG;
 	return ok;
@@ -198,29 +243,31 @@ bool VaultStore::validate(uint8_t bank, uint32_t generation, const uint8_t key[3
 bool VaultStore::open(const uint8_t key[32]) {
 	close();
 	if (status_ != Status::Ready) { error_ = ESP_ERR_INVALID_STATE; return false; }
-	uint32_t contacts = 0;
-	if (!validate(bank_, generation_, key, contacts)) return false;
+	uint32_t contacts = 0, groupCounter = 0;
+	uint8_t groups = 0;
+	if (!validate(bank_, generation_, key, contacts, groups, groupCounter)) return false;
 	memcpy(key_, key, sizeof(key_));
 	contacts_ = contacts;
+	groups_ = groups;
+	groupCounter_ = groupCounter;
 	open_ = true;
 	return true;
 }
 
 bool VaultStore::verifyKey(const uint8_t key[32]) {
 	if (status_ != Status::Ready) { error_ = ESP_ERR_INVALID_STATE; return false; }
-	uint32_t contacts = 0;
-	return validate(bank_, generation_, key, contacts);
+	uint32_t contacts = 0, groupCounter = 0;
+	uint8_t groups = 0;
+	return validate(bank_, generation_, key, contacts, groups, groupCounter);
 }
 
 bool VaultStore::prepare(uint8_t bank) {
 	nvs_handle_t handle;
 	error_ = nvs_open(records_, NVS_READWRITE, &handle);
 	if (error_ != ESP_OK) return false;
-	for (uint8_t index = 0; index < 35; ++index) {
+	for (uint8_t index = 0; index < RecordCount; ++index) {
 		char name[4], physical[16];
-		const char* logical = index == 0 ? "check" : index == 1 ? "identity" : index == 2 ? "index" : name;
-		if (index >= 3) contactName(index - 2, name);
-		physicalKey(bank, logical, physical);
+		physicalKey(bank, recordName(index, name), physical);
 		error_ = nvs_erase_key(handle, physical);
 		if (error_ == ESP_ERR_NVS_NOT_FOUND) error_ = ESP_OK;
 		if (error_ != ESP_OK) break;
@@ -231,9 +278,11 @@ bool VaultStore::prepare(uint8_t bank) {
 }
 
 bool VaultStore::activate(uint8_t bank, uint32_t generation, const uint8_t salt[16],
-	const uint8_t key[32], uint32_t contacts) {
-	uint32_t verified = 0;
-	if (!validate(bank, generation, key, verified) || verified != contacts) return false;
+	const uint8_t key[32], uint32_t contacts, uint8_t groups, uint32_t groupCounter) {
+	uint32_t verified = 0, verifiedCounter = 0;
+	uint8_t verifiedGroups = 0;
+	if (!validate(bank, generation, key, verified, verifiedGroups, verifiedCounter) || verified != contacts ||
+		verifiedGroups != groups || verifiedCounter != groupCounter) return false;
 	uint8_t metadata[26];
 	memcpy(metadata, "OGVM", 4);
 	metadata[4] = 1;
@@ -251,6 +300,8 @@ bool VaultStore::activate(uint8_t bank, uint32_t generation, const uint8_t salt[
 	memcpy(salt_, salt, sizeof(salt_));
 	memcpy(key_, key, sizeof(key_));
 	contacts_ = contacts;
+	groups_ = groups;
+	groupCounter_ = groupCounter;
 	open_ = true;
 	status_ = Status::Ready;
 	return true;
@@ -264,7 +315,7 @@ bool VaultStore::create(const uint8_t key[32], const uint8_t salt[16],
 	if (!prepare(0) || !writeRecord(0, 1, key, "check", Check, sizeof(Check)) ||
 		!writeRecord(0, 1, key, "identity", identity, length) ||
 		!writeRecord(0, 1, key, "index", index, sizeof(index))) return false;
-	return activate(0, 1, salt, key, 0);
+	return activate(0, 1, salt, key, 0, 0, 0);
 }
 
 bool VaultStore::rotate(const uint8_t key[32], const uint8_t salt[16]) {
@@ -275,19 +326,15 @@ bool VaultStore::rotate(const uint8_t key[32], const uint8_t salt[16]) {
 	uint8_t plaintext[MaxPlaintext] = {};
 	size_t length = 0;
 	bool ok = true;
-	for (uint8_t index = 0; ok && index < 35; ++index) {
+	for (uint8_t index = 0; ok && index < RecordCount; ++index) {
+		if (!stored(index)) continue;
 		char name[4];
-		const char* logical = index == 0 ? "check" : index == 1 ? "identity" : index == 2 ? "index" : name;
-		if (index >= 3) {
-			const uint8_t slot = index - 2;
-			if (!(contacts_ & (uint32_t(1) << (slot - 1)))) continue;
-			contactName(slot, name);
-		}
+		const char* logical = recordName(index, name);
 		ok = readRecord(bank_, generation_, key_, logical, plaintext, sizeof(plaintext), length) &&
 			writeRecord(bank, generation, key, logical, plaintext, length);
 		CryptoEngine::zeroize(plaintext, sizeof(plaintext));
 	}
-	return ok && activate(bank, generation, salt, key, contacts_);
+	return ok && activate(bank, generation, salt, key, contacts_, groups_, groupCounter_);
 }
 
 bool VaultStore::readIdentity(uint8_t* output, size_t capacity, size_t& length) {
@@ -333,6 +380,43 @@ bool VaultStore::writeContact(uint8_t slot, const uint8_t* input, size_t length)
 bool VaultStore::deleteContact(uint8_t slot) {
 	if (!open_ || slot < 1 || slot > 32) { error_ = ESP_ERR_INVALID_ARG; return false; }
 	return writeIndex(contacts_ & ~(uint32_t(1) << (slot - 1)));
+}
+
+bool VaultStore::readGroup(uint8_t slot, uint8_t* output, size_t capacity, size_t& length) {
+	if (!open_ || slot < 1 || slot > 8 || !(groups_ & (1 << (slot - 1)))) {
+		if (output) CryptoEngine::zeroize(output, capacity);
+		length = 0; error_ = ESP_ERR_NVS_NOT_FOUND; return false;
+	}
+	char name[4];
+	return readRecord(bank_, generation_, key_, recordName(36 + slot, name), output, capacity, length);
+}
+
+bool VaultStore::writeGroupIndex(uint8_t groups) {
+	if (!writeRecord(bank_, generation_, key_, "gindex", &groups, 1)) return false;
+	groups_ = groups;
+	return true;
+}
+
+bool VaultStore::writeGroup(uint8_t slot, const uint8_t* input, size_t length) {
+	if (!open_ || slot < 1 || slot > 8) { error_ = ESP_ERR_INVALID_ARG; return false; }
+	char name[4];
+	if (!writeRecord(bank_, generation_, key_, recordName(36 + slot, name), input, length)) return false;
+	const uint8_t groups = groups_ | (1 << (slot - 1));
+	return groups == groups_ || writeGroupIndex(groups);
+}
+
+bool VaultStore::deleteGroup(uint8_t slot) {
+	if (!open_ || slot < 1 || slot > 8) { error_ = ESP_ERR_INVALID_ARG; return false; }
+	return writeGroupIndex(groups_ & ~(1 << (slot - 1)));
+}
+
+bool VaultStore::writeGroupCounter(uint32_t end) {
+	if (!open_) { error_ = ESP_ERR_INVALID_STATE; return false; }
+	uint8_t bytes[4];
+	put32(bytes, end);
+	if (!writeRecord(bank_, generation_, key_, "gctr", bytes, sizeof(bytes))) return false;
+	groupCounter_ = end;
+	return true;
 }
 
 bool VaultStore::erase() {
@@ -402,7 +486,7 @@ bool VaultStore::selfTest(bool verify) {
 	}
 	if (ok) {
 		ok = store.open(key) &&
-			!store.activate(1 - store.bank_, store.generation_ + 1, salt, key, 0) &&
+			!store.activate(1 - store.bank_, store.generation_ + 1, salt, key, 0, 0, 0) &&
 			store.isOpen();
 	}
 	if (ok) {
@@ -419,6 +503,15 @@ bool VaultStore::selfTest(bool verify) {
 			store.deleteContact(32) && !store.readContact(32, output, sizeof(output), length) &&
 			store.rotate(key, salt) && store.generation_ == generation + 2;
 		CryptoEngine::zeroize(replacement, sizeof(replacement));
+	}
+	if (ok) {
+		ok = store.writeGroup(8, Check, sizeof(Check)) && store.writeGroupCounter(513) &&
+			store.rotate(key, salt) && store.groups() == 0x80 && store.groupCounter() == 513;
+		store.close();
+		ok = ok && store.open(key) && store.groups() == 0x80 && store.groupCounter() == 513 &&
+			store.readGroup(8, output, sizeof(output), length) && length == sizeof(Check) &&
+			memcmp(output, Check, length) == 0 && store.deleteGroup(8) &&
+			!store.readGroup(8, output, sizeof(output), length);
 	}
 	if (ok) ok = Contacts::selfTest(store);
 	if (ok) ok = MeshEngine::selfTest(store);

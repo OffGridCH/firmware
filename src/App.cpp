@@ -159,7 +159,7 @@ void App::handleCommand(void* context, const char* command,
 	JsonObjectConst arguments, JsonObject response, uint64_t nowMs) {
 	App& app = *static_cast<App*>(context);
 	app.action_ = app.commands_.handleSecure(command, arguments, response, nowMs,
-		app.security_, app.vaultStore_, app.configStore_, app.radioDriver_, app.contacts_, app.pairing_, app.mesh_);
+		app.security_, app.vaultStore_, app.configStore_, app.radioDriver_, app.contacts_, app.pairing_, app.mesh_, app.groups_);
 	if (app.action_ == Commands::Action::Reset) {
 		app.actionAt_ = nowMs;
 		onUiEvent(context, UiEvent::FactoryReset, nowMs);
@@ -224,6 +224,7 @@ void App::onLock(void* context) {
 	app.pairing_.cancel();
 	app.pairing_.clearFingerprint();
 	app.contacts_.close();
+	app.groups_.close();
 }
 
 void App::onMeshEvent(void* context, const MeshEngine::Event& event) {
@@ -237,7 +238,7 @@ void App::onMeshEvent(void* context, const MeshEngine::Event& event) {
 
 bool App::onLoad(void* context) {
 	App& app = *static_cast<App*>(context);
-	return app.mesh_.ready() && app.contacts_.load();
+	return app.mesh_.ready() && app.contacts_.load() && app.groups_.load();
 }
 
 bool App::finishReset() {

@@ -120,7 +120,15 @@ void writePayload(JsonObject output, const PacketCodec::Payload& payload, bool r
 		if (payload.hasAge) output["age_s"] = payload.ageSeconds;
 		else output["age_s"] = nullptr;
 		break;
+	case PacketCodec::Type::GroupSync: break;
 	}
+}
+
+const char* enqueueError(MeshEngine::Error error, bool group) {
+	return error == MeshEngine::Error::NoContact ? (group ? "E_NO_SUCH_GROUP" : "E_NO_SUCH_CONTACT") :
+		error == MeshEngine::Error::Full ? "E_QUEUE_FULL" : error == MeshEngine::Error::Locked ? "E_LOCKED" :
+		error == MeshEngine::Error::Storage ? "E_INTERNAL" :
+		error == MeshEngine::Error::CounterExhausted ? "E_BUSY" : "E_INVALID_ARG";
 }
 }
 
@@ -171,7 +179,7 @@ void Commands::emitSecureBoot(const Security& security, uint64_t nowMs) {
 	event["data"]["device_id"] = deviceId_;
 	event["data"]["fw"] = BoardConfig::FirmwareVersion;
 	event["data"]["radio_diagnostics"] = bool(OFFGRID_RADIO_DIAGNOSTICS);
-	event["data"]["proto"] = "1.0";
+	event["data"]["proto"] = "1.1";
 	event["data"]["state"] = stateName(security);
 	event["data"]["mock"] = false;
 	event["data"]["reset_reason"] = esp_reset_reason() == ESP_RST_SW ? "software" : "power_on";
@@ -180,7 +188,7 @@ void Commands::emitSecureBoot(const Security& security, uint64_t nowMs) {
 
 Commands::Action Commands::handleSecure(const char* command, JsonObjectConst args, JsonObject response,
 	uint64_t nowMs, Security& security, VaultStore& vault, ConfigStore& store, RadioDriver& radio,
-	Contacts& contacts, Pairing& pairing, MeshEngine& mesh) {
+	Contacts& contacts, Pairing& pairing, MeshEngine& mesh, Groups& groups) {
 	security.activity(nowMs);
 	JsonObject result = response["result"];
 	const bool unlocked = security.state() == DeviceState::Unlocked;
@@ -209,7 +217,7 @@ Commands::Action Commands::handleSecure(const char* command, JsonObjectConst arg
 		result["device_id"] = deviceId_;
 		result["fw"]["version"] = BoardConfig::FirmwareVersion;
 		result["fw"]["build"] = __DATE__;
-		result["proto"] = "1.0";
+		result["proto"] = "1.1";
 		result["state"] = stateName(security);
 		result["mock"] = false;
 		result["radio_diagnostics"] = bool(OFFGRID_RADIO_DIAGNOSTICS);
@@ -225,6 +233,10 @@ Commands::Action Commands::handleSecure(const char* command, JsonObjectConst arg
 		result["limits"]["max_contacts"] = 32;
 		result["limits"]["max_text_bytes"] = 83;
 		result["limits"]["pending_queue"] = 8;
+		result["limits"]["max_groups"] = Groups::Capacity;
+		result["limits"]["max_group_members"] = Groups::MaxMembers;
+		result["limits"]["max_group_text_bytes"] = PacketCodec::MaxTextBytes;
+		result.createNestedArray("features").add("groups");
 		result["recovery"]["master"] = "ECDSA-P256-SHA256";
 		result["recovery"]["app_wrap_label"] = "og-reset-wrap-v1";
 	} else if (strcmp(command, "sys.set_log_level") == 0) {
@@ -275,6 +287,8 @@ Commands::Action Commands::handleSecure(const char* command, JsonObjectConst arg
 		if (unlocked) {
 			result["contacts"]["used"] = __builtin_popcount(vault.contacts());
 			result["contacts"]["capacity"] = 32;
+			result["groups"]["used"] = groups.count();
+			result["groups"]["capacity"] = Groups::Capacity;
 			result["queue"]["pending"] = mesh.count();
 			result["queue"]["capacity"] = 8;
 			result["queue"]["dropped_events"] = mesh.stats().droppedEvents;
@@ -425,6 +439,11 @@ Commands::Action Commands::handleSecure(const char* command, JsonObjectConst arg
 	} else if (strncmp(command, "msg.", 4) == 0) {
 		if (!unlocked) fail(response, "E_LOCKED", "unlock required");
 		else secureMessages(command, args, response, nowMs, mesh, radio);
+	} else if (strncmp(command, "group.", 6) == 0) {
+		if (!unlocked) fail(response, security.state() == DeviceState::Unprovisioned ? "E_NOT_PROVISIONED" : "E_LOCKED",
+			"unlock required");
+		else if (strcmp(command, "group.send") == 0) secureMessages(command, args, response, nowMs, mesh, radio);
+		else secureGroups(command, args, response, nowMs, security, contacts, groups, mesh, radio);
 	} else fail(response, "E_UNKNOWN_CMD", "unknown command");
 	return Action::None;
 }
@@ -488,7 +507,9 @@ void Commands::secureMessages(const char* command, JsonObjectConst args, JsonObj
 			const MeshEngine::Pending* message = mesh.pending(index);
 			if (!message) continue;
 			JsonObject item = pending.createNestedObject();
-			item["msg_ref"] = message->reference; item["to"] = message->contact;
+			item["msg_ref"] = message->reference;
+			if (message->contact) item["to"] = message->contact;
+			if (message->group) item["group_id"] = message->group;
 			item["type"] = MeshEngine::typeName(message->type); item["ctr"] = message->counter;
 			item["state"] = MeshEngine::stateName(message->state); item["retry"] = message->retry;
 		}
@@ -502,8 +523,11 @@ void Commands::secureMessages(const char* command, JsonObjectConst args, JsonObj
 		result["state"] = "cancelled";
 		return;
 	}
-	if (strcmp(command, "msg.send") != 0) { fail(response, "E_UNKNOWN_CMD", "unknown message command"); return; }
-	if (!integerArg(args, response, "to", 1, 32) || !stringArg(args, response, "type", 1, 8) ||
+	// group.send shares this parser; groups take text and geo only and never request receipts.
+	const bool group = strcmp(command, "group.send") == 0;
+	if (!group && strcmp(command, "msg.send") != 0) { fail(response, "E_UNKNOWN_CMD", "unknown message command"); return; }
+	if (!(group ? integerArg(args, response, "group_id", 1, Groups::Capacity) : integerArg(args, response, "to", 1, 32)) ||
+		!stringArg(args, response, "type", 1, 8) ||
 		!integerArg(args, response, "hops", 0, 7, false) || !boolArg(args, response, "ack", false)) return;
 	PacketCodec::Payload payload;
 	const char* type = args["type"];
@@ -514,7 +538,7 @@ void Commands::secureMessages(const char* command, JsonObjectConst args, JsonObj
 			fail(response, "E_TOO_LONG", "text exceeds 83 UTF-8 bytes", "text"); return;
 		}
 		memcpy(payload.text, text.c_str(), text.size());
-	} else if (strcmp(type, "reaction") == 0) {
+	} else if (!group && strcmp(type, "reaction") == 0) {
 		payload.type = PacketCodec::Type::Reaction;
 		const JsonObjectConst target = args["target"];
 		if (target.isNull() || !stringArg(target, response, "author", 2, 4) ||
@@ -545,27 +569,29 @@ void Commands::secureMessages(const char* command, JsonObjectConst args, JsonObj
 		if (payload.hasAge && !integerArg(args, response, "age_s", 0, 2550)) return;
 		if (payload.hasAltitude) payload.altitude = args["alt_m"];
 		if (payload.hasAge) payload.ageSeconds = args["age_s"];
-	} else { fail(response, "E_INVALID_ARG", "type must be text, reaction or geo", "type"); return; }
-	payload.ack = args["ack"] | live_["mesh"]["ack_default"][type].as<bool>();
+	} else {
+		fail(response, "E_INVALID_ARG", group ? "type must be text or geo" : "type must be text, reaction or geo", "type");
+		return;
+	}
+	if (group && (args["ack"] | false)) { fail(response, "E_INVALID_ARG", "group messages have no receipts", "ack"); return; }
+	payload.ack = !group && (args["ack"] | live_["mesh"]["ack_default"][type].as<bool>());
+	const bool ack = payload.ack;
 	MeshEngine::Pending accepted;
 	size_t bytes = 0;
 	if (!radio.ready()) {
 		CryptoEngine::zeroize(&payload, sizeof(payload));
 		fail(response, "E_RADIO", "radio unavailable"); return;
 	}
-	const MeshEngine::Error error = mesh.enqueue(args["to"], payload,
-		args["hops"] | live_["mesh"]["hop_default"].as<uint8_t>(), nowMs, accepted, bytes);
+	const MeshEngine::Error error = mesh.enqueue(group ? 0 : args["to"].as<uint8_t>(), payload,
+		args["hops"] | live_["mesh"]["hop_default"].as<uint8_t>(), nowMs, accepted, bytes,
+		group ? args["group_id"].as<uint8_t>() : 0);
 	CryptoEngine::zeroize(&payload, sizeof(payload));
 	if (error != MeshEngine::Error::None) {
-		const char* code = error == MeshEngine::Error::NoContact ? "E_NO_SUCH_CONTACT" :
-			error == MeshEngine::Error::Full ? "E_QUEUE_FULL" : error == MeshEngine::Error::Locked ? "E_LOCKED" :
-			error == MeshEngine::Error::Storage ? "E_INTERNAL" :
-			error == MeshEngine::Error::CounterExhausted ? "E_BUSY" : "E_INVALID_ARG";
-		fail(response, code, error == MeshEngine::Error::CounterExhausted ? "counter exhausted; re-pair" : "message enqueue failed");
+		fail(response, enqueueError(error, group), error == MeshEngine::Error::CounterExhausted ? "counter exhausted; re-pair" : "message enqueue failed");
 		return;
 	}
 	result["msg_ref"] = accepted.reference; result["ctr"] = accepted.counter;
-	result["ack_requested"] = args["ack"] | live_["mesh"]["ack_default"][type].as<bool>();
+	result["ack_requested"] = ack;
 	result["hops"] = args["hops"] | live_["mesh"]["hop_default"].as<uint8_t>();
 	result["state"] = "queued"; result["bytes_on_air"] = bytes;
 	result["est_airtime_ms"] = RadioDriver::airtimeMs(radio.config(), bytes);
@@ -577,14 +603,27 @@ bool Commands::emitMeshEvent(const MeshEngine::Event& value) {
 	JsonObject data = event.createNestedObject("data");
 	if (value.type == MeshEngine::EventType::ContactActive) {
 		event["evt"] = "contact.state"; data["contact_id"] = value.message.contact; data["state"] = "active";
+	} else if (value.type == MeshEngine::EventType::GroupState) {
+		event["evt"] = "group.state"; data["group_id"] = value.message.group;
+		data["state"] = value.joined ? "joined" : "updated"; data["epoch"] = value.epoch;
 	} else if (value.type == MeshEngine::EventType::Received) {
-		event["evt"] = "msg.received";
+		// Old apps ignore group.received instead of filing group texts into a DM chat.
+		event["evt"] = value.message.group ? "group.received" : "msg.received";
 		writePayload(data, value.payload, true);
-		data["from"] = value.message.contact; data["ctr"] = value.message.counter; data["retry"] = value.message.retry;
+		if (value.message.group) {
+			char node[5];
+			snprintf(node, sizeof(node), "%04X", value.node);
+			data["group_id"] = value.message.group; data["member"] = value.member; data["node_id"].set(node);
+			if (value.message.contact) data["from"] = value.message.contact;
+			else data["from"] = nullptr;
+		} else data["from"] = value.message.contact;
+		data["ctr"] = value.message.counter; data["retry"] = value.message.retry;
 		data["hops"] = value.hops; data["rssi"] = value.rssi; data["snr"] = value.snr;
 	} else {
 		event["evt"] = "msg.status";
-		data["msg_ref"] = value.message.reference; data["to"] = value.message.contact;
+		data["msg_ref"] = value.message.reference;
+		if (value.message.contact) data["to"] = value.message.contact;
+		if (value.message.group) data["group_id"] = value.message.group;
 		data["state"] = MeshEngine::stateName(value.message.state); data["retry"] = value.message.retry;
 		if (value.reason != MeshEngine::Reason::None) data["reason"] = MeshEngine::reasonName(value.reason);
 		if (value.message.state == MeshEngine::State::Delivered) { data["hops"] = value.hops; data["rtt_ms"] = value.rttMs; }
@@ -816,6 +855,173 @@ void Commands::secureContacts(const char* command, JsonObjectConst args, JsonObj
 		if (!contactView(result.createNestedObject("contact"), slot, *contacts.view(slot)))
 			fail(response, "E_INTERNAL", "contact encoding failed");
 	}
+}
+
+void Commands::groupView(JsonObject output, uint8_t slot, const Groups::View& view, const Contacts& contacts,
+	bool members) {
+	char text[9];
+	snprintf(text, sizeof(text), "%02X%02X%02X%02X", view.id[0], view.id[1], view.id[2], view.id[3]);
+	output["group_id"] = slot; output["gid"].set(text); output["name"] = view.name; output["epoch"] = view.epoch;
+	output["owner"] = view.owner;
+	if (view.ownerContact) output["owner_contact_id"] = view.ownerContact;
+	else output["owner_contact_id"] = nullptr;
+	output["member"] = view.member; output["member_count"] = view.count;
+	if (!members) return;
+	JsonArray values = output.createNestedArray("members");
+	for (uint8_t member = 0; member < view.count; ++member) {
+		JsonObject value = values.createNestedObject();
+		snprintf(text, sizeof(text), "%04X", view.nodes[member]);
+		value["member"] = member; value["node_id"].set(text);
+		// The owner knows which contact each member is; members match other members by NodeID only.
+		uint8_t contact = view.owner ? view.contacts[member] : 0;
+		if (contact && (!contacts.view(contact) || contacts.view(contact)->nodeId != view.nodes[member])) contact = 0;
+		for (uint8_t slot = 1; !view.owner && member != view.member && !contact && slot <= Contacts::Capacity; ++slot)
+			if (contacts.view(slot) && contacts.view(slot)->nodeId == view.nodes[member]) contact = slot;
+		if (contact) value["contact_id"] = contact;
+		else value["contact_id"] = nullptr;
+	}
+}
+
+bool Commands::membersArg(JsonObjectConst args, JsonObject response, const Contacts& contacts, uint8_t maximum,
+	uint8_t* slots, uint8_t& count) {
+	count = 0;
+	const JsonArrayConst values = args["members"];
+	if (values.isNull() || values.size() < 1 || values.size() > maximum) {
+		fail(response, "E_INVALID_ARG", "members must be a nonempty array within the group size", "members");
+		return false;
+	}
+	for (JsonVariantConst value : values) {
+		const int64_t slot = value.is<int64_t>() ? value.as<int64_t>() : 0;
+		bool repeated = false;
+		for (uint8_t index = 0; index < count; ++index) if (slots[index] == slot) repeated = true;
+		if (slot < 1 || slot > 32 || repeated) {
+			fail(response, "E_INVALID_ARG", "members must be distinct contact IDs", "members"); return false;
+		}
+		if (!contacts.view(slot)) { fail(response, "E_NO_SUCH_CONTACT", "contact does not exist", "members"); return false; }
+		slots[count++] = slot;
+	}
+	return true;
+}
+
+void Commands::secureGroups(const char* command, JsonObjectConst args, JsonObject response, uint64_t nowMs,
+	Security& security, Contacts& contacts, Groups& groups, MeshEngine& mesh, const RadioDriver& radio) {
+	JsonObject result = response["result"];
+	auto failure = [&](Groups::Error error) {
+		if (error == Groups::Error::Storage) security.lock("lock", nowMs);
+		fail(response, error == Groups::Error::Full ? "E_STORAGE_FULL" : error == Groups::Error::Exhausted ? "E_BUSY" :
+			error == Groups::Error::Invalid ? "E_INVALID_ARG" : "E_INTERNAL",
+			error == Groups::Error::Full ? "all group slots are occupied" :
+			error == Groups::Error::Exhausted ? "group epochs exhausted; create a new group" : "group update failed");
+	};
+	if (strcmp(command, "group.list") == 0) {
+		result["total"] = groups.count();
+		JsonArray values = result.createNestedArray("groups");
+		for (uint8_t slot = 1; slot <= Groups::Capacity; ++slot)
+			if (groups.view(slot)) groupView(values.createNestedObject(), slot, *groups.view(slot), contacts, false);
+		return;
+	}
+	uint16_t nodes[Groups::MaxMembers] = {};
+	uint8_t members[Groups::MaxMembers] = {}, count = 0;
+	if (strcmp(command, "group.create") == 0) {
+		uint8_t added = 0;
+		if (!stringArg(args, response, "name", 1, 24) ||
+			!membersArg(args, response, contacts, Groups::MaxMembers - 1, members + 1, added)) return;
+		nodes[0] = security.nodeId();
+		for (uint8_t index = 1; index <= added; ++index) nodes[index] = contacts.view(members[index])->nodeId;
+		uint8_t slot = 0;
+		const Groups::Error error = groups.create(args["name"], nodes, members, added + 1, slot);
+		if (error != Groups::Error::None) { failure(error); return; }
+		groupView(result.createNestedObject("group"), slot, *groups.view(slot), contacts, true);
+		return;
+	}
+	if (strcmp(command, "group.get") && strcmp(command, "group.add") && strcmp(command, "group.remove") &&
+		strcmp(command, "group.sync") && strcmp(command, "group.delete")) {
+		fail(response, "E_UNKNOWN_CMD", "unknown group command"); return;
+	}
+	if (!integerArg(args, response, "group_id", 1, Groups::Capacity)) return;
+	const uint8_t slot = args["group_id"];
+	const Groups::View* view = groups.view(slot);
+	if (!view) { fail(response, "E_NO_SUCH_GROUP", "group does not exist", "group_id"); return; }
+	if (strcmp(command, "group.get") == 0) { groupView(result.createNestedObject("group"), slot, *view, contacts, true); return; }
+	if (strcmp(command, "group.delete") == 0) {
+		if (!args["confirm"].is<bool>() || !args["confirm"].as<bool>()) {
+			fail(response, "E_CONFIRM_REQUIRED", "confirm must be true", "confirm"); return;
+		}
+		if (!groups.remove(slot)) { security.lock("lock", nowMs); fail(response, "E_INTERNAL", "group deletion storage failed"); return; }
+		mesh.groupChanged(slot, true, nowMs);
+		result["deleted"] = true;
+		return;
+	}
+	if (!view->owner) { fail(response, "E_INVALID_ARG", "only the group owner can change or sync members", "group_id"); return; }
+	if (strcmp(command, "group.sync") == 0) {
+		if (!integerArg(args, response, "contact_id", 1, 32) || !integerArg(args, response, "hops", 0, 7, false)) return;
+		const uint8_t contact = args["contact_id"];
+		uint8_t member = 0;
+		for (uint8_t index = 1; index < view->count && !member; ++index)
+			if (view->contacts[index] == contact && contacts.view(contact) && contacts.view(contact)->nodeId == view->nodes[index])
+				member = index;
+		if (!member) { fail(response, "E_INVALID_ARG", "contact is not a member of this group", "contact_id"); return; }
+		if (!radio.ready()) { fail(response, "E_RADIO", "radio unavailable"); return; }
+		PacketCodec::Payload payload;
+		payload.type = PacketCodec::Type::GroupSync;
+		payload.ack = true;
+		size_t length = 0;
+		groups.syncBody(slot, member, reinterpret_cast<uint8_t*>(payload.text), length);
+		payload.syncLength = length;
+		MeshEngine::Pending accepted;
+		size_t bytes = 0;
+		const MeshEngine::Error error = mesh.enqueue(contact, payload,
+			args["hops"] | live_["mesh"]["hop_default"].as<uint8_t>(), nowMs, accepted, bytes, slot);
+		CryptoEngine::zeroize(&payload, sizeof(payload));
+		if (error != MeshEngine::Error::None) {
+			fail(response, enqueueError(error, false), error == MeshEngine::Error::CounterExhausted ? "counter exhausted; re-pair" : "sync enqueue failed");
+			return;
+		}
+		result["msg_ref"] = accepted.reference; result["ctr"] = accepted.counter; result["ack_requested"] = true;
+		result["hops"] = args["hops"] | live_["mesh"]["hop_default"].as<uint8_t>();
+		result["state"] = "queued"; result["bytes_on_air"] = bytes;
+		result["est_airtime_ms"] = RadioDriver::airtimeMs(radio.config(), bytes);
+		return;
+	}
+	count = view->count;
+	memcpy(nodes, view->nodes, sizeof(nodes));
+	memcpy(members, view->contacts, sizeof(members));
+	if (strcmp(command, "group.add") == 0) {
+		uint8_t added = 0;
+		if (!membersArg(args, response, contacts, Groups::MaxMembers - count, members + count, added)) return;
+		for (uint8_t index = count; index < count + added; ++index) {
+			for (uint8_t existing = 1; existing < count; ++existing)
+				if (view->contacts[existing] == members[index]) {
+					fail(response, "E_INVALID_ARG", "contact is already a member", "members"); return;
+				}
+			nodes[index] = contacts.view(members[index])->nodeId;
+		}
+		count += added;
+	} else {
+		const JsonArrayConst values = args["members"];
+		if (values.isNull() || values.size() < 1 || values.size() > size_t(count - 2)) {
+			fail(response, "E_INVALID_ARG", "remove 1 to member_count - 2 members; delete the group instead", "members");
+			return;
+		}
+		bool removed[Groups::MaxMembers] = {};
+		for (JsonVariantConst value : values) {
+			const int64_t member = value.is<int64_t>() ? value.as<int64_t>() : 0;
+			if (member < 1 || member >= count || removed[member]) {
+				fail(response, "E_INVALID_ARG", "members must be distinct member indexes other than 0", "members"); return;
+			}
+			removed[member] = true;
+		}
+		uint8_t kept = 0;
+		for (uint8_t index = 0; index < count; ++index) {
+			if (removed[index]) continue;
+			nodes[kept] = view->nodes[index]; members[kept++] = view->contacts[index];
+		}
+		count = kept;
+	}
+	const Groups::Error error = groups.rekey(slot, nodes, members, count);
+	if (error != Groups::Error::None) { failure(error); return; }
+	mesh.groupChanged(slot, false, nowMs);
+	groupView(result.createNestedObject("group"), slot, *groups.view(slot), contacts, true);
 }
 
 bool Commands::stringArg(JsonObjectConst args, JsonObject response, const char* field,

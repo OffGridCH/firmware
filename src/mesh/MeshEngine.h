@@ -1,7 +1,7 @@
 #pragma once
 
 #include "PacketCodec.h"
-#include "../security/Contacts.h"
+#include "../security/Groups.h"
 
 class MeshEngine {
 public:
@@ -9,11 +9,12 @@ public:
 	enum class Error { None, Locked, NoContact, Full, CounterExhausted, Storage, Invalid };
 	enum class State { Queued, Sent, Relayed, Retrying, Delivered, Failed, Cancelled };
 	enum class Reason { None, Timeout, Locked, ContactDeleted, RadioError };
-	enum class EventType { Status, Received, ContactActive };
+	enum class EventType { Status, Received, ContactActive, GroupState };
 	struct Pending {
 		bool used = false;
 		uint32_t reference = 0;
 		uint8_t contact = 0;
+		uint8_t group = 0;
 		PacketCodec::Type type = PacketCodec::Type::Text;
 		uint32_t counter = 0;
 		State state = State::Queued;
@@ -29,6 +30,10 @@ public:
 		uint8_t hops = 0;
 		float rssi = 0;
 		float snr = 0;
+		uint8_t member = 0;
+		uint16_t node = 0;
+		uint8_t epoch = 0;
+		bool joined = false;
 	};
 	struct Config {
 		uint8_t retries = 3;
@@ -55,7 +60,7 @@ public:
 		uint32_t injectedAckDrops = 0;
 #endif
 	};
-	explicit MeshEngine(Contacts& contacts);
+	MeshEngine(Contacts& contacts, Groups& groups);
 	bool init(bool provisioned);
 	bool ready() const { return cryptoReady_; }
 	bool radioWanted() const;
@@ -65,8 +70,9 @@ public:
 	void close(uint64_t nowMs);
 	void configure(const Config& config);
 	Error enqueue(uint8_t contact, const PacketCodec::Payload& payload, uint8_t hops,
-		uint64_t nowMs, Pending& accepted, size_t& bytes);
+		uint64_t nowMs, Pending& accepted, size_t& bytes, uint8_t group = 0);
 	bool cancel(uint32_t reference, uint64_t nowMs);
+	void groupChanged(uint8_t group, bool deleted, uint64_t nowMs);
 	const Pending* pending(size_t index) const;
 	size_t count() const;
 	void tick(uint64_t nowMs);
@@ -124,6 +130,8 @@ private:
 	Source* source(uint16_t id, uint64_t nowMs);
 	bool endpoint(const uint8_t* bytes, size_t length, const PacketCodec::Header& header,
 		float rssi, float snr, uint64_t nowMs);
+	bool groupEndpoint(const uint8_t* bytes, size_t length, const PacketCodec::Header& header,
+		float rssi, float snr, uint64_t nowMs);
 	static void contactChanged(void* context, uint8_t contact);
 	void removeContact(uint8_t contact);
 	void emit(const Event& event);
@@ -132,6 +140,7 @@ private:
 	bool allocate(uint8_t contact, uint32_t& counter);
 	void ack(uint8_t contact, const PacketCodec::Header& original);
 	Contacts& contacts_;
+	Groups& groups_;
 	Config config_;
 	Slot slots_[Capacity];
 	Ack acks_[4];

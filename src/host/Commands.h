@@ -37,7 +37,7 @@ public:
 	void initSecure(ConfigStore& store, Security& security);
 	Action handleSecure(const char* command, JsonObjectConst args, JsonObject response,
 		uint64_t nowMs, Security& security, VaultStore& vault, ConfigStore& store, RadioDriver& radio,
-		Contacts& contacts, Pairing& pairing, MeshEngine& mesh);
+		Contacts& contacts, Pairing& pairing, MeshEngine& mesh, Groups& groups);
 	void secureSnapshot(UiSnapshot& snapshot, uint64_t nowMs, const Security& security, const RadioDriver& radio,
 		const Contacts& contacts, const Pairing& pairing);
 	bool takeSecureLedConfig(LedConfig& config);
@@ -72,6 +72,12 @@ private:
 		uint64_t nowMs, Security& security, Contacts& contacts, Pairing& pairing);
 	void secureMessages(const char* command, JsonObjectConst args, JsonObject response,
 		uint64_t nowMs, MeshEngine& mesh, const RadioDriver& radio);
+	static void groupView(JsonObject output, uint8_t slot, const Groups::View& view, const Contacts& contacts,
+		bool members);
+	static bool membersArg(JsonObjectConst args, JsonObject response, const Contacts& contacts, uint8_t maximum,
+		uint8_t* slots, uint8_t& count);
+	void secureGroups(const char* command, JsonObjectConst args, JsonObject response, uint64_t nowMs,
+		Security& security, Contacts& contacts, Groups& groups, MeshEngine& mesh, const RadioDriver& radio);
 	StaticJsonDocument<16384> live_;
 	StaticJsonDocument<8192> candidate_;
 	char deviceId_[13] = {};
