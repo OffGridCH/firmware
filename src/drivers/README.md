@@ -81,9 +81,9 @@ stop progress rather than looping through reinitialization. A fresh real
 lock/unlock explicitly reinitializes unavailable hardware.
 
 App routes real RX/TX/error events to MeshEngine in every profile. Locked keyless
-receive/relay is opt-in; unprovisioned firmware does not initialize RF. Mesh
-enforces shared 99-times-airtime pacing after TX. This is a per-boot safeguard,
-not a durable legal rolling-hour ledger across resets.
+receive/relay is opt-in; unprovisioned firmware does not initialize RF.
+No duty-cycle cooldown is enforced. CAD/backoff and airtime measurement remain;
+the operator is responsible for permitted lab frequency/power/airtime use.
 
 There is no raw-radio simulator backend. Explicit lab profiles add secure
 fixtures, ciphertext trace and receipt-loss injection described in
