@@ -745,7 +745,7 @@ void Commands::secureContacts(const char* command, JsonObjectConst args, JsonObj
 		if (!pairing.begin(qr, length, nowMs) || !encode(result, "qr", qr, length)) {
 			pairing.cancel(); fail(response, "E_INTERNAL", "pairing initialization failed"); return;
 		}
-		result["qr_bytes"] = length; result["expires_s"] = 300;
+		result["qr_bytes"] = length; result["expires_s"] = pairing.remaining(nowMs);
 		return;
 	}
 	if (strcmp(command, "pair.cancel") == 0) { pairing.cancel(); result["cancelled"] = true; return; }
