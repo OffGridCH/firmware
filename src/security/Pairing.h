@@ -23,6 +23,12 @@ private:
 	Contacts& contacts_;
 	uint8_t salt_[16] = {};
 	uint64_t beganAt_ = 0;
+	bool saltValid_ = false;
+	// Peers (hash of public key and their salt) this salt already completed with. The same pair of salts and
+	// keys gives the same contact keys, and a replaced contact starts its counters at 1 again, so a second
+	// complete with an identical peer QR would reuse nonces; it is refused until a new salt is drawn.
+	uint8_t used_[4][32] = {};
+	size_t usedCount_ = 0;
 	bool active_ = false;
 	char fingerprint_[15] = {};
 	Error error_ = Error::None;

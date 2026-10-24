@@ -7,11 +7,14 @@
 
 void Pairing::cancel() {
 	active_ = false;
+	saltValid_ = false;
 	CryptoEngine::zeroize(salt_, sizeof(salt_));
+	CryptoEngine::zeroize(used_, sizeof(used_));
+	usedCount_ = 0;
 }
 
 void Pairing::tick(uint64_t nowMs) {
-	if (security_.state() != DeviceState::Unlocked || nowMs - beganAt_ >= 300000) cancel();
+	if (security_.state() != DeviceState::Unlocked || (saltValid_ && nowMs - beganAt_ >= 300000)) cancel();
 	if (security_.state() != DeviceState::Unlocked) clearFingerprint();
 }
 
@@ -20,29 +23,44 @@ uint16_t Pairing::remaining(uint64_t nowMs) const {
 }
 
 bool Pairing::begin(uint8_t qr[75], size_t& length, uint64_t nowMs) {
-	cancel(); clearFingerprint(); length = 0;
-	if (security_.state() != DeviceState::Unlocked || !CryptoEngine::randomBytes(salt_, sizeof(salt_))) {
-		error_ = Error::Crypto; return false;
+	tick(nowMs); clearFingerprint(); length = 0;
+	// One salt per 5-minute window. Both boards derive the contact keys from both salts, so the QR a
+	// peer scanned must stay the QR this board pairs with. The app calls pair.begin whenever its
+	// pairing screen opens, also after it scanned the peer and before the peer scans back; a fresh
+	// salt there gave the two boards different keys and every packet failed its tag (lab field test
+	// of 2026-10-24). A new salt starts only when less than a minute of the window is left.
+	if (!saltValid_ || nowMs - beganAt_ >= 240000) {
+		if (security_.state() != DeviceState::Unlocked || !CryptoEngine::randomBytes(salt_, sizeof(salt_))) {
+			cancel(); error_ = Error::Crypto; return false;
+		}
+		beganAt_ = nowMs; saltValid_ = true;
+		CryptoEngine::zeroize(used_, sizeof(used_));
+		usedCount_ = 0;
 	}
 	memcpy(qr, "OG1", 3);
 	memcpy(qr + 3, security_.publicKey(), 32);
 	memcpy(qr + 35, salt_, 16);
 	length = 51 + strlen(security_.name());
 	memcpy(qr + 51, security_.name(), length - 51);
-	beganAt_ = nowMs; active_ = true; error_ = Error::None;
+	active_ = true; error_ = Error::None;
 	return true;
 }
 
 bool Pairing::complete(const uint8_t* qr, size_t length, const char* name, bool replace, uint64_t nowMs,
 	uint8_t& slot, bool& collision) {
 	tick(nowMs); slot = 0; collision = false;
-	if (!active_) { error_ = Error::NoPairing; return false; }
+	if (!saltValid_) { error_ = Error::NoPairing; return false; }
 	if (!qr || length < 51 || length > 75 || memcmp(qr, "OG1", 3) ||
 		memchr(qr + 51, 0, length - 51) ||
 		!validUtf8(qr + 51, length - 51)) { error_ = Error::InvalidQr; return false; }
 	const uint8_t* own = security_.publicKey();
 	const uint8_t* peer = qr + 3;
 	if (memcmp(own, peer, 32) == 0) { error_ = Error::Self; return false; }
+	uint8_t peerQr[32];
+	if (!CryptoEngine::sha256(qr + 3, 48, peerQr)) { error_ = Error::Crypto; return false; }
+	for (size_t index = 0; index < usedCount_; ++index)
+		if (memcmp(used_[index], peerQr, 32) == 0) { error_ = Error::NoPairing; return false; }
+	if (usedCount_ == 4) { error_ = Error::NoPairing; return false; }
 	slot = contacts_.findPublicKey(peer);
 	if (slot && !replace) { error_ = Error::Exists; return false; }
 	if (!slot) slot = contacts_.freeSlot();
@@ -88,6 +106,8 @@ bool Pairing::complete(const uint8_t* qr, size_t length, const char* name, bool 
 		error_ = Error::Storage; return false;
 	}
 	strcpy(fingerprint_, fingerprint);
-	cancel(); error_ = Error::None;
+	memcpy(used_[usedCount_++], peerQr, 32);
+	// The session ends on the display, the salt stays for the rest of its window (see begin()).
+	active_ = false; error_ = Error::None;
 	return true;
 }
