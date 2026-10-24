@@ -3,6 +3,9 @@
 #include <Adafruit_NeoPixel.h>
 #include <cstdint>
 
+#include "../BoardConfig.h"
+#include "../Types.h"
+
 namespace led {
 // 0xRRGGBB palette, matched to the blue SSD1306 display.
 constexpr uint32_t kBlue  = 0x2A55FF; // base color, everything mesh/radio
@@ -38,19 +41,22 @@ class LedDriver {
 public:
     // Ring order: [L0..L3 top->bottom, R0..R3 top->bottom], L = strip 1.
     static constexpr uint8_t RingSize = 8;
-    // Mirrors OledDriver boot::T_END so both animations end together.
-    static constexpr uint32_t BootDurationMs = 6600;
+    // Single source of truth so both animations end together.
+    static constexpr uint32_t BootDurationMs = UiTiming::StartupEnd;
 
     LedDriver();
 
     void begin(); // init strips, start the boot sequence
-    void update(); // non-blocking, call every loop
+    void update(uint64_t nowMs = 0); // non-blocking, call every loop; 0 = millis()
 
     void setMode(led::Mode mode);
     led::Mode mode() const { return mode_; }
 
-    void trigger(led::Event event);
+    void trigger(led::Event event, uint64_t nowMs = 0);
     bool eventActive() const { return ev_.event != led::Event::None; }
+
+    // Host/UI event mapping for the main app surface.
+    void onEvent(UiEvent event, uint64_t nowMs = 0);
 
     // led.set configuration (link spec 7.8)
     void setEnabled(bool enabled);
@@ -63,11 +69,22 @@ public:
 
     // led.test preview: play a custom step pattern (on,off,on,... ms).
     void preview(const uint16_t *steps, uint8_t stepCount, uint8_t repeat = 1);
+    // Named or custom pattern from the host led.test/led.set config.
+    void preview(const LedPattern &pattern, uint64_t nowMs = 0);
 
     bool bootDone() const { return !bootActive_; }
 
+    // Status accessors for sys.status.
+    uint8_t duty() const { return brightness_; } // no onboard PWM; reports brightness
+    uint64_t frameTime() const { return lastUpdateMs_; }
+    const char *pattern() const; // active event name, else mode name
+
     // Test hook: last rendered pixel for a ring index (0xRRGGBB).
     uint32_t pixelAt(uint8_t ringIndex) const { return frame_[ringIndex]; }
+
+#if OFFGRID_RADIO_DIAGNOSTICS
+    static bool selfTest();
+#endif
 
 private:
     struct EventState {
@@ -80,9 +97,9 @@ private:
         uint32_t color = 0;
     };
 
-    static constexpr uint8_t Strip1Pin = 45; // left side, index 0 = top
-    static constexpr uint8_t Strip2Pin = 46; // right side, index 0 = top
-    static constexpr uint8_t StripLeds = RingSize / 2;
+    static constexpr uint8_t Strip1Pin = BoardConfig::StripPins[0]; // left, index 0 = top
+    static constexpr uint8_t Strip2Pin = BoardConfig::StripPins[1]; // right, index 0 = top
+    static constexpr uint8_t StripLeds = BoardConfig::StripPixels;
     static constexpr uint8_t MaxPreviewSteps = 16; // link spec limit
 
     Adafruit_NeoPixel strip1_;
@@ -102,6 +119,7 @@ private:
     bool enabled_ = true;
     bool quiet_ = false;
     uint8_t brightness_ = 128;
+    uint64_t lastUpdateMs_ = 0;
 
     uint8_t gamma_[256];
     uint32_t frame_[RingSize];

@@ -5,18 +5,19 @@
 #include <cmath>
 
 namespace {
-// Boot timeline, mirrors OledDriver::boot (feature/oled-driver) beat for beat.
-constexpr uint32_t B_LINE_END     = 260;
-constexpr uint32_t B_COLLAPSE_END = 420;
-constexpr uint32_t B_GROW_END     = 900;
-constexpr uint32_t B_RIPPLE_A     = 950;
+// Boot timeline, sourced from UiTiming (Types.h) so the LED boot stays in
+// sync with the OledDriver boot (feature/oled-driver) beat for beat.
+constexpr uint32_t B_LINE_END     = UiTiming::StartupLine;
+constexpr uint32_t B_COLLAPSE_END = UiTiming::StartupCollapse;
+constexpr uint32_t B_GROW_END     = UiTiming::StartupGrow;
+constexpr uint32_t B_RIPPLE_A     = UiTiming::StartupRipple;
 constexpr uint32_t B_RIPPLE_B     = 1350;
 constexpr uint32_t B_RIPPLE_ROW   = 80;
-constexpr uint32_t B_SLIDE_START  = 2000;
-constexpr uint32_t B_SLIDE_END    = 2450;
+constexpr uint32_t B_SLIDE_START  = UiTiming::StartupSlide;
+constexpr uint32_t B_SLIDE_END    = UiTiming::StartupSlideEnd;
 constexpr uint32_t B_TEXT_FLASH   = 2700; // "OFFGRID" lock-in
 constexpr uint32_t B_FREQ_FLASH   = 3750; // frequency lock-in
-constexpr uint32_t B_FILL_START   = 4450;
+constexpr uint32_t B_FILL_START   = UiTiming::StartupFill;
 constexpr uint32_t B_FILL_STEP    = 150;
 constexpr uint32_t B_FADE_START   = 6200;
 
@@ -30,6 +31,8 @@ constexpr uint16_t kStepsFlash[]  = {60};
 constexpr uint16_t kStepsDouble[] = {80, 80, 80, 760};
 constexpr uint16_t kStepsBlink100[] = {100, 100};
 constexpr uint16_t kStepsHeart[]  = {100, 150, 100, 650};
+constexpr uint16_t kStepsOn[]       = {60000}; // "on": lit until the mode resumes
+constexpr uint16_t kStepsBlinkSlow[] = {500, 500};
 
 constexpr uint32_t kFlashMs = 90;
 
@@ -61,6 +64,7 @@ void LedDriver::begin() {
 }
 
 void LedDriver::setMode(led::Mode mode) {
+    if (mode_ == mode) return; // App polls every tick; keep live events
     mode_ = mode;
 }
 
@@ -88,8 +92,8 @@ void LedDriver::clearResetProgress() {
     progressPct_ = 0;
 }
 
-void LedDriver::trigger(led::Event event) {
-    const uint32_t now = millis();
+void LedDriver::trigger(led::Event event, uint64_t nowMs) {
+    const uint32_t now = static_cast<uint32_t>(nowMs ? nowMs : millis());
     switch (event) {
     case led::Event::Tx:
         startEvent(event, kStepsFlash, 1, 1, led::kBlue, now);
@@ -124,6 +128,97 @@ void LedDriver::preview(const uint16_t *steps, uint8_t stepCount, uint8_t repeat
     startEvent(led::Event::None, previewSteps_, stepCount, repeat, led::kBlue, millis());
 }
 
+void LedDriver::onEvent(UiEvent event, uint64_t nowMs) {
+    switch (event) {
+    case UiEvent::Tx:
+        trigger(led::Event::Tx, nowMs);
+        break;
+    case UiEvent::Rx:
+        trigger(led::Event::Rx, nowMs);
+        break;
+    case UiEvent::MessageReceived:
+        trigger(led::Event::MsgReceived, nowMs);
+        break;
+    case UiEvent::Delivered:
+        trigger(led::Event::Delivered, nowMs);
+        break;
+    case UiEvent::Failed:
+        trigger(led::Event::Failed, nowMs);
+        break;
+    case UiEvent::Error:
+        trigger(led::Event::Error, nowMs);
+        break;
+    case UiEvent::Pairing:
+        trigger(led::Event::Pairing, nowMs);
+        break;
+    case UiEvent::Boot: // already running from begin()
+    case UiEvent::FactoryReset: // driven via setResetProgress()
+        break;
+    }
+}
+
+void LedDriver::preview(const LedPattern &pattern, uint64_t nowMs) {
+    const uint32_t now = static_cast<uint32_t>(nowMs ? nowMs : millis());
+    switch (pattern.kind) {
+    case LedPatternKind::Off:
+        ev_.event = led::Event::None;
+        ev_.stepCount = 0;
+        break;
+    case LedPatternKind::On:
+        startEvent(led::Event::None, kStepsOn, 1, 1, led::kBlue, now);
+        break;
+    case LedPatternKind::Flash:
+        startEvent(led::Event::None, kStepsFlash, 1, 1, led::kBlue, now);
+        break;
+    case LedPatternKind::BlinkSlow:
+        startEvent(led::Event::None, kStepsBlinkSlow, 2, 1, led::kBlue, now);
+        break;
+    case LedPatternKind::BlinkFast:
+        startEvent(led::Event::None, kStepsBlink100, 2, 1, led::kBlue, now);
+        break;
+    case LedPatternKind::Double:
+        startEvent(led::Event::None, kStepsDouble, 4, 1, led::kBlue, now);
+        break;
+    case LedPatternKind::Heartbeat:
+    case LedPatternKind::Pairing:
+        startEvent(led::Event::None, kStepsHeart, 4, 1, led::kCyan, now);
+        break;
+    case LedPatternKind::Custom: {
+        const uint8_t count = pattern.stepCount > MaxPreviewSteps ? MaxPreviewSteps
+                                                                  : pattern.stepCount;
+        if (count == 0) break;
+        for (uint8_t i = 0; i < count; i++) previewSteps_[i] = pattern.stepsMs[i];
+        previewStepCount_ = count;
+        startEvent(led::Event::None, previewSteps_, count, pattern.repeat, led::kBlue, now);
+        break;
+    }
+    default:
+        // Glow/Pulse/Send/Receive/Startup/Reset/Alert have no step-table equivalent.
+        break;
+    }
+}
+
+const char *LedDriver::pattern() const {
+    switch (ev_.event) {
+    case led::Event::Tx: return "tx";
+    case led::Event::Rx: return "rx";
+    case led::Event::MsgReceived: return "message_received";
+    case led::Event::Delivered: return "delivered";
+    case led::Event::Failed: return "failed";
+    case led::Event::Error: return "error";
+    case led::Event::Pairing: return "pairing";
+    case led::Event::None: break;
+    }
+    switch (mode_) {
+    case led::Mode::Unprovisioned: return "unprovisioned";
+    case led::Mode::Locked: return "locked";
+    case led::Mode::NoNeighbors: return "no_neighbors";
+    case led::Mode::MeshUp: return "mesh_up";
+    case led::Mode::Pairing: return "pairing";
+    }
+    return "off";
+}
+
 void LedDriver::startEvent(led::Event event, const uint16_t *steps, uint8_t stepCount,
                            uint8_t repeat, uint32_t color, uint32_t now) {
     ev_.event = (event != led::Event::None) ? event : ev_.event; // preview keeps its own
@@ -143,7 +238,7 @@ void LedDriver::advanceEvent(uint32_t now) {
         if (ev_.stepIndex + 1 < ev_.stepCount) {
             ev_.stepIndex++;
             ev_.stepEndsAt += ev_.steps[ev_.stepIndex];
-            return;
+            continue;
         }
         ev_.repeatLeft--;
         if (ev_.repeatLeft == 0) {
@@ -156,8 +251,9 @@ void LedDriver::advanceEvent(uint32_t now) {
     }
 }
 
-void LedDriver::update() {
-    const uint32_t now = millis();
+void LedDriver::update(uint64_t nowMs) {
+    const uint32_t now = static_cast<uint32_t>(nowMs ? nowMs : millis());
+    lastUpdateMs_ = now;
     advanceEvent(now);
 
     uint8_t v[RingSize] = {0, 0, 0, 0, 0, 0, 0, 0};
@@ -357,3 +453,15 @@ uint8_t LedDriver::triPulse(uint32_t t, uint32_t start, uint32_t rise, uint32_t 
     if (e < rise + fall) return static_cast<uint8_t>(255 * static_cast<float>(rise + fall - e) / fall);
     return 0;
 }
+
+#if OFFGRID_RADIO_DIAGNOSTICS
+bool LedDriver::selfTest() {
+    LedDriver probe;
+    probe.begin();
+    probe.setBrightness(255);
+    probe.update(7000); // past boot
+    probe.trigger(led::Event::Failed, 7000);
+    probe.update(7050); // inside the first red on window
+    return probe.pixelAt(0) == led::kRed;
+}
+#endif

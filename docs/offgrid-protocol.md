@@ -1,6 +1,6 @@
 # Offgrid Protocol v1: Design Specification
 
-> **Status:** Draft v1, for lab testing
+> **Status:** Implemented v1 wire protocol; physical three/four-board mesh acceptance pending
 > **Purpose:** Encrypted, meshed, infrastructure-free chat over raw LoRa
 > **Message types:** text, reaction, geolocation
 > **Out of scope for v1:** group chats, forward secrecy, store-and-forward, fragmentation
@@ -24,7 +24,7 @@
 13. [Known Gaps and How They Are Closed](#13-known-gaps-and-how-they-are-closed)
 14. [Limitations and Future Work](#14-limitations-and-future-work)
 15. [Worked Example: Byte by Byte](#15-worked-example-byte-by-byte)
-16. [Appendix A: Reference Code](#appendix-a-reference-code-python)
+16. [Appendix A: Implementation and Verification](#appendix-a-implementation-and-verification)
 17. [Appendix B: Constants](#appendix-b-constants)
 
 ---
@@ -151,9 +151,13 @@ All nodes in a mesh must use identical parameters.
 
 A 16-byte ACK at SF9 takes ca. 165 ms.
 
-### Duty cycle (lab note)
+### Airtime pacing and regulatory limits
 
-Duty cycle limits (1 % in 868.0–868.6 MHz, 10 % in 869.4–869.65 MHz; check current BAKOM / ETSI EN 300 220 values) are **not enforced in the lab setup**. Keep **CAD (listen-before-talk) and random backoff** enabled regardless, otherwise flooding causes collisions and the test results will be unrealistically bad. Airtime accounting must be added before any real-world deployment.
+Own data, ACKs and relays share a
+99-times-measured-airtime cooldown after each TX, including interrupted/failed
+transmits with known airtime. This conservatively paces to 1% during a continuous
+boot, but is not a durable rolling-hour ledger across resets or a certification
+of lawful frequency/power/antenna use in every jurisdiction.
 
 ---
 
@@ -247,7 +251,9 @@ AD = header with HOP_LEFT bits zeroed || orig_CTR (3 B)   (ACK packets)
 
 ### Counter persistence
 
-Before using counter values, reserve `ctr + 256` in flash. After a reboot, resume from the reserved value. A nonce is then never reused, even after a power loss.
+Each contact has one transmit-counter sequence per direction, shared by data and ACK packets. The first transmitted counter is 1; 0 is reserved. Every new packet consumes the next counter. A data retry reuses that data packet's counter and increments `RETRY`; sending an ACK again uses a fresh counter and `RETRY = 0`.
+
+Persist an exclusive reservation end before using any counter in its block. For a next counter `n`, reserve `[n, min(n + 256, 2^24))`. After reboot, resume at the persisted reservation end and skip every unused value in the prior block. Never wrap: when the next counter reaches `2^24`, sending to that contact stops until the peers re-pair and derive new keys. This makes nonce reuse impossible after power loss, assuming the reservation commit succeeds before a counter is used.
 
 ---
 
@@ -379,6 +385,13 @@ Inner header | lat (3 B) | lon (3 B) | [alt (2 B)] | [age (1 B)]
 
 No timestamps are used anywhere in the protocol, because devices may have no clock. The receiver timestamps messages on arrival.
 
+Firmware codec limits: reject nonfinite/out-of-range coordinates; clamp rounded
+upper endpoints to `0xFFFFFF` (never wrap +90/+180 to zero). Age is rounded to
+the nearest 10 seconds, capped at 2550 seconds. Reserved types/flags/emoji indices,
+malformed lengths and invalid UTF-8/NUL text are rejected after authentication.
+The firmware caps complete frames at 100 bytes and text bodies at 83 bytes;
+optional compressed text returns an explicit unsupported result.
+
 ### 8.4 ACK (no inner header)
 
 See [section 10](#10-receive-receipts-ack).
@@ -399,11 +412,11 @@ See [section 10](#10-receive-receipts-ack).
 
 > **Message ID = (SRC, DST, CTR)**
 
-The counter is **per contact and per direction**, not one global counter per device.
+The counter is **per contact and per direction**, not one global counter per device. It is shared by all new encrypted packets in that direction, including ACKs; retransmissions of a data packet reuse its counter and are distinguished by `RETRY`.
 
 **Why not global?** With a global counter, A could talk to other contacts in the meantime and push the counter far ahead. If an ACK to B got lost, B would later see the retry of an old CTR fall outside its replay window and silently drop it, so no ACK would ever be sent. With per-contact counters, the window only moves with traffic in that very conversation.
 
-The CTR serves four purposes:
+The first counter is 1; counter 0 is reserved. The CTR serves four purposes:
 
 1. Part of the nonce
 2. Duplicate identification
@@ -421,8 +434,8 @@ dedupe_key = Hash32( packet bytes with HOP_LEFT zeroed, including MIC )
 ```
 
 - **Include the MIC.** If only (SRC, CTR) were used, an attacker could pre-send forged packets with predicted counters and make relays drop the genuine one later. A forgery has a different tag and therefore a different key.
-- Use a **keyed hash with a random per-boot key** (for example SipHash). A plain CRC32 can be collided deliberately.
-- Storage: FIFO ring of 256 to 512 entries at 4 bytes each.
+- Firmware uses **HMAC-SHA256 truncated to 32 bits with a random 16-byte per-boot key**. A plain CRC32 can be collided deliberately.
+- Storage: FIFO ring of 256 entries at 4 bytes each.
 - Relays also **cancel a pending rebroadcast** if they overhear a neighbour sending the same packet.
 
 ### 9.3 Replay protection at the receiver
@@ -433,12 +446,18 @@ Per contact the receiver keeps `highest_ctr` and a **64-bit sliding window bitma
 |---|---|
 | greater than `highest_ctr` | accept, shift window (gaps of any size are fine) |
 | inside the window, not yet seen | accept (reordering) |
-| inside the window, already seen | duplicate: do not deliver again, **re-ACK if RETRY > 0** |
-| older than the window | drop |
+| inside the window, already seen | duplicate: do not deliver again; **re-ACK if requested and RETRY > 0** |
+| more than 63 below `highest_ctr` | stale: drop, even when the tag is valid or `RETRY > 0` |
 
 The window state is updated **only after the tag has verified**.
 
-Persist `highest_ctr` about every 16 messages. After a reboot, treat everything at or below it as already seen.
+Commit the accepted highest before every new delivery, including reordered
+acceptance, rather than leaving an unsaved interval. After a reboot, treat
+everything at or below the saved highest as already seen.
+This prevents reboot re-delivery at the expense of more flash writes; endurance
+and mixed-load timing must be accepted before release.
+
+Per-contact counters prevent traffic to other contacts from advancing this window. Heavy traffic in the same direction can still move an unacknowledged packet outside it. Such a retry is rejected and the sender may eventually report `timeout`; this is the intentional security-first limit of the 64-counter replay window.
 
 ---
 
@@ -492,16 +511,21 @@ Offgrid uses **managed flooding**.
 ### 11.1 Receive algorithm
 
 ```
-1. Check sync word and PHY CRC. Length must be ≥ 16.
-   Drop if SRC == own ID.
-2. Dedupe lookup.
-   Hit  → cancel own pending rebroadcast of this packet, drop (see 9.3 for re-ACK case).
-3. If DST == own ID:
+1. Check sync word, PHY CRC, packet length (at least 16 bytes), and routing fields.
+2. If DST == own ID, try authentication with every contact whose NodeID matches SRC. On success, apply replay handling: deliver a new packet once; for an authenticated duplicate, do not deliver again and send a fresh ACK when the original requested one and `RETRY > 0`.
+3. Check the relay dedupe cache using the packet with HOP_LEFT zeroed and the MIC included. A hit cancels any pending rebroadcast and suppresses forwarding. Local transmissions are inserted into this cache before radio launch, so this also suppresses self-echoes.
+4. If DST == own ID and authentication failed for every candidate (or no contact matched), treat it as transit traffic. A 16-bit NodeID collision must not make a node swallow another node's packet.
+5. If HOP_LEFT > 0, schedule rebroadcast with HOP_LEFT − 1.
+
+Never drop a packet solely because `SRC == own ID`: NodeIDs can collide. Endpoint authentication/replay handling runs before relay dedupe so a duplicate addressed packet can trigger the required fresh ACK without being delivered twice.
+
+The endpoint authentication step is:
+
+```
+if DST == own ID:
    for each contact whose NodeID == SRC: try to verify the tag
-      success → replay check, deliver, send ACK if requested, DO NOT relay
-4. If the tag failed for all candidates (or no contact matched):
-   treat as transit traffic.
-5. If HOP_LEFT > 0: schedule rebroadcast with HOP_LEFT − 1.
+        success → replay check, deliver once, ACK duplicates as specified
+```
 ```
 
 Step 4 matters: a 16-bit NodeID can collide. A collision must never make a node swallow someone else's packet.
@@ -521,7 +545,7 @@ Step 4 matters: a 16-bit NodeID can collide. A collision must never make a node 
 | Rate limit per SRC | Limit junk flooding |
 | Own messages and ACKs before relayed traffic | Priority |
 | Rate limit on tag failures per SRC | Limit verify-DoS |
-| Destination does not relay packets addressed to it | Save airtime |
+| Authenticated destination packets are not relayed | Save airtime without swallowing transit traffic on NodeID collisions |
 
 Everyone relays everyone's packets, including those of strangers. This is also good for anonymity.
 
@@ -540,7 +564,7 @@ Everyone relays everyone's packets, including those of strangers. This is also g
 
 ### 12.2 Retransmission
 
-- Same **CTR**, **RETRY** incremented (1, 2, 3)
+- Same **CTR**, **RETRY** incremented (1, 2, 3); each retry starts with `HOP_LEFT = HOP_START`
 - New nonce, new ciphertext, new MIC. Relays therefore do not treat it as a duplicate, while the receiver recognises the same CTR in its window.
 - Timeout: `(2 × hops + 2) × (airtime + max_jitter) × 2^retry`
   Example at SF9 and 3 hops: about 6 s, then 12 s, then 24 s.
@@ -580,12 +604,12 @@ There is no running shared state that has to be tracked packet by packet:
 | Mutable HOP_LEFT would break the tag | HOP_LEFT zeroed in AD |
 | Dedupe poisoning with predicted counters | MIC included in dedupe key, keyed hash (9.2) |
 | 16-bit ID collisions | Trial verification, transit fallback (11.1) |
-| Echo and loops | Dedupe, `SRC == self` drop, hop limit |
+| Echo and loops | Locally originated packets enter the normalized dedupe cache before TX; hop limit |
 | Retransmit swallowed by mesh | RETRY field changes MIC and dedupe key |
-| Retry outside replay window | Per-contact counters (9.1) |
+| Retry outside replay window | Drop as stale; same-contact traffic can advance the 64-counter window (9.3), so sender may time out |
 | ACK forgery or mix-up | AD bound to original CTR, replay window |
 | ACK storm | One ACK per message, small hop limit, no ACK for ACK |
-| Flooding exhausts airtime | CAD and backoff now, airtime budget before deployment |
+| Flooding exhausts airtime | CAD, random backoff, bounded relay/source budgets and shared per-boot airtime pacing |
 | No clock on device | No timestamps in protocol, receiver stamps arrival |
 | Lost or stolen device | Delete contact and re-pair. Revocation over the air is impossible because the key is compromised |
 | Flood of invalid tags | Rate limit per SRC |
@@ -604,7 +628,7 @@ There is no running shared state that has to be tracked packet by packet:
 | **No forward secrecy** | A stolen device or key exposes captured past traffic |
 | **Offline recipient** | The message is lost after the retries. Store-and-forward on relays is future work |
 | **No fragmentation** | Long texts must be split by the app |
-| **Duty cycle not enforced** | Lab only |
+| **Airtime accounting resets at boot** | Shared 1% pacing is not a durable rolling-hour ledger or regulatory certification |
 
 **Possible extensions**
 
@@ -616,17 +640,11 @@ There is no running shared state that has to be tracked packet by packet:
 - **Fragmentation** with a fragment type.
 - Other frequency plans (US915 and others).
 
-**Open decisions**
-
-1. Group chats in v1 or v2?
-2. Read receipts wanted?
-3. Which frequency plans are in scope?
-
 ---
 
 ## 15. Worked Example: Byte by Byte
 
-> All values below were generated with the reference code in [Appendix A](#appendix-a-reference-code-python). The ciphertext and MIC bytes are **real AES-CCM output**, so the example can be reproduced exactly. These keys are test vectors only. **Never use them in production.**
+> The ciphertext and MIC bytes below are **real AES-CCM output**, reproduced exactly by the on-device codec checks described in [Appendix A](#appendix-a-implementation-and-verification). These keys are test vectors only. **Never use them in production.**
 
 ### 15.1 Setup
 
@@ -841,90 +859,28 @@ Bob decodes the position as 47.05170° N, 8.30751° E (about 1 to 2 m rounding e
 
 ---
 
-## Appendix A: Reference Code (Python)
+## Appendix A: Implementation and Verification
 
-Requires `pip install cryptography`. This is the exact code used to generate the vectors in section 15.
+The maintained codec is [PacketCodec.cpp](../src/mesh/PacketCodec.cpp). Its
+isolated self-test reproduces all four encrypted vectors in section 15, tests
+mutable-hop authentication, wrong keys/tags, ACK counter binding, UTF-8 bounds,
+reactions and GEO quantization. It is compiled only into explicit lab profiles:
 
-```python
-import hashlib
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
-from cryptography.hazmat.primitives.ciphers.aead import AESCCM
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-
-RAW = dict(encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw)
-
-
-def keypair(seed: str):                       # deterministic, for test vectors only
-    sk = X25519PrivateKey.from_private_bytes(hashlib.sha256(seed.encode()).digest())
-    return sk, sk.public_key().public_bytes(**RAW)
-
-
-def node_id(pub: bytes) -> bytes:             # 16-bit node ID
-    return hashlib.sha256(pub).digest()[:2]
-
-
-def derive(sk, pub_self, salt_self, pub_peer, salt_peer):
-    """Returns (k_out, k_in) from the point of view of 'self'."""
-    dh = sk.exchange(X25519PublicKey.from_public_bytes(pub_peer))
-    first, second = sorted([(pub_self, salt_self), (pub_peer, salt_peer)], key=lambda x: x[0])
-    salt = first[1] + second[1]               # role-independent salt order
-    k = lambda snd, rcv: HKDF(hashes.SHA256(), 16, salt, b"og1" + snd + rcv).derive(dh)
-    return k(pub_self, pub_peer), k(pub_peer, pub_self)
-
-
-def header(hop_start, hop_left, retry, dst, src, ctr):
-    return bytes([(hop_start << 5) | (hop_left << 2) | retry]) + dst + src + ctr.to_bytes(3, "big")
-
-
-def mask(h):                                  # zero HOP_LEFT (bits 4..2) -> used as AD
-    return bytes([h[0] & 0b11100011]) + h[1:]
-
-
-def nonce(h):                                 # 13 bytes: SRC DST CTR RETRY 00*5
-    return h[3:5] + h[1:3] + h[5:8] + bytes([h[0] & 0b11]) + b"\x00" * 5
-
-
-def seal(key, h, plaintext, extra_ad=b""):    # extra_ad = orig CTR for ACKs
-    return h + AESCCM(key, tag_length=8).encrypt(nonce(h), plaintext, mask(h) + extra_ad)
-
-
-def open_(key, pkt, extra_ad=b""):            # raises InvalidTag on failure
-    h = pkt[:8]
-    return AESCCM(key, tag_length=8).decrypt(nonce(h), pkt[8:], mask(h) + extra_ad)
+```sh
+pio run -e radio_diag -t upload --upload-port /dev/ttyUSB0
+python3 tools/serial-check.py --port /dev/ttyUSB0 --command diag.codec.selftest --allow-secure-changes
 ```
 
-Usage sketch (reproduces the first packet of the worked example):
-
-```python
-from og_core import *
-
-skA, pubA = keypair("alice"); skB, pubB = keypair("bob")
-saltA = bytes(range(0x10, 0x20)); saltB = bytes(range(0x20, 0x30))
-idA, idB = node_id(pubA), node_id(pubB)
-
-k_out, _ = derive(skA, pubA, saltA, pubB, saltB)       # Alice's view
-_, k_in  = derive(skB, pubB, saltB, pubA, saltA)       # Bob's view
-
-pkt = seal(k_out, header(3, 3, 0, idB, idA, 1), b"\x08" + b"Hello!")
-print(pkt.hex(" ").upper())
-# 6C E8 41 E3 F0 00 00 01 5D 1D 3F D9 2A 3E 04 DA 79 40 24 DB 76 AD BC
-
-# a relay decrements HOP_LEFT from 3 to 2 (0x6C -> 0x68), tag still verifies
-relayed = bytes([0x68]) + pkt[1:]
-assert open_(k_in, relayed) == b"\x08Hello!"
-
-# ACK from Bob (orig CTR = 1, received after one hop -> HOP_START 2)
-ack = seal(derive(skB, pubB, saltB, pubA, saltA)[0],
-           header(2, 2, 0, idA, idB, 1), b"", extra_ad=(1).to_bytes(3, "big"))
-assert len(ack) == 16
-```
+Restore normal secure firmware after diagnostics. The self-test uses published
+fixture keys, not live identity/contact keys, and does not transmit. Passing it
+verifies codec behavior, not physical multi-hop forwarding. The former incomplete
+Python development sketch has been removed rather than offered as runnable code.
 
 ---
 
 ## Appendix B: Constants
 
-### Emoji table (proposal)
+### Emoji table
 
 | Index | Emoji |
 |---|---|
@@ -951,7 +907,7 @@ assert len(ack) == 16
 | Max retries | 3 |
 | Replay window | 64 |
 | Counter reservation block | 256 |
-| `highest_ctr` persistence interval | ca. 16 messages |
-| Dedupe cache | 256 to 512 entries |
+| `highest_ctr` persistence interval | Every newly accepted packet, before delivery |
+| Dedupe cache | 256 entries |
 | ACK length | 16 bytes |
-| Recommended max packet | ca. 100 bytes |
+| Maximum complete packet | 100 bytes |
